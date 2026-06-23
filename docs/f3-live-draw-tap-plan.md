@@ -95,6 +95,16 @@ Per frame, two full passes run regardless of what actually changed:
   into `g_liveBuild` by `HighcutLivePushDraw`)**. Fix: stop double-copying vertex data (share/move
   the vertex blob; hand packets to the bridge by move/arena, not by-value). Then re-measure toward
   60fps — consumer (~44ms) and render (~8ms) have headroom.
+- **F-3.3 DONE + F-3.4 subdivision (2026-06-22, controller dense run, commits fdd58df/11eb827).**
+  Packet-move applied (minor, as predicted). Subdivided "other" into gap1 (xlat→untile) / gap2
+  (untile→packet). **Controller dense finding (~1500 draws, ~15fps, ~65ms/frame): only ~HALF the
+  frame (~34ms) is IN RenderBetaOwnedDraw** — translate ~8, **gap1 ~11 (biggest in-function)**,
+  untile ~7, packet ~4, gap2 ~3 — **the other ~31ms/frame is OUTSIDE it (SDK front-end PM4 decode +
+  coexistence GPU wait).** ⇒ **60fps needs BOTH: (1) draw-level caching for our ~34ms (skip
+  re-processing unchanged static draws — collapses all 5 buckets for them; the big lever, aligned
+  with the accept-staleness choice), AND (2) F-4 coexistence removal for the ~31ms.** Neither alone
+  reaches 60. gap1 (texture-binding/vfetch setup) is the biggest single in-function target if
+  attacking incrementally instead.
 
 ### F-3.0 — Make the live co-run actually connect (PREREQUISITE — confirmed blocker 2026-06-22)
 The live feed requires the **beta-takeover-live CP** (pushes draws) and the **plume-present thread**
