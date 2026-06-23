@@ -1673,6 +1673,7 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
   static const bool skip_owned_render = (std::getenv("NHL_HIGHCUT_LIVE_FEED") != nullptr) &&
                                         (std::getenv("NHL_HIGHCUT_KEEP_OWNED_DRAW") == nullptr);
   static double s_tXlat = 0.0, s_tUntile = 0.0, s_tPacket = 0.0, s_tTotal = 0.0;
+  static double s_tGap1 = 0.0, s_tGap2 = 0.0;  // F-3.4: "other" split (post-xlat->untile, post-untile->packet)
   using hc_clock = std::chrono::steady_clock;
   auto hc_secs = [](hc_clock::time_point a, hc_clock::time_point b) {
     return std::chrono::duration_cast<std::chrono::duration<double>>(b - a).count();
@@ -1680,6 +1681,7 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
   // Total per-draw producer time; "other" = total - (translate+untile+packet) reveals the unbucketed
   // setup cost (RT-cache Update, viewport, vertex-blob copy). Accumulated at the skip_owned_render return.
   const auto _hc_t0 = hc_profile ? hc_clock::now() : hc_clock::time_point{};
+  hc_clock::time_point _hc_eXlat{}, _hc_eUntile{};  // F-3.4: phase-end marks for the "other" split (per-draw)
   static std::atomic<int> highcut_p3_count{0};
   constexpr int kP3MaxDraws = 32;
   const auto _hc_tx0 = hc_profile ? hc_clock::now() : hc_clock::time_point{};
@@ -1956,7 +1958,7 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     }
   }
 
-  if (hc_profile) s_tXlat += hc_secs(_hc_tx0, hc_clock::now());
+  if (hc_profile) { const auto _e = hc_clock::now(); s_tXlat += hc_secs(_hc_tx0, _e); _hc_eXlat = _e; }
 
   // LIVE-TAKEOVER FREEZE FIX: the SDK DXBC translate + the per-new-shader async-translation / PSO
   // SPIN-WAITS below (Sleep-loops up to ~200ms each + a 1000ms PSO wait) are owned-draw prep ONLY. On
@@ -2536,9 +2538,10 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     }
     };  // untileBindings
     const auto _hc_tu0 = hc_profile ? hc_clock::now() : hc_clock::time_point{};
+    if (hc_profile && _hc_eXlat.time_since_epoch().count()) s_tGap1 += hc_secs(_hc_eXlat, _hc_tu0);  // F-3.4
     untileBindings(p3_ps_texbinds, tex_descs, tex_blobs, /*is_ps=*/true);   // set3 (pixel) textures
     untileBindings(p3_vs_texbinds, vs_tex_descs, vs_tex_blobs, /*is_ps=*/false);  // C-5d.3: set2 (vertex/skinning) textures
-    if (hc_profile) s_tUntile += hc_secs(_hc_tu0, hc_clock::now());
+    if (hc_profile) { const auto _e = hc_clock::now(); s_tUntile += hc_secs(_hc_tu0, _e); _hc_eUntile = _e; }
 
     // C-5f: per-sampler filter/clamp. For each translated SamplerBinding, resolve the guest sampler
     // state from its texture fetch constant (dword_0 = clamp_x/y/z, dword_3 = mag/min/mip/aniso filter).
@@ -2760,12 +2763,17 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
             static uint32_t s_fpsFrames = 0;
             static auto s_fpsT0 = std::chrono::steady_clock::now();
             static double s_prevXlat = 0.0, s_prevUntile = 0.0, s_prevPacket = 0.0, s_prevTotal = 0.0;
+            static double s_prevGap1 = 0.0, s_prevGap2 = 0.0;                        // F-3.4
             static double s_winXlat = 0.0, s_winUntile = 0.0, s_winPacket = 0.0;     // window accumulator
+            static double s_winGap1 = 0.0, s_winGap2 = 0.0;                          // F-3.4 "other" split
             if (hc_profile) {
               const double fX = s_tXlat - s_prevXlat, fU = s_tUntile - s_prevUntile,
                            fP = s_tPacket - s_prevPacket, fT = s_tTotal - s_prevTotal;
+              const double fG1 = s_tGap1 - s_prevGap1, fG2 = s_tGap2 - s_prevGap2;   // F-3.4
               s_prevXlat = s_tXlat; s_prevUntile = s_tUntile; s_prevPacket = s_tPacket; s_prevTotal = s_tTotal;
+              s_prevGap1 = s_tGap1; s_prevGap2 = s_tGap2;
               s_winXlat += fX; s_winUntile += fU; s_winPacket += fP;
+              s_winGap1 += fG1; s_winGap2 += fG2;
               // Per-frame breakdown for SLOW frames: a slow dense gameplay frame never reaches the 60-frame
               // window, so log its bucket split immediately. "other" = total - the three buckets (the
               // unbucketed setup: RT-cache Update, viewport, vertex-blob copy). >250ms => "slow".
@@ -2789,9 +2797,11 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
               if (hc_profile) {
                 const double ms = 1000.0;
                 REXLOG_INFO("[highcut-perf]   window cost: translate={:.0f}ms untile={:.0f}ms "
-                            "packet={:.0f}ms (of {:.0f}ms wall)",
-                            s_winXlat * ms, s_winUntile * ms, s_winPacket * ms, secs * ms);
-                s_winXlat = s_winUntile = s_winPacket = 0.0;
+                            "packet={:.0f}ms | OTHER-gap1(xlat->untile)={:.0f}ms OTHER-gap2(untile->packet)={:.0f}ms "
+                            "(of {:.0f}ms wall)",
+                            s_winXlat * ms, s_winUntile * ms, s_winPacket * ms,
+                            s_winGap1 * ms, s_winGap2 * ms, secs * ms);
+                s_winXlat = s_winUntile = s_winPacket = s_winGap1 = s_winGap2 = 0.0;
               }
               s_fpsFrames = 0;
               s_fpsT0 = now;
@@ -2846,6 +2856,7 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     // capture / replay) OR hand them to the plume live-feed bridge (HighcutLivePushDraw). Live never
     // latches (skip_capture stays false) so it pushes every frame's draws. (live_feed declared above.)
     const auto _hc_tp0 = hc_profile ? hc_clock::now() : hc_clock::time_point{};
+    if (hc_profile && _hc_eUntile.time_since_epoch().count()) s_tGap2 += hc_secs(_hc_eUntile, _hc_tp0);  // F-3.4
     if (!skip_capture) {
       // Step 2: in LIVE mode, stream each unique shader/texture to the consumer's resource dictionary
       // ONCE and zero its inline byte count, so the per-draw packet no longer carries the ~130KB shader +
