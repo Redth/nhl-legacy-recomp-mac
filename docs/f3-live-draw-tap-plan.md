@@ -84,6 +84,17 @@ Per frame, two full passes run regardless of what actually changed:
   blob; in live mode push an EMPTY blob for already-streamed `tex_id`s since the consumer has them in
   its by-id dictionary) and/or cache at the DRAW level so unchanged draws skip texture processing
   entirely. Counters: `[highcut-perf] untile cache: H hits, M misses, C clears`.
+- **F-3.2 FIX DONE + VERIFIED (2026-06-22).** Made blobs `shared_ptr<const vector>` (`HcBlob`) so a
+  cache hit (and the cache store, which used to double-copy) is a refcount bump, not a deep texel
+  copy. Result on dense live frames: **untile/window ~5,500ms → ~250–570ms (~10–20×), fps ~5.7 →
+  ~11–20 (~2.5–3.5×)**, still 100% cache hit, still rendering 1656 draws/frame live. The blob copy
+  WAS the wall.
+- **F-3.3 (next) — the bottleneck shifted.** With untile fixed, window cost is now dominated by
+  **"other" (~35ms/frame: vertex-blob copy `app(vtx_src, shared_bytes)` + RT-cache Update + viewport)**
+  and **packet build (~10ms/frame: the vertex blob is copied into `pkt`, then `pkt` is copied AGAIN
+  into `g_liveBuild` by `HighcutLivePushDraw`)**. Fix: stop double-copying vertex data (share/move
+  the vertex blob; hand packets to the bridge by move/arena, not by-value). Then re-measure toward
+  60fps — consumer (~44ms) and render (~8ms) have headroom.
 
 ### F-3.0 — Make the live co-run actually connect (PREREQUISITE — confirmed blocker 2026-06-22)
 The live feed requires the **beta-takeover-live CP** (pushes draws) and the **plume-present thread**

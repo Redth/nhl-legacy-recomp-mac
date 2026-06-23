@@ -2277,9 +2277,14 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     // the per-block byte offset. Bring-up handles 2D 8888 + DXT1/2_3/4_5; anything else gets a 2x2
     // magenta placeholder so the bind/sample path still runs (and is visibly wrong if reached).
     std::vector<nhl::highcut::TexturePacketDesc> tex_descs;
-    std::vector<std::vector<uint8_t>> tex_blobs;
+    // F-3.2: blobs are shared_ptr so a cache hit (and the cache store) is a refcount bump, not a deep
+    // copy of the untiled texels. The untile GATHER is already 100% cached; the remaining ~75% of
+    // producer time was this per-binding COPY of multi-MB textures referenced by many draws. const so
+    // the shared blob is safe to alias across out_blobs + the cache slot.
+    using HcBlob = std::shared_ptr<const std::vector<uint8_t>>;
+    std::vector<HcBlob> tex_blobs;
     std::vector<nhl::highcut::TexturePacketDesc> vs_tex_descs;  // C-5d.3: VS (set2) textures
-    std::vector<std::vector<uint8_t>> vs_tex_blobs;
+    std::vector<HcBlob> vs_tex_blobs;
     // UNTILE CACHE (live-takeover freeze fix): re-untiling every sampled texture every frame (per-block
     // tiled gather + endian swap, e.g. 131k blocks for a 2048x1024 background) is ~75% of producer frame
     // time (measured via NHL_HIGHCUT_PROFILE). Cache the untiled blob + its derived desc fields keyed by
@@ -2290,7 +2295,7 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     // and force a full re-untile of the static textures too (the gameplay untile≈200ms thrash). contentHash
     // (512B prefix) is stored to detect when a slot's data changed (dynamic) vs is reusable (static).
     struct HcTexCacheEntry {
-      std::vector<uint8_t> blob;
+      HcBlob blob;
       uint32_t width = 0, height = 0, tex_format = 0, row_pitch_bytes = 0, data_bytes = 0,
                array_layers = 0, swizzle = 0;
       uint64_t contentHash = 0;
@@ -2305,7 +2310,7 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     // per-block byte offset. 2D 8888 + DXT1/2_3/4_5 supported; anything else -> 2x2 magenta.
     auto untileBindings = [&](const std::vector<rex::graphics::SpirvShader::TextureBinding>& binds,
                               std::vector<nhl::highcut::TexturePacketDesc>& out_descs,
-                              std::vector<std::vector<uint8_t>>& out_blobs, bool is_ps) {
+                              std::vector<HcBlob>& out_blobs, bool is_ps) {
     for (const auto& tb : binds) {
       const uint32_t slot = tb.fetch_constant;
       xenos::xe_gpu_texture_fetch_t tf{};
@@ -2373,7 +2378,7 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
           blob[i] = 32; blob[i + 1] = 32; blob[i + 2] = 32; blob[i + 3] = 255;  // neutral, alpha=1
         }
         if (hc_verbose) REXLOG_INFO("[highcut-C5i] tex slot={} CUBE base=0x{:X} -> 6-face NEUTRAL cube ({})", slot, tex_base, why);
-        out_descs.push_back(td); out_blobs.push_back(std::move(blob));
+        out_descs.push_back(td); out_blobs.push_back(std::make_shared<const std::vector<uint8_t>>(std::move(blob)));
       };
       // Allow the cube dimension through the untile path (a cube is k3DOrStacked-ish, not k2DOrStacked).
       const bool okDim = xenos::DataDimension(tf.dimension) == xenos::DataDimension::k2DOrStacked || isCube;
@@ -2398,7 +2403,7 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
         if (hc_verbose) REXLOG_INFO("[highcut-C4] tex slot={} UNSUPPORTED fmt={} dim={} base=0x{:X} -> 2x2 {}",
                     slot, uint32_t(fmt), uint32_t(tf.dimension), tex_base,
                     is_depth ? "white (depth)" : "magenta");
-        out_descs.push_back(td); out_blobs.push_back(std::move(blob));
+        out_descs.push_back(td); out_blobs.push_back(std::make_shared<const std::vector<uint8_t>>(std::move(blob)));
         continue;
       }
       const uint32_t bw = fi->block_width, bh = fi->block_height, bpb = fi->bytes_per_block();
@@ -2517,15 +2522,17 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
       // Store/overwrite this address slot (bounded by address count — dynamic content reuses the slot, so
       // no growth). The byte counter tracks net size when a slot's blob size changes; a generous safety cap
       // clears if the working set of distinct addresses is genuinely huge.
+      // F-3.2: build ONE shared blob; the cache slot and out_blobs alias it (no copy of the texels).
+      auto shared = std::make_shared<const std::vector<uint8_t>>(std::move(blob));
       {
         auto it = s_texCache.find(addrKey);
-        if (it != s_texCache.end()) s_texCacheBytes -= it->second.blob.size();  // replacing this slot
-        if (s_texCacheBytes + blob.size() > kTexCacheBudget) { s_texCache.clear(); s_texCacheBytes = 0; ++s_texClears; }
-        s_texCacheBytes += blob.size();
-        s_texCache[addrKey] = HcTexCacheEntry{blob, td.width, td.height, td.tex_format, td.row_pitch_bytes,
+        if (it != s_texCache.end() && it->second.blob) s_texCacheBytes -= it->second.blob->size();  // replacing this slot
+        if (s_texCacheBytes + shared->size() > kTexCacheBudget) { s_texCache.clear(); s_texCacheBytes = 0; ++s_texClears; }
+        s_texCacheBytes += shared->size();
+        s_texCache[addrKey] = HcTexCacheEntry{shared, td.width, td.height, td.tex_format, td.row_pitch_bytes,
                                               td.data_bytes, td.array_layers, td.swizzle, contentHash};
       }
-      out_descs.push_back(td); out_blobs.push_back(std::move(blob));
+      out_descs.push_back(td); out_blobs.push_back(shared);
     }
     };  // untileBindings
     const auto _hc_tu0 = hc_profile ? hc_clock::now() : hc_clock::time_point{};
@@ -2853,12 +2860,12 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
         if (hdr.ps_spirv_bytes) { stream(hdr.ps_shader_id, p3_ps_spirv.data(), hdr.ps_spirv_bytes); hdr.ps_spirv_bytes = 0; }
         for (size_t i = 0; i < tex_descs.size(); ++i)
           if (tex_descs[i].tex_id && tex_descs[i].data_bytes) {
-            stream(tex_descs[i].tex_id, tex_blobs[i].data(), tex_descs[i].data_bytes);
+            stream(tex_descs[i].tex_id, tex_blobs[i]->data(), tex_descs[i].data_bytes);
             tex_descs[i].data_bytes = 0;  // consumer resolves the blob from the dictionary
           }
         for (size_t i = 0; i < vs_tex_descs.size(); ++i)
           if (vs_tex_descs[i].tex_id && vs_tex_descs[i].data_bytes) {
-            stream(vs_tex_descs[i].tex_id, vs_tex_blobs[i].data(), vs_tex_descs[i].data_bytes);
+            stream(vs_tex_descs[i].tex_id, vs_tex_blobs[i]->data(), vs_tex_descs[i].data_bytes);
             vs_tex_descs[i].data_bytes = 0;
           }
       }
@@ -2876,8 +2883,8 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
       if (hdr.ps_float_bytes) app(ps_floats.data(), hdr.ps_float_bytes);
       if (hdr.vs_spirv_bytes) app(p3_vs_spirv.data(), hdr.vs_spirv_bytes);
       if (hdr.ps_spirv_bytes) app(p3_ps_spirv.data(), hdr.ps_spirv_bytes);
-      for (size_t i = 0; i < tex_descs.size(); ++i) { app(&tex_descs[i], sizeof(tex_descs[i])); if (tex_descs[i].data_bytes) app(tex_blobs[i].data(), tex_descs[i].data_bytes); }
-      for (size_t i = 0; i < vs_tex_descs.size(); ++i) { app(&vs_tex_descs[i], sizeof(vs_tex_descs[i])); if (vs_tex_descs[i].data_bytes) app(vs_tex_blobs[i].data(), vs_tex_descs[i].data_bytes); }  // C-5d.3 VS (set2) after PS textures
+      for (size_t i = 0; i < tex_descs.size(); ++i) { app(&tex_descs[i], sizeof(tex_descs[i])); if (tex_descs[i].data_bytes) app(tex_blobs[i]->data(), tex_descs[i].data_bytes); }
+      for (size_t i = 0; i < vs_tex_descs.size(); ++i) { app(&vs_tex_descs[i], sizeof(vs_tex_descs[i])); if (vs_tex_descs[i].data_bytes) app(vs_tex_blobs[i]->data(), vs_tex_descs[i].data_bytes); }  // C-5d.3 VS (set2) after PS textures
       for (const auto& sd : ps_samp_descs) app(&sd, sizeof(sd));  // C-5f per-sampler descs (PS then VS)
       for (const auto& sd : vs_samp_descs) app(&sd, sizeof(sd));
       if (hdr.index_bytes) app(index_blob.data(), hdr.index_bytes);  // C-5d, last
