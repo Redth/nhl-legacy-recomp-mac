@@ -37,6 +37,29 @@ answered.
   drops toward ~25–30 ms → parallelization works → pursue it. If snapshot/sync overhead keeps it ~flat →
   parallelization is blocked by the shared-state coupling → 60 fps needs the leaner-custom-decoder path.
 
+### ✅ F-5b SHIPPED (commit `a372fb9`) — the snapshot-cost probe (do this measurement FIRST)
+
+The pool's whole bet hinges on **how expensive the snapshot is** — and that's measurable WITHOUT building
+the pool. `NHL_HIGHCUT_SNAPPROBE` (in `RenderBetaOwnedDraw`, just after the index gather) per draw memcpys
+exactly the bytes a worker would need — the register banks (`regs[0x2000..0x2400]` + `regs[0x4000..0x4940]`)
++ the full guest **vertex** + **index** bytes — into a reusable scratch buffer, times it on the CP thread,
+and reports `ms/frame` + `MB/frame` in the 60-frame window (next to BUSYPROBE). Rendering is unchanged
+(scratch discarded). It's the **worst-case** snapshot (copies full vtx/idx, not the deduped by-id
+artifacts) = an UPPER bound on the post-MT CP-thread floor.
+
+- **Run it:** `scripts\_snapprobe.ps1` → drive into dense gameplay, hold ~30 s, close. Read
+  `[highcut-perf] SNAPPROBE: per-draw input snapshot = N ms/frame …` against our ~34 ms.
+- **Decision rule:**
+  - snapshot **<< ~34 ms** (say ≤ ~8 ms) → byte copy is cheap → **MT producer is GO** (build the pool;
+    post-MT CP wall → ~SDK-decode 25 ms + snapshot → ~30 ms → ~33 fps, then F-4 trims).
+  - snapshot **≈ ~34 ms** → the raw copy alone is as costly as the work → **threads don't help**; 60 fps
+    needs the leaner custom PM4 decoder. THEN: re-run with a **deduped** snapshot model (copy only the
+    register banks + by-id ids, skip full vtx/idx — most static draws are already-sent geometry) as a
+    cheaper floor before abandoning the pool.
+- **Why this is the right first step:** it de-risks the pool. If snapshot ≈ work, building a thread-safe
+  worker pool (shard/lock `s_texCache`/xlat caches) would have been wasted effort on a doomed approach.
+  Needs the user at the controller (autonomous attract is too light to be representative).
+
 ## Performance reality (manage expectations)
 
 - **Likely reachable** (MT producer + F-4 + gap1/untile micro-opts): **~30–35 fps dense**, higher on
@@ -106,6 +129,12 @@ Drive into a game, hold ~30 s, close; the script greps the lines.
 ## This session's flags + commits
 
 Flags (all opt-in, default behavior unchanged): `NHL_HIGHCUT_BUSYPROBE` (F-4 probe),
-`NHL_HIGHCUT_DRAWCACHE`[`_HASHLEN`] (menu-only, leave off), `NHL_HIGHCUT_GEOM_BYID` (shipped lever).
-Scripts: `_f4busyprobe.ps1`, `_drawcache.ps1`. Commit: **`dfcbe46`** on `perf/cpu-draw-submission`
-(6 files, +495). Nothing else pending; the branch's pre-existing work is untouched.
+`NHL_HIGHCUT_DRAWCACHE`[`_HASHLEN`] (menu-only, leave off), `NHL_HIGHCUT_GEOM_BYID` (shipped lever),
+**`NHL_HIGHCUT_SNAPPROBE`** (F-5b decisive snapshot-cost probe). Scripts: `_f4busyprobe.ps1`,
+`_drawcache.ps1`, **`_snapprobe.ps1`**. Commits: `dfcbe46` (F-4/F-5), **`a372fb9`** (F-5b snapprobe)
+on `perf/cpu-draw-submission`. The branch's pre-existing work is untouched.
+
+**State at this handoff:** F-5b built + compiles + links clean (`BUILD_EXIT=0`, only the one TU rebuilt),
+exe fresh in `out/build/win-amd64-vk-ffx`. The probe is UNMEASURED — it needs one live dense-gameplay run
+(`scripts\_snapprobe.ps1`, user at the controller). That single number decides whether the MT producer
+gets built. Nothing else changed; the renderer behaves identically with the flag off.
