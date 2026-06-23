@@ -123,19 +123,80 @@ both run together.
 **Exit:** a live frame's RTs are all created at logical size from D3D9 hooks (no 640-pitch anywhere
 in the plume path); the existing menu render still composites correctly into them.
 
-### F-2 — Resolve = D3D9-hooked host-copy (render-to-texture)
-Use the count-exact `sub_827EF8E0` Resolve hook to drive host-copy of a flat plume RT → a plume
-texture, keyed by the D3D9 resolve dest address. This is what makes shadow maps, reflections, and
-post-process composite correctly without EDRAM resolve.
-**Exit:** a 3D scene's shadow-map / reflection / post chain composites correctly from
-D3D9-hooked resolves; no SDK EDRAM resolve involved.
+**FINDINGS (2026-06-22, F-1.1/F-1.2 done):**
+- **Coexistence PROVEN (F-1.1).** `d3d9_resources.cpp` (NHL_HIGHCUT) runs concurrently with the
+  beta D3D12 capture (NHL_HIGHCUT_FRAME_CAPTURE) in one process — both log streams present; D3D9
+  graph reports present/viewport/resolves all at logical 1280×720. No source-arrangement conflict.
+- **The premise was partly off — the replay is ALREADY fold-free in *sizing*.** `LoadC5Frames`
+  sizes each offscreen surface RT from the per-draw **logical viewport** (`vpW/vpH`,
+  `plume_present.cpp:1421-1427`), not the EDRAM pitch. The 640-pitch survives ONLY as a component
+  of the `SurfaceKey` *identity*, never as a dimension. So F-1 is smaller than written: it's not
+  "stop EDRAM-pitch sizing" (already done) but **(a) remove the EDRAM-tile values from the surface
+  *identity key*, and (b) replace the viewport-max size heuristic** — which has documented failure
+  modes (C-5h "camera sunk in the ice": a half-res aux pass out-areas the real view) — **with the
+  D3D9 graph's authoritative per-resource logical size.**
+- **Bridge primitive landed (F-1.2, built clean).** `HighcutD3D9FrameSize()` +
+  `HighcutD3D9LogicalSizeByBase(base_addr,…)` in `d3d9_resources.cpp` expose the logical graph
+  (frame size; resource logical size by decoded GPU base) for the capture/replay pipeline to size +
+  key from.
+- **F-1.3 DONE — address correlation is a DEAD END (decisive).** Validated on a live dense frame
+  (auto-latched 505 draws / 352 3D, `[F1-corr]`/`[F1-reg]` logging):
+  - **Frame/primary size correlates RELIABLY** (D3D9 present = capture = 1280×720) — because it comes
+    straight from the Present args, not object decode.
+  - **Per-surface correlation FAILS — 0 of 315 resolves matched.** Diagnosis (`HighcutD3D9DumpRegistry`):
+    the PM4 resolve dests are **EDRAM-resolved physical addresses (`0x1A0xxxxx`)**, but the D3D9
+    registry's decoded bases are **main-memory GPU addresses (`0xF0xxxxxx`)** — *different address
+    spaces*. (Also: the H-1 `DecodeDims` width/height layout, validated on one full-screen texture,
+    yields garbage for arbitrary object types — `4098×1` etc. — so the registry decode is unreliable
+    beyond present/viewport.) **`copy_dest_base ↔ Resource.baseAddr` is the wrong bridge.**
+- **CONCLUSION / reframe:** the correct way to attribute a draw/surface to a D3D9 logical RT is
+  **binding-order** (track the currently-bound RT/viewport at draw time), NOT after-the-fact address
+  matching — and that is exactly what the **live F-3** path must do anyway. Since the capture/replay is
+  **already fold-free** (logical viewport sizing) and the *reliable* D3D9 signal (frame size) already
+  matches, **F-1's fold goal is effectively met**; per-surface D3D9-authoritative sizing/keying should
+  **fold into F-3 (live binding-order)** rather than be forced through the dead address bridge here.
+  - **Kept:** `HighcutD3D9FrameSize()` (reliable, useful as the primary/swapchain authority).
+  - **Known-not-useful:** `HighcutD3D9LogicalSizeByBase()` + the `[F1-corr]`/`[F1-reg]` diagnostics
+    (one-shot, gated on capture+NHL_HIGHCUT — harmless in the shipped path; remove when convenient).
+  - **Net:** F-1 reduced from "swap per-surface authority to D3D9" → "fold goal already satisfied;
+    per-surface D3D9 authority moves to F-3." Recommend proceeding to F-2/F-3 rather than chasing the
+    address bridge.
 
-### F-3 — Draw-tap → flat render
-Wire the inlined-draw PM4 decode (`RenderBetaOwnedDraw`) to emit into the F-1 flat RT bound at draw
-time (attribute each inlined draw to the current logical viewport/RT from the D3D9 graph). Live, not
-disk-replay.
-**Exit:** a full live frame (menu, then a 3D scene) renders end-to-end into the D3D9-sized flat RTs
-from the live draw tap — still alongside rexglue, but plume's output is a faithful full frame.
+### F-2 — Resolve = host-copy (render-to-texture)
+Drive host-copy of a flat plume RT → a plume texture so shadow maps, reflections, and post-process
+composite correctly without EDRAM resolve.
+**Exit:** a 3D scene's shadow-map / reflection / post chain composites correctly from resolves; no
+SDK EDRAM resolve involved.
+
+**FINDINGS (2026-06-22) — already met on the offline path; the "D3D9-hooked" framing is the same
+dead bridge as F-1.** Examined the live dense capture replayed through plume:
+- **The resolve=host-copy mechanism already exists and is wired, PM4-keyed** (C-5d.3:
+  `ParseResolveGraphBytes` → `resolveMap[dest_addr]` → `GetOrCreateSurfaceRT` → rebind stubbed
+  bindings). Replay loads the resolve graph (9 dest mappings / 12 markers), renders clean (0 VUID).
+  It re-points stubbed depth/shadow bindings (shown: 66 depth rebinds on a prior frame; 0 on this
+  frame because its shadow dests were captured real via readback-resolve C-5l). **No SDK EDRAM
+  resolve is involved — already host-copy.**
+- **Fold-free confirmed on a REAL fold surface.** This frame's PRIMARY surface is
+  `pitch=640 msaa=1` (1280-wide rendered into a 640-pitch EDRAM surface at 2×) — the canonical fold
+  case — and the replay sizes it logically (viewport 1280×720) and renders it correctly.
+- **The "D3D9-hooked resolve" reframe (keyed by the D3D9 resolve dest) hits F-1.3's wall:** the
+  D3D9 resolve dest is a different address space than the PM4 `copy_dest_base` the host-copy keys on.
+  And the PM4 resolve capture (`HighcutCaptureResolve`) already tracks the same `sub_827EF8E0`
+  resolves count-exact — the D3D9 hook adds nothing on the offline path.
+- **CONCLUSION:** like F-1, F-2's goal is **already satisfied on the offline path** via the PM4-keyed
+  mechanism; the D3D9-hook version is inherently **F-3 (live)** work — there, the D3D9 resolve hook
+  *triggers* a live host-copy and there's no PM4-vs-D3D9 correlation to reconcile.
+
+### F-3 — Draw-tap → flat render (live)  ← **detailed scope: [f3-live-draw-tap-plan.md](f3-live-draw-tap-plan.md)**
+Replace the static disk replay with a live per-frame feed so plume renders the running game. **Scoped
+2026-06-22 — and it's mostly already built:** the C-6 live feed (`NHL_HIGHCUT_LIVE_FEED`) is wired
+end-to-end (CP `HighcutLivePushDraw`/`HighcutLiveCommitFrame` → in-memory bridge → plume rebuild),
+with by-ID GPU-object caches; it hit 22–60 fps on the menu. Surface attribution is **already
+binding-order** (per-draw PM4 surface registers — not D3D9 address, per F-1.3). So F-3 = a **perf +
+live-gameplay-correctness** push, not a build: F-3.1 baseline+profile live gameplay → F-3.2 consumer
+incremental rebuild (the named "next increment") → F-3.3 producer dirty-tracking + kill the by-value
+copy → F-3.4 live resolve=host-copy → F-3.5 dense gameplay correctness+framerate.
+**Exit:** live gameplay renders correctly through plume at real-time (coexisting with rexglue).
 
 ### F-4 — TAKEOVER: make plume exclusive  ← *the goal*
 Suppress rexglue's GPU render backend and present so plume is the only output:
@@ -152,13 +213,31 @@ baseline reached parity with 4 small fixes; the owned path needs its own sweep (
 jersey numbers/names, equipment normals + cube reflections, alpha-to-coverage net, MSAA).
 **Exit:** user-verified parity with the retired FSI baseline across all scenes.
 
-### F-6 — Performance  ← *the gating risk*
-Path C was ~3 fps, but that was **bring-up artifacts** (CPU untile, disk-replay, dual-GPU
-coexistence) — F-3/F-4 remove all three. Real-time *owned* plume is nonetheless **unproven**. Levers:
-GPU-compute untile, descriptor/buffer pooling, dynamic-texture-by-address reuse, removing the
-coexistence overhead, MT command recording.
-**Exit:** real-time framerate (target: within range of the retired FSI baseline's 66–84 fps) in
-dense gameplay. **This is the make-or-break; if it cannot be met, the pivot fails and FSI stands.**
+### F-6 — Performance  ← ~~the gating risk~~ **DE-RISKED (2026-06-22 spike): PROVEN**
+Path C's old ~3 fps was **entirely bring-up artifacts** (per-frame CPU untile, disk I/O,
+dual-GPU coexistence) — F-3/F-4 remove all three. **Measured spike result** (RTX 4080 SUPER;
+`NHL_HIGHCUT_PERF` instrumentation in `plume_present.cpp::RenderClear`, validation layer OFF):
+
+- **Captured frame:** the attract-demo auto-latched a dense **500-draw / 346-3D** broadcast frame
+  (real on-ice broadcast presentation — representative of gameplay density).
+- **Replay through plume, steady state (WITH rexglue coexistence contending for the GPU):**
+  CPU-record ~0.37 ms, **GPU ~5.7 ms, frame ~6.0 ms → ~165 fps.**
+- **Tail of the run, once rexglue's GPU work dropped away (≈ the F-4 exclusive endstate):**
+  **GPU ~1.0 ms, frame ~1.5 ms → ~650–700 fps.** Same 500 draws — so the ~5.7 ms steady-state was
+  ~5× inflated by *coexistence contention*, exactly the overhead F-4 removes.
+
+**Verdict: owned-plume renders a dense 3D frame at 2.7× real-time even in the unoptimized,
+contended bring-up state, and ~11× when it has the GPU to itself.** CPU command-buffer build for
+500 draws is trivial (~0.4 ms). The pivot is not perf-gated. The make-or-break risk is retired.
+
+**Caveats / remaining confirmation:** the spike is a STATIC replay (resources untiled/uploaded/
+pipelined ONCE at load), so it measures GPU render cost + CPU record cost, **not** the live
+per-frame upload/translate cost F-3 adds (dynamic geometry re-upload, new-draw shader/pipeline
+build). Those are cacheable (pipeline-by-hash, texture-by-address, only dynamic vfetch ranges
+re-upload — see [[highcut-live-takeover-freeze-fix]]) and start from a 0.4 ms base, so headroom is
+large — but a live F-3 measurement is the final confirmation. Also: high-end GPU; weaker hardware
+scales down, but a ~1 ms exclusive cost leaves margin for an 8×-slower GPU to clear 60 fps.
+**Levers if ever needed:** GPU-compute untile, descriptor/buffer pooling, MT command recording.
 
 ---
 

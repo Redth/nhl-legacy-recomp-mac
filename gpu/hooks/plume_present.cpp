@@ -1567,6 +1567,15 @@ void LoadResolveGraph(PlumeCtx& c) {
 }
 
 void RenderClear(PlumeCtx& c) {
+    // F-6 PERF SPIKE: NHL_HIGHCUT_PERF measures plume's per-frame cost in isolation, to answer
+    // "can owned-plume hit real-time?" CPU-record = begin()->end() (building the command buffer);
+    // GPU = executeCommandLists->waitForCommandFence (the fence is signaled by command-list
+    // completion, independent of present/vsync, which only stalls the NEXT acquire). These are
+    // serial in this single-frame-in-flight design, so frame = record + gpu. Logged every 60 frames.
+    static const bool perf = std::getenv("NHL_HIGHCUT_PERF") != nullptr;
+    static double s_perfRec = 0.0, s_perfGpu = 0.0, s_perfRecMax = 0.0, s_perfGpuMax = 0.0;
+    static uint64_t s_perfN = 0;
+    std::chrono::steady_clock::time_point tRec0{}, tRecEnd{}, tGpu0{};
     // C-5a: load the captured frame once, before touching the swapchain (resource creation +
     // texture uploads use the queue, independent of the frame). Gated NHL_HIGHCUT_C5.
     static const bool c5_mode = std::getenv("NHL_HIGHCUT_C5") != nullptr;
@@ -1599,6 +1608,7 @@ void RenderClear(PlumeCtx& c) {
         return;
     }
 
+    if (perf) tRec0 = std::chrono::steady_clock::now();
     c.cmd->begin();
     RenderTexture* tex = c.swap->getTexture(idx);
     // C-5c: transition color -> COLOR_WRITE and the shared depth-stencil -> DEPTH_WRITE for this pass.
@@ -2101,6 +2111,7 @@ void RenderClear(PlumeCtx& c) {
     c.cmd->barriers(RenderBarrierStage::NONE,
                     RenderTextureBarrier(tex, RenderTextureLayout::PRESENT));
     c.cmd->end();
+    if (perf) tRecEnd = std::chrono::steady_clock::now();
 
     while (c.releaseSems.size() < c.swap->getTextureCount())
         c.releaseSems.emplace_back(c.device->createCommandSemaphore());
@@ -2108,9 +2119,28 @@ void RenderClear(PlumeCtx& c) {
     const RenderCommandList* cl = c.cmd.get();
     RenderCommandSemaphore* wait = c.acquireSem.get();
     RenderCommandSemaphore* signal = c.releaseSems[idx].get();
+    if (perf) tGpu0 = std::chrono::steady_clock::now();
     c.queue->executeCommandLists(&cl, 1, &wait, 1, &signal, 1, c.fence.get());
     c.swap->present(idx, &signal, 1);
     c.queue->waitForCommandFence(c.fence.get());
+    if (perf) {
+        using msd = std::chrono::duration<double, std::milli>;
+        const auto now = std::chrono::steady_clock::now();
+        const double recMs = std::chrono::duration_cast<msd>(tRecEnd - tRec0).count();
+        const double gpuMs = std::chrono::duration_cast<msd>(now - tGpu0).count();
+        s_perfRec += recMs; s_perfGpu += gpuMs; ++s_perfN;
+        if (recMs > s_perfRecMax) s_perfRecMax = recMs;
+        if (gpuMs > s_perfGpuMax) s_perfGpuMax = gpuMs;
+        if (s_perfN >= 60) {
+            const double aRec = s_perfRec / double(s_perfN), aGpu = s_perfGpu / double(s_perfN);
+            const double total = aRec + aGpu;
+            REXLOG_INFO("[highcut-PERF] draws={} | CPU-record avg={:.3f}ms max={:.3f} | "
+                        "GPU avg={:.3f}ms max={:.3f} | frame={:.3f}ms -> {:.1f} fps ceiling",
+                        uint32_t(c.c5draws.size()), aRec, s_perfRecMax, aGpu, s_perfGpuMax,
+                        total, total > 0.0 ? 1000.0 / total : 0.0);
+            s_perfRec = s_perfGpu = 0.0; s_perfN = 0; s_perfRecMax = s_perfGpuMax = 0.0;
+        }
+    }
 
     // C-5g: GPU is idle (fence waited) — map the readback buffer and write the PNG once.
     if (doShot && shotBuf) {
