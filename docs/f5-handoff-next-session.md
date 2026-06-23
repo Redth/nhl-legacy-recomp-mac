@@ -89,6 +89,16 @@ custom decoder. But MT alone is a large, real win and is now GO with evidence.
 5. Gate behind a flag (`NHL_HIGHCUT_MT_PRODUCER`), keep BUSYPROBE on to confirm the CP wall drops toward
    ~26 ms. Validate with the user at the controller (geometry correctness + fps).
 
+### ▶ NEXT: execute the MT producer — STAGED (1 worker first). Plan: [mt-producer-stage1-plan.md](mt-producer-stage1-plan.md)
+
+User chose **stage it: 1 worker first, then widen** (de-risks the ~1000-line body extraction from
+concurrency). Full execution spec — seam (CP thread 1405–2144 + 2922–3068; worker 2149–2920+3073–3190),
+snapshot contents (full `RegisterFile` copy for Stage 1, vtx/idx bytes, vpi/result/translate-outputs),
+the ~24 body redirect sites, the single-worker lifecycle, and the 1a→1b increments — is in
+**`docs/mt-producer-stage1-plan.md`**. Gated `NHL_HIGHCUT_MT_PRODUCER` (default OFF = byte-identical
+serial path). Target ~29 fps (Stage 1), ~38 fps (Stage 2 N-worker). Validate: `_mtproducer.ps1` (clone
+`_snapprobe.ps1` + the flag), user at the controller, A/B by unsetting the flag.
+
 ## Performance reality (manage expectations)
 
 - **Likely reachable** (MT producer + F-4 + gap1/untile micro-opts): **~30–35 fps dense**, higher on
