@@ -39,7 +39,8 @@ if ($Off) {
   Write-Output "=== MT PRODUCER OFF (proven serial path -- A/B reference) ==="
 } else {
   $env:NHL_HIGHCUT_MT_PRODUCER = "1"
-  Write-Output "=== MT PRODUCER ON (Stage 1a: ProduceLiveDrawPacket, synchronous, live read) ==="
+  $env:NHL_HIGHCUT_F4PROBE     = "1"   # decompose the CP frame: throwaway base-IssueSwap vs PM4 decode
+  Write-Output "=== MT PRODUCER ON (threaded; +F4 split probe) ==="
 }
 $argline = '--game_data_root "H:\Emulators\games\XBOX\NHL Legacy - Vanilla"'
 $p = Start-Process -FilePath "$dir\nhllegacy.exe" -ArgumentList $argline -WorkingDirectory $dir -PassThru
@@ -50,7 +51,7 @@ $p.WaitForExit()
 Start-Sleep -Milliseconds 600
 $log = (Get-ChildItem "$dir\logs\*.log" | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
 Write-Output "LOG=$log"
-Write-Output "=== [highcut-mt] (MT path notice + fps) ==="
-Select-String -Path $log -Pattern "highcut-mt" | Select-Object -Last 12 | ForEach-Object { ($_.Line -split '\] ',2)[-1] }
+Write-Output "=== [highcut-mt] fps + CP/worker busy + F4 split ==="
+Select-String -Path $log -Pattern "highcut-mt" | Select-Object -Last 20 | ForEach-Object { ($_.Line -split '\] ',2)[-1] }
 Write-Output "=== [highcut-perf] live takeover fps (serial path, if -Off) ==="
 Select-String -Path $log -Pattern "live takeover:" | Select-Object -Last 6 | ForEach-Object { ($_.Line -split '\] ',2)[-1] }

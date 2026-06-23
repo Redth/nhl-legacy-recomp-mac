@@ -1407,6 +1407,15 @@ extern "C" void HighcutLiveCommitFrame(const uint8_t* resolves, size_t rsize);
 // delimited to ONE guest frame instead of stacking 2–3.
 extern "C" uint64_t HighcutGuestPresentCount();
 
+// F-4 probe (NHL_HIGHCUT_F4PROBE): decompose the CP thread's per-frame cost to answer whether F-4
+// (headless SDK — no GPU render/present) can cut the ~25ms "SDK decode" toward FSI's ~12ms. In live
+// takeover the base per-draw render is ALREADY skipped, so the throwaway candidate is the base
+// IssueSwap (the SDK's GPU submit + swapchain PRESENT, which plume duplicates). These accumulate the
+// per-frame wall time of (a) our IssueDraw body [CP-side setup, incl. any enqueue backpressure wait]
+// and (b) the base IssueSwap [the throwaway]; reported + reset in the CP busy-probe window. CP thread.
+static double g_f4OurDraw = 0.0;
+static double g_f4BaseSwap = 0.0;
+
 // ===== MT PRODUCER (NHL_HIGHCUT_MT_PRODUCER) — Stage 1, docs/mt-producer-stage1-plan.md ============
 // Per-draw snapshot handed from the CP thread to ProduceLiveDrawPacket. The SDK rewrites register_file_
 // for the next draw and RING-BUFFERS guest vtx/idx WITHIN a frame, so a worker on draw N would read
@@ -2901,9 +2910,25 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
             const double cpuNow = cpuSecs();
             const double busy = cpuNow - s_cpBase;
             s_cpBase = cpuNow;
+            const double f = s_cpF > 0 ? double(s_cpF) : 1.0;
             REXLOG_INFO("[highcut-mt] CP-thread CPU-busy={:.0f}% ({:.1f}ms/frame) [~=100% => CP-bound, N "
                         "workers won't help; <<100% => worker-bound, N workers help]",
-                        secs > 0.0 ? 100.0 * busy / secs : 0.0, busy / s_cpF * 1000.0);
+                        secs > 0.0 ? 100.0 * busy / secs : 0.0, busy / f * 1000.0);
+            // F-4 split: how much of the CP frame is the THROWAWAY base IssueSwap (SDK submit+present,
+            // removable by F-4 headless) vs our per-draw setup vs the rest (PM4 decode). decode is the
+            // remainder of the frame wall after our-IssueDraw and base-swap.
+            static const bool f4probe = std::getenv("NHL_HIGHCUT_F4PROBE") != nullptr;
+            if (f4probe) {
+              const double ourMs = g_f4OurDraw / f * 1000.0;
+              const double swapMs = g_f4BaseSwap / f * 1000.0;
+              const double wallMs = secs / f * 1000.0;
+              REXLOG_INFO("[highcut-mt]   F4-split: base-IssueSwap(throwaway)={:.1f}ms/frame "
+                          "our-IssueDraw(CP setup +bp-wait)={:.1f}ms/frame  PM4-decode(remainder)~={:.1f}ms/frame "
+                          "(of {:.1f}ms wall) [big base-swap => F-4 frees it => FSI-parity reachable]",
+                          swapMs, ourMs, wallMs - ourMs - swapMs, wallMs);
+              g_f4OurDraw = 0.0;
+              g_f4BaseSwap = 0.0;
+            }
             s_cpF = 0;
             s_cpT0 = now;
           }
@@ -6805,6 +6830,15 @@ bool NhlD3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, ui
                                          bool major_mode_explicit) {
   ++draws_this_frame_;
   ++draws_total_;
+  // F-4 probe: accumulate this IssueDraw's whole-body wall time (covers all the early returns below).
+  static const bool f4probe = std::getenv("NHL_HIGHCUT_F4PROBE") != nullptr;
+  struct F4DrawAcc {
+    std::chrono::steady_clock::time_point t0;
+    bool on;
+    ~F4DrawAcc() {
+      if (on) g_f4OurDraw += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    }
+  } f4acc{std::chrono::steady_clock::now(), f4probe};
 
   // Stage-1 texture auto-mapping (NHL_INJECT_CORRELATE): hash this draw's textures'
   // guest RAM against the loose-.rx2 registry and record address->asset hits. Env-
@@ -7226,7 +7260,13 @@ void NhlD3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t fron
   // after every dumped draw and the index resets on frame_index_ change. IssueSwap is NOT a reliable
   // finalize point: live-3D takeover can be killed mid-frame before this swap is ever reached.)
 
-  d3d12::D3D12CommandProcessor::IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+  {
+    // F-4 probe: time the base IssueSwap (SDK GPU submit + swapchain present) — the throwaway in live mode.
+    static const bool f4probe = std::getenv("NHL_HIGHCUT_F4PROBE") != nullptr;
+    const auto _s0 = f4probe ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    d3d12::D3D12CommandProcessor::IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+    if (f4probe) g_f4BaseSwap += std::chrono::duration<double>(std::chrono::steady_clock::now() - _s0).count();
+  }
 
   // LIVE mode: present our just-rendered RT to the window, then reset per-frame state so the
   // next frame re-clears the RT + re-BeginFrame's the beta caches (gated on first_draw, i.e.
