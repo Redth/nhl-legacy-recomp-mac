@@ -1417,6 +1417,8 @@ extern "C" uint64_t HighcutGuestPresentCount();
 struct NhlD3D12CommandProcessor::HcDrawTask {
   uint64_t seq = 0;
   bool use_snapshot = false;  // true: MT (read rf/guest_vtx/guest_idx); false: serial (read live state)
+  bool frame_marker = false;          // a frame-boundary COMMIT marker (not a draw) — worker commits in order
+  std::vector<uint8_t> resolve_bytes; // serialized resolve sidecar for the just-ended frame (markers only)
 
   // --- snapshotted mutable state (filled only when use_snapshot) ---
   // rf is a FULL-SIZE register buffer (so the consumer's RF.Get<>()/regs[] index by absolute register),
@@ -1477,8 +1479,16 @@ struct NhlD3D12CommandProcessor::HcLiveWorker {
     std::lock_guard<std::mutex> lk(m_);
     free_.push_back(t);
   }
+  // Backpressure: block the CP thread when the queue is full so it runs at most kMaxDepth tasks ahead of
+  // the worker — this throttles the (faster) CP decode to the (slower) worker's rate, fully overlapping
+  // the decode, while bounding both pool memory AND how far the worker can lag (hence how stale a live
+  // texture read can be: ~kMaxDepth draws, << 1 frame). A few hundred is plenty to keep the worker fed.
+  static constexpr size_t kMaxDepth = 256;
   void enqueue(HcDrawTask* t) {
-    { std::lock_guard<std::mutex> lk(m_); q_.push_back(t); }
+    std::unique_lock<std::mutex> lk(m_);
+    space_cv_.wait(lk, [this] { return q_.size() < kMaxDepth || stop_; });
+    q_.push_back(t);
+    lk.unlock();
     cv_.notify_one();
   }
   void drain() {  // block until the queue is empty AND the in-flight task (if any) finished
@@ -1488,6 +1498,7 @@ struct NhlD3D12CommandProcessor::HcLiveWorker {
   ~HcLiveWorker() {
     { std::lock_guard<std::mutex> lk(m_); stop_ = true; }
     cv_.notify_all();
+    space_cv_.notify_all();  // wake any CP thread blocked in enqueue
     if (thread_.joinable()) thread_.join();
   }
  private:
@@ -1502,6 +1513,7 @@ struct NhlD3D12CommandProcessor::HcLiveWorker {
         q_.pop_front();
         busy_ = true;
       }
+      space_cv_.notify_one();  // a queue slot freed — wake a CP thread blocked in enqueue
       fn_(*t);
       {
         std::lock_guard<std::mutex> lk(m_);
@@ -1513,7 +1525,7 @@ struct NhlD3D12CommandProcessor::HcLiveWorker {
   }
   std::thread thread_;
   std::mutex m_;
-  std::condition_variable cv_, drain_cv_;
+  std::condition_variable cv_, drain_cv_, space_cv_;
   std::deque<HcDrawTask*> q_;                            // in-flight (pointers into storage_)
   std::vector<std::unique_ptr<HcDrawTask>> storage_;     // owns the pooled tasks
   std::deque<HcDrawTask*> free_;                         // recycled, ready to reuse
@@ -1526,40 +1538,25 @@ struct NhlD3D12CommandProcessor::HcLiveWorker {
 // it already, so this is usually a no-op. The unique_ptr<beta cache> members destroy after this body.
 NhlD3D12CommandProcessor::~NhlD3D12CommandProcessor() { delete mt_worker_; }
 
-// MT producer per-draw frame-boundary handling (CP thread). Mirrors the live_feed commit embedded in
-// RenderBetaOwnedDraw's serial body: when the guest-present counter advances, commit the just-ended
-// frame (resolve sidecar) to the plume bridge and reset the per-frame draw index. The fps readout shows
-// whether the threaded producer keeps up.
-void NhlD3D12CommandProcessor::MaybeCommitLiveFrame() {
-  const uint64_t present_count = HighcutGuestPresentCount();
-  if (present_count == highcut_last_present_count_ && frame_index_ == highcut_last_frame_index_) return;
-  std::vector<uint8_t> rbytes;
-  const uint32_t rmagic = nhl::highcut::kResolveSidecarMagic;
-  const uint32_t rcount = uint32_t(highcut_resolves_.size());
-  auto ap = [&](const void* p, size_t n) {
-    const uint8_t* b = static_cast<const uint8_t*>(p);
-    rbytes.insert(rbytes.end(), b, b + n);
-  };
-  ap(&rmagic, 4);
-  ap(&rcount, 4);
-  for (const auto& m : highcut_resolves_) ap(&m, sizeof(m));
-  HighcutLiveCommitFrame(rbytes.data(), rbytes.size());
-  {
-    static uint32_t s_fpsFrames = 0;
-    static auto s_fpsT0 = std::chrono::steady_clock::now();
-    if (++s_fpsFrames >= 60) {
-      const auto now = std::chrono::steady_clock::now();
-      const double secs = std::chrono::duration_cast<std::chrono::duration<double>>(now - s_fpsT0).count();
-      REXLOG_INFO("[highcut-mt] live takeover (MT): {:.1f} fps over {} frames ({} draws last frame)",
-                  secs > 0.0 ? s_fpsFrames / secs : 0.0, s_fpsFrames, highcut_capture_idx_);
-      s_fpsFrames = 0;
-      s_fpsT0 = now;
-    }
+// MT producer frame COMMIT, run in pipeline order (on the worker in threaded mode, on the CP thread in
+// sync mode) when the worker reaches a frame-boundary marker. Finalizes the just-ended frame's resolve
+// sidecar to the plume bridge and resets the per-frame draw index; the fps readout shows whether the
+// threaded producer keeps up. Boundary DETECTION + resolve serialization happen on the CP thread (which
+// owns highcut_resolves_) and arrive here as `resolve_bytes`. highcut_capture_idx_ is owned by whoever
+// produces draws (the worker in threaded mode), so resetting it here is race-free.
+void NhlD3D12CommandProcessor::CommitLiveFrameOnWorker(const std::vector<uint8_t>& resolve_bytes) {
+  HighcutLiveCommitFrame(resolve_bytes.data(), resolve_bytes.size());
+  static uint32_t s_fpsFrames = 0;
+  static auto s_fpsT0 = std::chrono::steady_clock::now();
+  if (++s_fpsFrames >= 60) {
+    const auto now = std::chrono::steady_clock::now();
+    const double secs = std::chrono::duration_cast<std::chrono::duration<double>>(now - s_fpsT0).count();
+    REXLOG_INFO("[highcut-mt] live takeover (MT): {:.1f} fps over {} frames ({} draws last frame)",
+                secs > 0.0 ? s_fpsFrames / secs : 0.0, s_fpsFrames, highcut_capture_idx_);
+    s_fpsFrames = 0;
+    s_fpsT0 = now;
   }
-  highcut_last_present_count_ = present_count;
-  highcut_last_frame_index_ = frame_index_;
   highcut_capture_idx_ = 0;
-  highcut_resolves_.clear();
 }
 
 void NhlD3D12CommandProcessor::ProduceLiveDrawPacket(HcDrawTask& t) {
@@ -2815,27 +2812,51 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     // live instead of the snapshot. Default = threaded + snapshot (the real 1b-step2 path).
     static const bool mt_sync = std::getenv("NHL_HIGHCUT_MT_SYNC") != nullptr;
     static const bool mt_liveread = std::getenv("NHL_HIGHCUT_MT_LIVEREAD") != nullptr;
-    // Frame boundary: in threaded mode DRAIN the worker (so the just-ended frame's draws are all pushed)
-    // BEFORE committing it — this barrier also keeps guest texture RAM + the live-feed accumulator free of
-    // concurrent access. MaybeCommitLiveFrame re-checks the boundary, commits the sidecar, and resets.
+    // Lazily create the worker (also owns the task pool, used even in sync mode); start its thread only
+    // when threaded. The worker branches: a frame-boundary marker commits; a draw produces a packet.
+    if (!mt_worker_) {
+      mt_worker_ = new HcLiveWorker();
+      if (!mt_sync)
+        mt_worker_->start([this](HcDrawTask& tk) {
+          if (tk.frame_marker) CommitLiveFrameOnWorker(tk.resolve_bytes);
+          else ProduceLiveDrawPacket(tk);
+        });
+    }
+    // DEEPENED PIPELINE: at a guest-present boundary, serialize the just-ended frame's resolves (CP owns
+    // highcut_resolves_) and hand the COMMIT to the pipeline as a frame-marker task — the worker runs it
+    // IN ORDER after that frame's draws. NO CP-side drain: the CP thread keeps decoding+enqueuing while
+    // the worker trails (bounded by the queue's kMaxDepth backpressure), so the SDK decode fully overlaps
+    // the producer work. (Texture source is still read live in the consumer; the bounded lag — a few
+    // hundred draws, << 1 frame — caps how stale that read can be.)
     {
       const uint64_t pc = HighcutGuestPresentCount();
       if (pc != highcut_last_present_count_ || frame_index_ != highcut_last_frame_index_) {
-        if (!mt_sync && mt_worker_) mt_worker_->drain();
-        MaybeCommitLiveFrame();
+        std::vector<uint8_t> rb;
+        const uint32_t rmagic = nhl::highcut::kResolveSidecarMagic;
+        const uint32_t rcount = uint32_t(highcut_resolves_.size());
+        auto ap = [&](const void* p, size_t n) { const uint8_t* b = static_cast<const uint8_t*>(p); rb.insert(rb.end(), b, b + n); };
+        ap(&rmagic, 4);
+        ap(&rcount, 4);
+        for (const auto& m : highcut_resolves_) ap(&m, sizeof(m));
+        highcut_resolves_.clear();
+        highcut_last_present_count_ = pc;
+        highcut_last_frame_index_ = frame_index_;
+        if (mt_sync) {
+          CommitLiveFrameOnWorker(rb);
+        } else {
+          HcDrawTask* mk = mt_worker_->acquire();
+          mk->frame_marker = true;
+          mk->resolve_bytes = std::move(rb);
+          mt_worker_->enqueue(mk);
+        }
       }
-    }
-    // Lazily create the worker (also owns the task pool, used even in sync mode); start its thread only
-    // when threaded.
-    if (!mt_worker_) {
-      mt_worker_ = new HcLiveWorker();
-      if (!mt_sync) mt_worker_->start([this](HcDrawTask& tk) { ProduceLiveDrawPacket(tk); });
     }
     HcDrawTask* tp = mt_worker_->acquire();  // recycled — its rf/vtx/idx buffers keep capacity (no malloc)
     HcDrawTask& task = *tp;
     // SNAPSHOT by default (the worker must read register banks + guest vtx/idx from the copy). MT_LIVEREAD
     // (sync only) forces the 1a-verified live-read path for A/B; threaded mode ALWAYS snapshots.
     task.use_snapshot = !(mt_sync && mt_liveread);
+    task.frame_marker = false;   // recycled tasks may have been a marker
     task.vs = beta_current_vs_;  // per-draw shader pointer (the CP thread overwrites it for the next draw)
     task.primitive_type = primitive_type;
     task.index_count = index_count;

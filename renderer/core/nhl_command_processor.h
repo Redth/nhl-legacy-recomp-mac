@@ -197,10 +197,11 @@ class NhlD3D12CommandProcessor : public rex::graphics::d3d12::D3D12CommandProces
   // Defined in the .cpp (heavy SDK types); forward-declared here as a nested type.
   struct HcDrawTask;
   void ProduceLiveDrawPacket(HcDrawTask& t);
-  // MT producer frame boundary: detect a new guest present, commit the just-ended frame's resolve
-  // sidecar to the plume bridge, reset per-frame counters, and emit the live fps readout. The serial
-  // path does this inline; the MT path skips the serial body, so it runs this on the CP thread per draw.
-  void MaybeCommitLiveFrame();
+  // MT producer frame commit, run IN PIPELINE ORDER (worker thread when threaded, CP thread when sync) at
+  // a frame-boundary marker: finalize the just-ended frame's resolve sidecar to the plume bridge + reset
+  // the per-frame draw index + emit the fps readout. Boundary detection + resolve serialization happen on
+  // the CP thread (owner of highcut_resolves_) and are passed in as resolve_bytes.
+  void CommitLiveFrameOnWorker(const std::vector<uint8_t>& resolve_bytes);
   // MT producer worker (1b-step2): a single background thread runs ProduceLiveDrawPacket on snapshotted
   // tasks so our ~34ms per-draw work overlaps the CP thread's ~25ms SDK PM4 decode. Lazily created on the
   // first MT draw; deleted (stop + join) in ShutdownContext, with the out-of-line destructor as backstop.
