@@ -1448,7 +1448,12 @@ struct NhlD3D12CommandProcessor::HcDrawTask {
   // --- translate outputs (produced CP-side, consumed by the body) ---
   bool p3_dump_data = false;
   uint64_t p3_vs_id = 0, p3_ps_id = 0;
-  std::vector<uint8_t> p3_vs_spirv, p3_ps_spirv;
+  // SPIR-V by POINTER into the stable shader-translation cache (never copied): it's streamed by-id ONCE,
+  // so a per-draw copy is pure waste on the CP thread. The cache entries are process-lifetime and
+  // unordered_map guarantees reference stability across inserts, so the pointer stays valid for the
+  // bounded time the worker trails. null => that stage's shader absent (treated as 0 bytes).
+  const std::vector<uint8_t>* p3_vs_spirv_ptr = nullptr;
+  const std::vector<uint8_t>* p3_ps_spirv_ptr = nullptr;
   std::vector<rex::graphics::SpirvShader::TextureBinding> p3_vs_texbinds, p3_ps_texbinds;
   std::vector<rex::graphics::SpirvShader::SamplerBinding> p3_vs_sampbinds, p3_ps_sampbinds;
   uint32_t p3_vs_sampler_count = 0, p3_ps_sampler_count = 0;
@@ -1937,8 +1942,8 @@ void NhlD3D12CommandProcessor::ProduceLiveDrawPacket(HcDrawTask& t) {
   hdr.bool_bytes = kBoolLoopBytes;
   hdr.vs_float_bytes = uint32_t(vs_floats.size());
   hdr.ps_float_bytes = uint32_t(ps_floats.size());
-  hdr.vs_spirv_bytes = uint32_t(t.p3_vs_spirv.size());
-  hdr.ps_spirv_bytes = uint32_t(t.p3_ps_spirv.size());
+  hdr.vs_spirv_bytes = t.p3_vs_spirv_ptr ? uint32_t(t.p3_vs_spirv_ptr->size()) : 0u;
+  hdr.ps_spirv_bytes = t.p3_ps_spirv_ptr ? uint32_t(t.p3_ps_spirv_ptr->size()) : 0u;
   hdr.texture_count = uint32_t(tex_descs.size());
   hdr.ps_sampler_count = t.p3_ps_sampler_count;
   hdr.vs_texture_count = uint32_t(vs_tex_descs.size());
@@ -2030,8 +2035,8 @@ void NhlD3D12CommandProcessor::ProduceLiveDrawPacket(HcDrawTask& t) {
     if (!id || !data || !n) return;
     if (s_sentRes.insert(id).second) HighcutLivePushResource(id, data, n);
   };
-  if (hdr.vs_spirv_bytes) { streamRes(hdr.vs_shader_id, t.p3_vs_spirv.data(), hdr.vs_spirv_bytes); hdr.vs_spirv_bytes = 0; }
-  if (hdr.ps_spirv_bytes) { streamRes(hdr.ps_shader_id, t.p3_ps_spirv.data(), hdr.ps_spirv_bytes); hdr.ps_spirv_bytes = 0; }
+  if (hdr.vs_spirv_bytes) { streamRes(hdr.vs_shader_id, t.p3_vs_spirv_ptr->data(), hdr.vs_spirv_bytes); hdr.vs_spirv_bytes = 0; }
+  if (hdr.ps_spirv_bytes) { streamRes(hdr.ps_shader_id, t.p3_ps_spirv_ptr->data(), hdr.ps_spirv_bytes); hdr.ps_spirv_bytes = 0; }
   if (geo_byid) {
     if (vtx_id && !shared_blob.empty() && s_sentGeo.insert(vtx_id).second)
       HighcutLivePushResource(vtx_id, shared_blob.data(), uint32_t(shared_blob.size()));
@@ -2052,8 +2057,8 @@ void NhlD3D12CommandProcessor::ProduceLiveDrawPacket(HcDrawTask& t) {
   app(bool_src, kBoolLoopBytes);
   if (hdr.vs_float_bytes) app(vs_floats.data(), hdr.vs_float_bytes);
   if (hdr.ps_float_bytes) app(ps_floats.data(), hdr.ps_float_bytes);
-  if (hdr.vs_spirv_bytes) app(t.p3_vs_spirv.data(), hdr.vs_spirv_bytes);
-  if (hdr.ps_spirv_bytes) app(t.p3_ps_spirv.data(), hdr.ps_spirv_bytes);
+  if (hdr.vs_spirv_bytes) app(t.p3_vs_spirv_ptr->data(), hdr.vs_spirv_bytes);
+  if (hdr.ps_spirv_bytes) app(t.p3_ps_spirv_ptr->data(), hdr.ps_spirv_bytes);
   for (size_t i = 0; i < tex_descs.size(); ++i) { app(&tex_descs[i], sizeof(tex_descs[i])); if (tex_descs[i].data_bytes) app(tex_blobs[i]->data(), tex_descs[i].data_bytes); }
   for (size_t i = 0; i < vs_tex_descs.size(); ++i) { app(&vs_tex_descs[i], sizeof(vs_tex_descs[i])); if (vs_tex_descs[i].data_bytes) app(vs_tex_blobs[i]->data(), vs_tex_descs[i].data_bytes); }
   for (const auto& sd : ps_samp_descs) app(&sd, sizeof(sd));
@@ -2308,6 +2313,10 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
   uint64_t p3_vs_id = 0, p3_ps_id = 0;
   std::vector<uint8_t> p3_vs_spirv;  // C-5a: masked VS dumped INLINE per draw (frame capture)
   std::vector<uint8_t> p3_ps_spirv;
+  // MT producer: pointers into the xlat cache's stable SPIR-V (set in the cached translate path) so the MT
+  // task carries a pointer, not a per-draw copy. The serial path still uses the p3_*_spirv vectors above.
+  const std::vector<uint8_t>* p3_vs_spirv_ptr = nullptr;
+  const std::vector<uint8_t>* p3_ps_spirv_ptr = nullptr;
   std::vector<rex::graphics::SpirvShader::TextureBinding> p3_ps_texbinds;
   uint32_t p3_ps_sampler_count = 0;
   // C-5f: the PS sampler bindings (filter/clamp resolved from each binding's fetch constant). Bring-up
@@ -2449,7 +2458,8 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
         vsIt = s_vsXlat.emplace(vs_key, std::move(e)).first;
       }
       if (vsIt->second.valid) {
-        p3_vs_spirv = vsIt->second.spirv;
+        p3_vs_spirv_ptr = &vsIt->second.spirv;             // MT: carry a pointer (no copy)
+        if (!hc_mt_producer) p3_vs_spirv = vsIt->second.spirv;  // serial inline path needs the copy
         p3_vs_texbinds = vsIt->second.tex;
         p3_vs_sampbinds = vsIt->second.samp;
         p3_vs_sampler_count = uint32_t(p3_vs_sampbinds.size());
@@ -2492,7 +2502,8 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
           psIt = s_psXlat.emplace(ps_key, std::move(e)).first;
         }
         if (psIt->second.valid) {
-          p3_ps_spirv = psIt->second.spirv;
+          p3_ps_spirv_ptr = &psIt->second.spirv;            // MT: carry a pointer (no copy)
+          if (!hc_mt_producer) p3_ps_spirv = psIt->second.spirv;  // serial inline path needs the copy
           p3_ps_texbinds = psIt->second.tex;
           p3_ps_sampbinds = psIt->second.samp;
           p3_ps_sampler_count = uint32_t(p3_ps_sampbinds.size());
@@ -2886,8 +2897,8 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     task.p3_dump_data = p3_dump_data;
     task.p3_vs_id = p3_vs_id;
     task.p3_ps_id = p3_ps_id;
-    task.p3_vs_spirv.assign(p3_vs_spirv.begin(), p3_vs_spirv.end());  // assign reuses the pooled capacity
-    task.p3_ps_spirv.assign(p3_ps_spirv.begin(), p3_ps_spirv.end());
+    task.p3_vs_spirv_ptr = p3_vs_spirv_ptr;  // pointer into the stable xlat cache — no per-draw SPIR-V copy
+    task.p3_ps_spirv_ptr = p3_ps_spirv_ptr;
     task.p3_vs_texbinds.assign(p3_vs_texbinds.begin(), p3_vs_texbinds.end());
     task.p3_ps_texbinds.assign(p3_ps_texbinds.begin(), p3_ps_texbinds.end());
     task.p3_vs_sampbinds.assign(p3_vs_sampbinds.begin(), p3_vs_sampbinds.end());
