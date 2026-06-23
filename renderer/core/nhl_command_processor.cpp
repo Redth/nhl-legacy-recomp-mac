@@ -5,6 +5,11 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <mutex>
+#include <thread>
 #include <bit>
 #include <cmath>
 #include <cstdio>
@@ -295,10 +300,9 @@ void NhlD3D12CommandProcessor::PrintInventory() {
       inv_color_info_.size());
 }
 
-// Defined here (not =default in the header) so the unique_ptr<beta cache> members
-// are destroyed where the cache types are complete. By this point ShutdownContext
-// has already reset them, so this is normally a no-op.
-NhlD3D12CommandProcessor::~NhlD3D12CommandProcessor() = default;
+// The destructor is defined LATER in this file (after the HcDrawTask/HcLiveWorker definitions) so the
+// forward-declared unique_ptr<HcLiveWorker> member is destroyed where that type is complete — same reason
+// the beta-cache unique_ptrs need their cache types complete here. (Out-of-line, not =default in header.)
 
 bool NhlD3D12CommandProcessor::BuildBetaCaches() {
   // Phase 2 of the Tier-1 owned backend (docs/tier1-backend-build-order.md):
@@ -1427,6 +1431,7 @@ struct NhlD3D12CommandProcessor::HcDrawTask {
   rex::graphics::PrimitiveProcessor::ProcessingResult result{};
   rex::graphics::draw_util::ViewportInfo vpi{};
   rex::graphics::reg::RB_DEPTHCONTROL ndc{};                       // normalized depth/stencil control
+  rex::graphics::d3d12::D3D12Shader* vs = nullptr;                 // beta_current_vs_ this draw (per-draw!)
   rex::graphics::d3d12::D3D12Shader* eff_ps = nullptr;             // beta_current_ps_ or null this draw
 
   // --- translate outputs (produced CP-side, consumed by the body) ---
@@ -1438,12 +1443,64 @@ struct NhlD3D12CommandProcessor::HcDrawTask {
   uint32_t p3_vs_sampler_count = 0, p3_ps_sampler_count = 0;
 };
 
-// Stage 1a-cont (TODO): lift the per-draw packet-production body (geometry gather+hash → float pack →
-// spv_sys → untile → sampler descs → header → resource stream → serialize → HighcutLivePushDraw) here,
-// reading register banks from `t.use_snapshot ? t.rf : *register_file_`, vtx/idx from the snapshot when
-// `t.use_snapshot` (else live memory_), texture source always from live memory_. Profiling buckets +
-// frame-commit + drawcache stay on the CP thread (per-thread/per-frame, not part of this unit). Until
-// wired, RenderBetaOwnedDraw runs the inline serial body and this is never called.
+// MT producer worker (1b-step2). One background thread drains a FIFO of snapshotted draw tasks and runs
+// ProduceLiveDrawPacket on each — overlapping our ~34ms per-draw work with the CP thread's ~25ms SDK PM4
+// decode. SINGLE worker => FIFO order == draw order, so the consumer's HighcutLivePushDraw stays in draw
+// order with NO reorder buffer, and the worker is the SOLE toucher of s_texCache/s_sentRes/s_sentGeo and
+// the live-feed push, so NO locks are needed there. The CP thread DRAINS the worker at each frame
+// boundary before committing, so guest texture RAM + the live-feed accumulator are never touched
+// concurrently. (Stage 2 widens to N workers with an s_texCache lock + a seq-ordered drain.)
+struct NhlD3D12CommandProcessor::HcLiveWorker {
+  void start(std::function<void(HcDrawTask&)> fn) {
+    fn_ = std::move(fn);
+    thread_ = std::thread([this] { run(); });
+  }
+  void enqueue(HcDrawTask&& t) {
+    { std::lock_guard<std::mutex> lk(m_); q_.push_back(std::move(t)); }
+    cv_.notify_one();
+  }
+  void drain() {  // block until the queue is empty AND the in-flight task (if any) finished
+    std::unique_lock<std::mutex> lk(m_);
+    drain_cv_.wait(lk, [this] { return q_.empty() && !busy_; });
+  }
+  ~HcLiveWorker() {
+    { std::lock_guard<std::mutex> lk(m_); stop_ = true; }
+    cv_.notify_all();
+    if (thread_.joinable()) thread_.join();
+  }
+ private:
+  void run() {
+    for (;;) {
+      HcDrawTask t;
+      {
+        std::unique_lock<std::mutex> lk(m_);
+        cv_.wait(lk, [this] { return !q_.empty() || stop_; });
+        if (q_.empty()) { if (stop_) return; else continue; }
+        t = std::move(q_.front());
+        q_.pop_front();
+        busy_ = true;
+      }
+      fn_(t);
+      {
+        std::lock_guard<std::mutex> lk(m_);
+        busy_ = false;
+        if (q_.empty()) drain_cv_.notify_all();
+      }
+    }
+  }
+  std::thread thread_;
+  std::mutex m_;
+  std::condition_variable cv_, drain_cv_;
+  std::deque<HcDrawTask> q_;
+  std::function<void(HcDrawTask&)> fn_;
+  bool stop_ = false, busy_ = false;
+};
+
+// Out-of-line destructor — here, where HcLiveWorker (and the beta-cache types via the .cpp includes) are
+// complete. Deletes the MT worker (stop + join) as a backstop; ShutdownContext normally deleted + nulled
+// it already, so this is usually a no-op. The unique_ptr<beta cache> members destroy after this body.
+NhlD3D12CommandProcessor::~NhlD3D12CommandProcessor() { delete mt_worker_; }
+
 // MT producer per-draw frame-boundary handling (CP thread). Mirrors the live_feed commit embedded in
 // RenderBetaOwnedDraw's serial body: when the guest-present counter advances, commit the just-ended
 // frame (resolve sidecar) to the plume bridge and reset the per-frame draw index. The fps readout shows
@@ -1489,6 +1546,7 @@ void NhlD3D12CommandProcessor::ProduceLiveDrawPacket(HcDrawTask& t) {
   // live. Texture source: ALWAYS live memory_ (textures aren't ring-buffered; stable within a frame).
   rg::RegisterFile& RF = t.use_snapshot ? t.rf : *register_file_;
   const uint32_t* regs = RF.values;
+  rg::d3d12::D3D12Shader* vs = t.vs;       // snapshotted: beta_current_vs_ changes per draw on the CP thread
   rg::d3d12::D3D12Shader* eff_ps = t.eff_ps;
   const draw_util::ViewportInfo& vpi = t.vpi;
   const auto& result = t.result;
@@ -1519,7 +1577,7 @@ void NhlD3D12CommandProcessor::ProduceLiveDrawPacket(HcDrawTask& t) {
     struct VStream { uint32_t base, size, off; };
     VStream streams[64]; uint32_t nStreams = 0, total = 0;
     uint64_t h = 1469598103934665603ull;
-    for (const auto& vb : beta_current_vs_->vertex_bindings()) {
+    for (const auto& vb : vs->vertex_bindings()) {
       const uint32_t idx = vb.fetch_constant * 2;
       xenos::xe_gpu_vertex_fetch_t f{};
       f.dword_0 = regs[0x4800 + idx];
@@ -1612,7 +1670,7 @@ void NhlD3D12CommandProcessor::ProduceLiveDrawPacket(HcDrawTask& t) {
     }
     return out;
   };
-  const std::vector<uint8_t> vs_floats = pack_floats(beta_current_vs_, false);
+  const std::vector<uint8_t> vs_floats = pack_floats(vs, false);
   const std::vector<uint8_t> ps_floats = pack_floats(eff_ps, true);
 
   // ===== untile texture bindings into linear blobs + descs (PS set3, VS set2) =====
@@ -2724,13 +2782,25 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
   // sets use_snapshot=true + threads it). The proven serial body is untouched as the else-if. (Drawcache
   // and the disk-capture/survey branches are not part of the MT path — live-feed only.)
   if (hc_mt_producer && p3_dump_data && beta_current_vs_ && memory_) {
-    MaybeCommitLiveFrame();  // CP-thread frame boundary (serial body does this inline; MT skips it)
-    HcDrawTask task;
-    // 1b-step1: default = SNAPSHOT (read register banks + guest vtx/idx from the copy, as a worker will);
-    // NHL_HIGHCUT_MT_LIVEREAD forces the 1a-verified live-read path for A/B. The snapshot is the only new
-    // CP-thread cost (~1ms, F-5b) — proven cheap; this step verifies it's also CORRECT before threading.
+    // Debug ladder: MT_SYNC runs the consumer on the CP thread (no worker); MT_LIVEREAD (sync only) reads
+    // live instead of the snapshot. Default = threaded + snapshot (the real 1b-step2 path).
+    static const bool mt_sync = std::getenv("NHL_HIGHCUT_MT_SYNC") != nullptr;
     static const bool mt_liveread = std::getenv("NHL_HIGHCUT_MT_LIVEREAD") != nullptr;
-    task.use_snapshot = !mt_liveread;
+    // Frame boundary: in threaded mode DRAIN the worker (so the just-ended frame's draws are all pushed)
+    // BEFORE committing it — this barrier also keeps guest texture RAM + the live-feed accumulator free of
+    // concurrent access. MaybeCommitLiveFrame re-checks the boundary, commits the sidecar, and resets.
+    {
+      const uint64_t pc = HighcutGuestPresentCount();
+      if (pc != highcut_last_present_count_ || frame_index_ != highcut_last_frame_index_) {
+        if (!mt_sync && mt_worker_) mt_worker_->drain();
+        MaybeCommitLiveFrame();
+      }
+    }
+    HcDrawTask task;
+    // SNAPSHOT by default (the worker must read register banks + guest vtx/idx from the copy). MT_LIVEREAD
+    // (sync only) forces the 1a-verified live-read path for A/B; threaded mode ALWAYS snapshots.
+    task.use_snapshot = !(mt_sync && mt_liveread);
+    task.vs = beta_current_vs_;  // per-draw shader pointer (the CP thread overwrites it for the next draw)
     task.primitive_type = primitive_type;
     task.index_count = index_count;
     task.result = result;
@@ -2781,7 +2851,15 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
         if (isrc) task.guest_idx.assign(isrc, isrc + task.idx_length);
       }
     }
-    ProduceLiveDrawPacket(task);
+    if (mt_sync) {
+      ProduceLiveDrawPacket(task);  // synchronous (debug / extraction verify)
+    } else {
+      if (!mt_worker_) {
+        mt_worker_ = new HcLiveWorker();
+        mt_worker_->start([this](HcDrawTask& tk) { ProduceLiveDrawPacket(tk); });
+      }
+      mt_worker_->enqueue(std::move(task));  // overlap our ~34ms work with the SDK PM4 decode
+    }
   } else if (p3_dump_data && beta_current_vs_ && memory_) {
     namespace rg = rex::graphics;
     const uint32_t* regs = register_file_->values;
@@ -6448,6 +6526,11 @@ bool NhlD3D12CommandProcessor::SetupContext() {
 }
 
 void NhlD3D12CommandProcessor::ShutdownContext() {
+  // MT producer: stop + join the worker FIRST — it touches memory_/shaders/the live-feed bridge that the
+  // teardown below frees. ~HcLiveWorker drops any still-queued tasks (fine at shutdown) after the
+  // in-flight one finishes.
+  delete mt_worker_;
+  mt_worker_ = nullptr;
   if (beta_enabled_) {
     ShutdownBetaCaches();
     REXLOG_INFO("[nhl-beta] Phase-2: beta caches torn down before base ShutdownContext");

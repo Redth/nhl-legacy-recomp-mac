@@ -201,6 +201,13 @@ class NhlD3D12CommandProcessor : public rex::graphics::d3d12::D3D12CommandProces
   // sidecar to the plume bridge, reset per-frame counters, and emit the live fps readout. The serial
   // path does this inline; the MT path skips the serial body, so it runs this on the CP thread per draw.
   void MaybeCommitLiveFrame();
+  // MT producer worker (1b-step2): a single background thread runs ProduceLiveDrawPacket on snapshotted
+  // tasks so our ~34ms per-draw work overlaps the CP thread's ~25ms SDK PM4 decode. Lazily created on the
+  // first MT draw; deleted (stop + join) in ShutdownContext, with the out-of-line destructor as backstop.
+  // RAW owning pointer on purpose: a unique_ptr<incomplete HcLiveWorker> would force every TU that
+  // constructs this class (graphics_system's make_unique via the inherited ctor) to complete the type.
+  struct HcLiveWorker;
+  HcLiveWorker* mt_worker_ = nullptr;
   // Loose-asset texture injection (replay only): some textures are never written
   // by the GPU trace (static assets cached before capture), so guest RAM is zero
   // at their fetch-constant base and they render black. NHL_BETA_INJECT supplies

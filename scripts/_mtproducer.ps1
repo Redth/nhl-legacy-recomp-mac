@@ -12,8 +12,13 @@
 #
 # YOU drive into a game and HOLD in dense gameplay ~30s+, then close. Compare the two runs by eye
 # (players/rink/HUD render the same?) and by the fps line. The MT path logs "[highcut-mt] live takeover
-# (MT): N fps"; the serial path logs "[highcut-perf] live takeover: N fps". (Stage 1a is synchronous, so
-# fps should be ~the same as serial -- the speedup arrives in 1b when the work moves off the CP thread.)
+# (MT): N fps"; the serial path logs "[highcut-perf] live takeover: N fps".
+#
+# 1b-step2 (now default): the per-draw work runs on a WORKER THREAD overlapping the SDK PM4 decode, so
+# fps should RISE (~16 -> ~29 dense) AND the render must still match flag-OFF. Debug ladder (set before
+# launch to bisect a problem):
+#   NHL_HIGHCUT_MT_SYNC=1       run the consumer on the CP thread (no worker)  -- isolates threading
+#   NHL_HIGHCUT_MT_SYNC=1 + NHL_HIGHCUT_MT_LIVEREAD=1   sync + live read (no snapshot) -- the 1a path
 param([switch]$Off)
 $dir = "e:\Repositories\nhl-legacy-recomp\out\build\win-amd64-vk-ffx"
 Get-Process nhllegacy -ErrorAction SilentlyContinue | Stop-Process -Force
