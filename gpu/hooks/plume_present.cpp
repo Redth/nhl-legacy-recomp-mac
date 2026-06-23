@@ -1587,6 +1587,7 @@ void RenderClear(PlumeCtx& c) {
     if (c5_mode && live_feed) {
         const uint64_t seq = g_liveSeq.load(std::memory_order_acquire);
         if (seq != c.liveSeqSeen) {
+            REXLOG_INFO("[F3-bridge] consumer: new live seq {} (was {}) — rebuilding", seq, c.liveSeqSeen);
             // Step 2: drain the resource dictionary FIRST (append-only, never dropped), so every shader/
             // texture id a draw references is in c.resourceBytes before the rebuild looks it up.
             {
@@ -2239,9 +2240,12 @@ extern "C" void HighcutPublishTranslatedVS(const uint8_t* data, size_t size) {
 
 // C-6 live feed: CP thread appends one owned draw's packet bytes to the in-progress frame. No lock —
 // only the CP thread touches g_liveBuild between commits.
+// F3-bridge: total pushes, so a silent commit log can show whether draws ever reached the bridge.
+uint64_t g_livePushTotal = 0;
 extern "C" void HighcutLivePushDraw(const uint8_t* data, size_t size) {
     if (!g_enabled || !data || !size) return;
     g_liveBuild.emplace_back(data, data + size);
+    ++g_livePushTotal;
 }
 // Step 2: CP thread streams a unique shader/texture's bytes ONCE (append-only, persistent). The plume
 // thread drains g_resourcePending into c.resourceBytes before each rebuild.
@@ -2254,6 +2258,18 @@ extern "C" void HighcutLivePushResource(uint64_t id, const uint8_t* data, size_t
 // g_livePending under the lock and bump the seq so the plume thread picks it up. resolves may be null.
 extern "C" void HighcutLiveCommitFrame(const uint8_t* resolves, size_t rsize) {
     if (!g_enabled) { g_liveBuild.clear(); g_liveBuildResolves.clear(); return; }
+    // F3-bridge observability: log the commit chain (before the empty-skip) so a silent break is
+    // visible — "no commit lines" = CP never reaches commit; "0 draws" = pushes not firing; "N draws,
+    // seq=S" = bridge fine, look at the consumer. Push+commit are CP-thread-only (no lock needed here).
+    {
+        static uint64_t s_commits = 0, s_empty = 0;
+        const size_t built = g_liveBuild.size();
+        if (built == 0) ++s_empty;
+        if (s_commits < 4 || (s_commits % 120) == 0)
+            REXLOG_INFO("[F3-bridge] commit #{}: {} draws this frame, {} pushes total, {} empty, seq->{}",
+                        s_commits, built, g_livePushTotal, s_empty, g_liveSeq.load() + (built ? 1 : 0));
+        ++s_commits;
+    }
     if (g_liveBuild.empty()) return;  // nothing accumulated (e.g. a non-rendered frame)
     {
         std::lock_guard<std::mutex> lk(g_liveMutex);

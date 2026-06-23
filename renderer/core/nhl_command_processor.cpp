@@ -2297,6 +2297,7 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     };
     static std::unordered_map<uint64_t, HcTexCacheEntry> s_texCache;
     static size_t s_texCacheBytes = 0;
+    static uint64_t s_texHits = 0, s_texMisses = 0, s_texClears = 0;  // F-3.2: untile-cache diagnosis
     constexpr size_t kTexCacheBudget = 512u * 1024u * 1024u;  // 512 MB safety cap (rarely hit now)
     // C-4/C-5d.3: untile each texture binding (PS or VS) into a LINEAR blob + a TexturePacketDesc.
     // Factored into a lambda so the SAME path serves PS textures (set3) and the VS skinning bone
@@ -2446,8 +2447,10 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
           td.array_layers = e.array_layers; td.swizzle = e.swizzle;
           out_descs.push_back(td);
           out_blobs.push_back(e.blob);  // static hit — reuse the untiled blob, skip the gather
+          ++s_texHits;
           continue;
         }
+        ++s_texMisses;
       }
       std::vector<uint8_t> blob(faceBytes * cubeLayers);
       for (uint32_t face = 0; face < cubeLayers; ++face) {
@@ -2517,7 +2520,7 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
       {
         auto it = s_texCache.find(addrKey);
         if (it != s_texCache.end()) s_texCacheBytes -= it->second.blob.size();  // replacing this slot
-        if (s_texCacheBytes + blob.size() > kTexCacheBudget) { s_texCache.clear(); s_texCacheBytes = 0; }
+        if (s_texCacheBytes + blob.size() > kTexCacheBudget) { s_texCache.clear(); s_texCacheBytes = 0; ++s_texClears; }
         s_texCacheBytes += blob.size();
         s_texCache[addrKey] = HcTexCacheEntry{blob, td.width, td.height, td.tex_format, td.row_pitch_bytes,
                                               td.data_bytes, td.array_layers, td.swizzle, contentHash};
@@ -2771,6 +2774,11 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
                   std::chrono::duration_cast<std::chrono::duration<double>>(now - s_fpsT0).count();
               REXLOG_INFO("[highcut-perf] live takeover: {:.1f} fps over {} frames ({} draws last frame)",
                           secs > 0.0 ? s_fpsFrames / secs : 0.0, s_fpsFrames, highcut_capture_idx_);
+              REXLOG_INFO("[highcut-perf]   untile cache: {} hits, {} misses ({:.0f}% hit), {} budget-clears",
+                          s_texHits, s_texMisses,
+                          (s_texHits + s_texMisses) ? 100.0 * double(s_texHits) / double(s_texHits + s_texMisses) : 0.0,
+                          s_texClears);
+              s_texHits = s_texMisses = s_texClears = 0;
               if (hc_profile) {
                 const double ms = 1000.0;
                 REXLOG_INFO("[highcut-perf]   window cost: translate={:.0f}ms untile={:.0f}ms "

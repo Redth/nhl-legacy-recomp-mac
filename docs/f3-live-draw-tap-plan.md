@@ -61,6 +61,46 @@ Per frame, two full passes run regardless of what actually changed:
 
 ## Milestones
 
+## STATUS 2026-06-22: F-3.0 RESOLVED, F-3.1 DONE, F-3.2 root cause found
+
+- **F-3.0 RESOLVED.** The "co-run doesn't connect" was a **recipe bug**, not a deep timing issue:
+  the live feed's entire build/push path is gated on `frame_capture` (nhl_command_processor.cpp:1686,
+  2733), so `NHL_HIGHCUT_LIVE_FEED` *without* `NHL_HIGHCUT_FRAME_CAPTURE` builds/pushes/commits
+  nothing. **Working recipe = BOTH flags.** Added `[F3-bridge]` observability (push/commit/seq +
+  consumer) so the chain is no longer silent. Live result: **~1600 live gameplay draws/frame flow to
+  plume**, consumer rebuilds, plume presents. The EDRAM-free live path RENDERS live 3D gameplay.
+  (Footgun remains: `live_feed` *should* imply the build path — a clean fix is to OR `live_feed` into
+  the 1686/2733 gates so it works standalone. Deferred; recipe works.)
+- **F-3.1 DONE — producer-bound.** Per dense ~1600-draw live frame (~280ms → ~5.7 fps): **untile
+  ~210ms (75%)**, other (RT-cache/viewport/vertex-copy) ~55ms, translate ~9ms (by-id cached), packet
+  ~6ms. Consumer rebuild ~44ms (0.03ms/draw — by-id GPU caches excellent). Render ~8ms (126 fps
+  ceiling). **The CP producer is the wall; the render is not.**
+- **F-3.2 ROOT CAUSE (the surprise).** The untile cache is **100% hit / 0 miss / 0 clears** — so
+  re-untiling is NOT the cost. The ~92–210ms is the **per-binding work that runs even on a hit**:
+  ~6,000 texture-bindings/frame, each parsing its fetch constant + hashing a 512B prefix + **copying
+  the cached blob** (`out_blobs.push_back(e.blob)`, nhl_command_processor.cpp:2448) — multi-MB
+  background textures copied once per referencing draw. The cache skips the *gather*, not the
+  *setup+copy*. **F-3.2 fix = eliminate the per-binding blob copy** (reference/shared_ptr the cached
+  blob; in live mode push an EMPTY blob for already-streamed `tex_id`s since the consumer has them in
+  its by-id dictionary) and/or cache at the DRAW level so unchanged draws skip texture processing
+  entirely. Counters: `[highcut-perf] untile cache: H hits, M misses, C clears`.
+
+### F-3.0 — Make the live co-run actually connect (PREREQUISITE — confirmed blocker 2026-06-22)
+The live feed requires the **beta-takeover-live CP** (pushes draws) and the **plume-present thread**
+(consumes + renders) to co-run in one process. **Confirmed live that they don't connect yet:** with
+`NHL_BACKEND=beta NHL_VK_BACKEND_OFF=1 …LIVE_FEED=1 …PRESENT=1`, the game ran fine (frame 31000+,
+presenting) and the plume thread rendered standalone (~2000 fps, **draws=0**), but **beta takeover
+never activated** — zero takeover-activation / live-commit / push log lines across 31k frames, so
+nothing reached the bridge. This is the known C-2 caveat ("beta-takeover + present same-run doesn't
+co-run cleanly yet — beta fires the owned draw during early boot before plume's ~30-frame init").
+**Work:** (a) add observability — log takeover activation, `HighcutLivePushDraw`/`…CommitFrame`
+counts, and `g_liveSeq` bumps (today they're silent, so failures are invisible); (b) fix the
+activation/ordering so takeover engages and commits frames while plume is up (sequence plume init
+before takeover, or let takeover wait for plume-ready). Note: capture-only (`FRAME_CAPTURE`, no
+`PRESENT`) DOES activate takeover and latch — so the regression is specifically the present co-run.
+**Exit:** with the live recipe, the consumer shows `draws>0` and `consumer rebuild` fires on the
+attract 3D demo (autonomously reachable).
+
 ### F-3.1 — Baseline live gameplay + locate the real bottleneck
 Run the live feed on live **gameplay** (not menu) and measure where the per-frame time goes:
 producer decode, packet build+copy, bridge, consumer rebuild, plume render (the `NHL_HIGHCUT_PERF`
