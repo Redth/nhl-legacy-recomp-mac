@@ -1387,7 +1387,7 @@ extern "C" void HighcutPublishTranslatedVS(const uint8_t* data, size_t size);
 // Defined in gpu/hooks/plume_present.cpp — C-6 LIVE FEED bridge. PushDraw hands one owned draw's packet
 // bytes (the same bytes written to highcut_frame_<N>.bin) to the plume thread's in-progress frame;
 // CommitFrame finalizes it at the guest-present boundary. No-op unless the plume thread is enabled.
-extern "C" void HighcutLivePushDraw(const uint8_t* data, size_t size);
+extern "C" void HighcutLivePushDraw(std::vector<uint8_t>&& pkt);  // F-3.3: by-move (extern "C" name-matches)
 // Step 2: stream one unique shader/texture's bytes to the consumer's resource dictionary (once per id).
 extern "C" void HighcutLivePushResource(uint64_t id, const uint8_t* data, size_t size);
 extern "C" void HighcutLiveCommitFrame(const uint8_t* resolves, size_t rsize);
@@ -2891,7 +2891,7 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
 
       bool wrote = false;
       if (live_feed) {
-        HighcutLivePushDraw(pkt.data(), pkt.size());  // C-6: accumulate into the plume thread's frame
+        HighcutLivePushDraw(std::move(pkt));  // C-6: move the built packet into the plume thread's frame
         wrote = true;
       } else if (std::FILE* pf = std::fopen(pkt_path, "wb")) {
         std::fwrite(pkt.data(), 1, pkt.size(), pf);

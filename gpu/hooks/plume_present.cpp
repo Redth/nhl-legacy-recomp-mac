@@ -403,7 +403,12 @@ HWND CreatePlumeWindow() {
                                 WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
                                 r.right - r.left, r.bottom - r.top, nullptr, nullptr,
                                 wc.hInstance, nullptr);
-    if (hwnd) ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    // NHL_HIGHCUT_HIDE_WINDOW: keep the plume present window hidden (headless perf/dev runs where the
+    // result comes from the log, not the window). The swapchain still renders/presents to its surface,
+    // so producer/consumer/render costs are unaffected. The 2nd window disappears entirely at F-4, when
+    // plume presents to the real game window and rexglue's GPU is off.
+    static const bool hideWin = std::getenv("NHL_HIGHCUT_HIDE_WINDOW") != nullptr;
+    if (hwnd) ShowWindow(hwnd, hideWin ? SW_HIDE : SW_SHOWNOACTIVATE);
     return hwnd;
 }
 
@@ -2242,9 +2247,12 @@ extern "C" void HighcutPublishTranslatedVS(const uint8_t* data, size_t size) {
 // only the CP thread touches g_liveBuild between commits.
 // F3-bridge: total pushes, so a silent commit log can show whether draws ever reached the bridge.
 uint64_t g_livePushTotal = 0;
-extern "C" void HighcutLivePushDraw(const uint8_t* data, size_t size) {
-    if (!g_enabled || !data || !size) return;
-    g_liveBuild.emplace_back(data, data + size);
+// F-3.3: take the packet by MOVE so the CP's built vector is moved into the frame, not deep-copied
+// (the by-value bridge copy was the bulk of the "packet" producer cost). Kept extern "C" so the two
+// TUs link by the unmangled symbol name (a C++-typed param under extern "C" is legal — [dcl.link]).
+extern "C" void HighcutLivePushDraw(std::vector<uint8_t>&& pkt) {
+    if (!g_enabled || pkt.empty()) return;
+    g_liveBuild.push_back(std::move(pkt));
     ++g_livePushTotal;
 }
 // Step 2: CP thread streams a unique shader/texture's bytes ONCE (append-only, persistent). The plume
