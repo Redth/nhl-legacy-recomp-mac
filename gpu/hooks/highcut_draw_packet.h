@@ -30,9 +30,13 @@
 namespace nhl::highcut {
 
 constexpr uint32_t kDrawPacketMagic = 0x48334450;  // 'H3DP'
-constexpr uint32_t kDrawPacketVersion = 11;         // by-ID: shader/texture resource IDs for the consumer
-                                                    // cache (reuse GPU objects across frames + draws —
-                                                    // fixes the dense-gameplay consumer-rebuild crash)
+constexpr uint32_t kDrawPacketVersion = 12;         // by-ID: shader/texture AND geometry (vtx/idx) IDs.
+                                                    // v12 streams the vertex + index buffers by content
+                                                    // id (like shaders/textures) so the per-frame packet
+                                                    // no longer inlines geometry — geometry is camera- and
+                                                    // animation-independent (verts are bind-pose; the
+                                                    // transform/skinning is in the VS), so a mesh streams
+                                                    // ONCE and later frames skip the gather+copy+resend.
 
 // Plume topology for the host draw. Xenos RectangleList -> kRectangleListAsTriangleStrip (4-vert
 // strip). kQuadList (menu text/glyphs) has no host-shader expansion in the translator, so the plume
@@ -205,6 +209,12 @@ struct DrawPacketHeader {
     // textures and BEFORE the index blob: [PS textures][VS textures][index]. Same TexturePacketDesc.
     uint32_t vs_texture_count;     // number of VS TexturePacketDesc+blobs (set2 textures)
     uint32_t vs_sampler_count;     // number of VS sampler bindings (set2, after the VS textures)
+    // v12 by-ID GEOMETRY: content-hash ids of the vertex (shared_memory) + index buffers. When non-zero
+    // (live by-id mode) the corresponding shared_bytes / index_bytes are 0 and the consumer resolves the
+    // bytes from the streamed resource dictionary (c.resourceBytes), caching the GPU buffer by this id.
+    // 0 => the bytes are inline (disk capture / by-id disabled), as before.
+    uint64_t vtx_id;
+    uint64_t idx_id;
 };
 
 }  // namespace nhl::highcut

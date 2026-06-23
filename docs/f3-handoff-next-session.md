@@ -25,6 +25,122 @@ to F-5). Nothing is blocked on feasibility — it's now perf + completeness engi
 `RenderBetaOwnedDraw` vs CP idle, or A/B with the base render suppressed. If it's mostly wait, F-4
 removes it ~for free and roughly doubles fps; if it's SDK decode, re-plan.
 
+### F-4 first step — BUILT (2026-06-22), pending a dense controller run
+The decisive probe is implemented + built clean as **`NHL_HIGHCUT_BUSYPROBE=1`**
+(`nhl_command_processor.cpp`, the per-60-frame `[highcut-perf]` window report). It reads the **CP
+thread's own CPU time** (`GetThreadTimes` on the thread that runs BOTH the SDK PM4 decode AND
+`RenderBetaOwnedDraw`, then blocks at the coexistence sync) and splits the frame wall into:
+- **CPU-busy** (`busyPct`, ms/frame) = SDK decode + our work (the thread actually executing)
+- **blocked** (`wall − busy`, ms/frame) = the thread idle on coexistence (GPU wait / producer-consumer stall)
+- and, with `NHL_HIGHCUT_PROFILE` on (it is, in the recipe), a sub-line splitting CPU-busy into
+  **our `RenderBetaOwnedDraw`** vs **SDK-PM4-decode(+other)**.
+
+**Decision rule (printed inline in the log):**
+- `busy << wall` (large `blocked` ms/frame) ⇒ the ~31 ms is coexistence GPU-WAIT ⇒ **F-4 reclaims it
+  ~for free** (≈2× fps). Proceed with F-4 takeover.
+- `busy ~= wall` (`blocked ≈ 0`, busy 90–100%) ⇒ the ~31 ms is SDK PM4 decode (CPU) ⇒ **F-4 does not
+  free it**; re-plan toward draw-level caching / attacking our 34 ms.
+
+**Run it:** `scripts\_f4busyprobe.ps1` (full live recipe + the flag; pointed at `win-amd64-vk-ffx`).
+**YOU must drive into dense gameplay and HOLD ~30s+**, then close the game — it greps the
+`F4-busyprobe` lines. Autonomous smoke test (attract, 3–7 draws/frame, ~450 fps) already confirmed the
+probe FIRES and doesn't crash, reporting `CPU-busy 56–70%, blocked ~0.8 ms/frame` — but that is light
+scene data, **NOT** the decisive dense number (the ~31 ms outside-cost only appears at ~1500 draws).
+
+### F-4 first-step RESULT (2026-06-22, dense controller run — DECISIVE, OVERTURNS the F-4 bet)
+Dense gameplay measured (~10 windows, 1356–1606 draws/frame, ~14–19 fps, log `nhllegacy_058.log`):
+
+| bucket | per frame | share |
+|---|---|---|
+| **CP-thread CPU-busy** | **~59 ms (90–95%)** | wall is CPU |
+| — our `RenderBetaOwnedDraw` | ~34 ms | 53% |
+| — SDK PM4 decode (+base render/present) | ~25 ms | 39% |
+| **blocked (coexistence GPU wait)** | **~5 ms** | **8%** |
+| frame wall | ~64 ms | — |
+
+**Verdict: `busy ~= wall` (90–95% busy, blocked ≈ 5 ms) ⇒ the ~31 ms "outside" is ~25 ms CPU + only
+~5 ms GPU wait — NOT "mostly coexistence GPU-WAIT."** The handoff's F-4 bet ("mostly wait ⇒ F-4
+removes it ~free ⇒ ~2× fps") is **REFUTED**: F-4's pure-wait win is ~5 ms (~8%), ~15→~16 fps. The
+frame is **CPU-bound on the CP thread**; removing GPU contention barely moves it.
+
+**Reframed path to 60 fps (both levers are CPU, not GPU):**
+- **Draw-level caching** — attacks our ~34 ms (53%), fully ours, now the single biggest lever. BUT
+  floors at ~30 ms/frame (~33 fps): the SDK still walks the full PM4 every frame (~25 ms), which our
+  caching cannot skip (the guest re-emits all draws; we only cache *our* post-decode processing).
+- **SDK-decode reduction (the real F-4)** — the ~25 ms is the SDK CP decoding all PM4 + its base
+  render/present *CPU* submission. F-4 ("headless") only helps if it removes the throwaway-base-render
+  CPU work; the geometry-decode part is needed. **Unknown: how the ~25 ms splits between needed-decode
+  vs throwaway-base-render.** That split is the next F-4 measurement and F-4 is **no longer cheap**.
+- The per-draw SDK owned-draw render is ALREADY skipped (`skip_owned_render`, NHL_HIGHCUT_LIVE_FEED),
+  so the ~25 ms is the residual SDK front-end + frame-boundary work.
+
+### F-5 DRAW-LEVEL CACHE — BUILT + mechanism validated (2026-06-23), pending dense controller run
+Chosen lever (per the F-4 result: attack our ~34 ms, the biggest CPU slice). `NHL_HIGHCUT_DRAWCACHE=1`
+(live-feed only), in `RenderBetaOwnedDraw`: cache the fully-serialized live packet and, on an unchanged
+draw, re-push it while skipping translate-tail/gap1/untile/gap2/serialize (~25 of the 34 ms).
+- **KEY = a single CONTENT+STATE hash, deliberately ADDRESS-FREE.** v1 keyed on buffer addresses and
+  thrashed (guest ring-buffers vtx/idx every frame → 76,798 entries / 222 MB / **1% hit**). v2 hashes
+  what the packet encodes — shader ids, geometry/texture CONTENT, float constants, render state — never
+  a guest pointer. Double-buffered by guest-present (promote `s_drawNext`→`s_drawPrev` each frame) so it
+  holds ~one frame of draws and evicts stale dynamic draws automatically.
+- **Autonomous attract validation: 1% → 73–91% hit, entries 76,798 → ~130, mem ~0 MB, no crash/errors.**
+  That's the light menu scene; the dense-gameplay hit rate + fps gain is the decisive number and needs
+  the controller.
+- **STALENESS (accepted choice):** texture content keyed on the SAME 512 B prefix the untile cache uses
+  (moving player's bone-palette texture changes in its first 512 B → miss → reprocessed; **players that
+  move stay live**). Vtx/idx content keyed on a 512 B prefix by default — small NEW staleness on
+  same-address content changes past 512 B; `NHL_HIGHCUT_DRAWCACHE_HASHLEN=0` hashes FULL vtx/idx content
+  (zero added staleness, slower) for A/B.
+- **Run:** `scripts\_drawcache.ps1` (live recipe + drawcache + busyprobe + profile). Drive into dense
+  gameplay, hold ~30 s, close. Compare `draw cache: …% hit`, `live takeover: N fps` (vs ~15 baseline),
+  and `F4-busyprobe our RenderBetaOwnedDraw=…ms` (should drop from ~34) against `scripts\_f4busyprobe.ps1`
+  (no cache). **Verify players/puck animate** (not frozen). Expected floor even at 100% hit ≈ ~33 fps
+  (the ~25 ms SDK decode survives — that's the F-4 follow-on).
+- Code: `nhl_command_processor.cpp` — cache block at the top of the `p3_dump_data` heavy block
+  (~:2173), store on miss before `HighcutLivePushDraw`, report by the untile-cache line. NOT committed.
+
+#### F-5 dense controller RESULT (2026-06-23) — NEGATIVE: whole-packet caching fails in gameplay
+Log `nhllegacy_061`. Dense (~700–1530 draws): **hit rate 3–13%** (vs 73–91% on the menu), **fps
+unchanged (~14–21 = baseline)**, `our RenderBetaOwnedDraw` still ~24–39 ms. **Root cause = the moving
+broadcast camera:** every draw multiplies by the per-frame view/projection matrix carried in its VS
+float constants, so every packet differs frame-to-frame → near-zero hits. The rink is static in WORLD
+space but NOT in PACKET space once the camera moves — so the handoff premise ("most of a 1500-draw scene
+is static") was geometrically true but false for byte-identical packets. Only camera-independent 2D
+HUD/scoreboard (~77 draws) hits. Cache itself is correct + bounded (no crash, 0 MB) — the workload
+defeats whole-packet granularity. **DRAWCACHE is a menu-only win; keep it gated/off for gameplay.**
+
+**Corrected lever → cache the camera-independent BULK at finer grain.** The expensive
+camera-independent work is the vertex/index GATHER+COPY (gap1 ~13 ms + packet ~6 ms; untile is already
+content-cached). Recommended: **stream vertex/index buffers BY-ID (content-hashed) like shaders+textures
+already are** (the `HighcutLivePushResource` infra exists; geometry is the last INLINED bulk in the
+packet). Then the per-frame packet is small (floats+state+ids) → cheap to rebuild every frame even with
+a moving camera, and geometry copies once per unique mesh.
+
+### F-5 BY-ID GEOMETRY — BUILT (2026-06-23), pending dense controller run + VISUAL check
+`NHL_HIGHCUT_GEOM_BYID=1` (live only). Packet **v12**: added `vtx_id`/`idx_id` to `DrawPacketHeader`.
+- **Producer** (`nhl_command_processor.cpp`): the vertex gather is now two-pass — rebase the fetch
+  offsets + hash the concatenated stream content in place (read, no copy) → `vtx_id` (domain-tagged);
+  build the `shared_blob` COPY only on first sight (`s_sentGeo`), so later frames skip the gather copy.
+  Index buffer the same (`idx_id`). In by-id mode `shared_bytes`/`index_bytes` = 0 (geometry not inlined)
+  and the blobs are streamed once via `HighcutLivePushResource` (alongside the existing shader/tex stream).
+- **Consumer** (`plume_present.cpp`): when `shared_bytes==0 && vtx_id` (and idx) resolve the bytes from
+  `c.resourceBytes` (the streamed dict) — `sharedN`/`idxN` are the effective sizes. No staleness: the id
+  is a FULL content hash, so changed geometry → new id → re-streamed.
+- **Why this beats whole-packet caching:** geometry content is camera/animation-independent (verts are
+  bind-pose; transform+skinning are in the VS), so it streams once and stays cached even as the camera
+  moves — exactly the property whole-packet caching lacked.
+- **Autonomous attract smoke test: no crash, no VUID/validation errors, renders at 250+ fps, draws flow.**
+  Structurally sound — but attract is light; the dense producer win and **VISUAL correctness are the
+  decisive checks and need the controller.**
+- **Run:** `scripts\_drawcache.ps1` (now defaults GEOM_BYID **on**, DRAWCACHE off; `-DrawCache` to add it).
+  Drive into dense gameplay, hold ~30 s, close. **(1) Perf:** `window cost` gap1+packet should drop, `our
+  RenderBetaOwnedDraw` < the ~34 ms baseline, fps > ~15. **(2) VISUAL — critical:** confirm players/rink/
+  puck render CORRECTLY (not exploded/missing) — by-id geometry has correctness risk (id collision, the
+  rebased `fetch_blob` vs streamed blob, consumer resolve). If geometry is wrong, the prime suspects are
+  the two-pass rebase or a vtx_id collision; A/B by unsetting `NHL_HIGHCUT_GEOM_BYID`.
+- NOT committed. (Alt if needed = producer-only partial cache: reuse gathered vtx blob + tex descs by
+  content, rebuild only floats + serialize.)
+
 ## Reproduce the live dense measurement (NEEDS THE USER AT THE CONTROLLER)
 
 Autonomous attract runs DON'T reach dense gameplay (the live feed slows the game so the attract loop

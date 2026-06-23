@@ -55,6 +55,10 @@
 // <windows.h> out of this TU; user32 is already linked by the windowed app).
 extern "C" __declspec(dllimport) short __stdcall GetAsyncKeyState(int v_key);
 extern "C" __declspec(dllimport) void __stdcall Sleep(unsigned long ms);
+// F-4 first-step busy-vs-wait probe (NHL_HIGHCUT_BUSYPROBE) reads THIS thread's CPU time via
+// GetThreadTimes/GetCurrentThread (FILETIME, 100ns units) to split the CP frame wall into CPU-busy
+// (SDK PM4 decode + our work) vs blocked (coexistence GPU wait). Those Win32 symbols + FILETIME are
+// already in this TU's include graph (windows.h via d3d12.h) — used directly below.
 
 namespace nhl::graphics {
 
@@ -2145,6 +2149,138 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
   if (p3_dump_data && beta_current_vs_ && memory_) {
     namespace rg = rex::graphics;
     const uint32_t* regs = register_file_->values;
+
+    // ===== F-5 DRAW-LEVEL CACHE (NHL_HIGHCUT_DRAWCACHE) ==========================================
+    // The F-4 busyprobe showed dense gameplay is CPU-bound on the CP thread: ~34 ms/frame is OUR
+    // per-draw work (translate/gap1/untile/packet) and most of a ~1500-draw scene is STATIC (rink,
+    // boards, UI). Skip a draw that is identical to its last occurrence: cache the fully-serialized
+    // LIVE packet keyed by a stable identity (shaders + buffer addrs + counts), validated by a cheap
+    // signature over the draw's inputs. On a HIT, re-push the cached packet and skip the
+    // gather/untile/hdr/serialize entirely (~25 of the 34 ms). Live-feed only.
+    //
+    // STALENESS: the signature hashes the SAME 512 B texture-content prefix the untile cache keys on
+    // (so a hit adds NO texture staleness beyond what already exists — a moving player's bone-palette
+    // texture changes in its first 512 B -> sig changes -> miss -> reprocessed), plus a prefix of each
+    // vertex stream + the index buffer (a small, TUNABLE new staleness on same-address vtx/idx content
+    // changes past the prefix). NHL_HIGHCUT_DRAWCACHE_HASHLEN=0 => hash FULL vtx/idx content (zero
+    // added staleness, slower) for correctness A/B; default 512.
+    static const bool hc_live_feed = std::getenv("NHL_HIGHCUT_LIVE_FEED") != nullptr;
+    static const bool dc_on = (std::getenv("NHL_HIGHCUT_DRAWCACHE") != nullptr) && hc_live_feed;
+    static const size_t dc_hashlen = []() -> size_t {
+      const char* s = std::getenv("NHL_HIGHCUT_DRAWCACHE_HASHLEN");
+      return s ? size_t(std::strtoull(s, nullptr, 10)) : 512u;  // 0 => full vtx/idx content hash
+    }();
+    // KEY = a single CONTENT+STATE hash, deliberately ADDRESS-FREE: the guest ring-buffers vertex/index
+    // (and some texture) memory every frame, so any guest address in the key makes static draws miss
+    // forever (proven: address-keyed v1 grew to 76k entries / 222 MB at ~1% hit). We hash what the
+    // PACKET actually encodes — shader ids, geometry/texture CONTENT, float constants, render state —
+    // never a raw guest pointer. Double-buffered by guest-present: each new frame promotes s_drawNext ->
+    // s_drawPrev and clears next, so the cache holds ~one frame of draws and stale dynamic draws evict
+    // automatically (no unbounded growth). The packet is a shared_ptr so promote/carry-forward is a
+    // refcount bump, not a copy.
+    struct HcDrawCacheEntry { std::shared_ptr<const std::vector<uint8_t>> pkt; };
+    static std::unordered_map<uint64_t, HcDrawCacheEntry> s_drawPrev, s_drawNext;
+    static size_t s_drawNextBytes = 0;
+    static uint64_t s_dcLastPresent = ~0ull;
+    static uint64_t s_drawHits = 0, s_drawMisses = 0, s_drawDrops = 0;
+    constexpr size_t kDrawCacheBudget = 384ull * 1024 * 1024;  // stop inserting past this (safety)
+    uint64_t dc_key = 0;
+    bool dc_eligible = false;
+    if (dc_on) {
+      // New guest frame? promote next->prev (bounds the cache, evicts last frame's stale dynamic draws).
+      const uint64_t pc = HighcutGuestPresentCount();
+      if (pc != s_dcLastPresent) {
+        s_dcLastPresent = pc;
+        s_drawPrev = std::move(s_drawNext);
+        s_drawNext.clear();
+        s_drawNextBytes = 0;
+      }
+      // Fast FNV-1a variant: 8 bytes/step (change-detection only, not a security hash).
+      auto fhash = [](uint64_t h, const void* p, size_t n) -> uint64_t {
+        const uint8_t* b = static_cast<const uint8_t*>(p);
+        size_t i = 0;
+        for (; i + 8 <= n; i += 8) { uint64_t w; std::memcpy(&w, b + i, 8); h = (h ^ w) * 1099511628211ull; }
+        for (; i < n; ++i) { h = (h ^ b[i]) * 1099511628211ull; }
+        return h;
+      };
+      auto hashMem = [&](uint64_t h, uint32_t base, uint32_t size, uint32_t cap) -> uint64_t {
+        if (!base || !size) return h;
+        const uint8_t* p = memory_->TranslatePhysical<const uint8_t*>(base);
+        if (!p) return h;
+        size_t n = cap ? std::min<size_t>(cap, size) : size;
+        return fhash(h, p, n);
+      };
+      uint64_t k = 1469598103934665603ull;
+      // shaders + topology + count (NO buffer addresses)
+      k = fhash(k, &p3_vs_id, 8); k = fhash(k, &p3_ps_id, 8);
+      k = fhash(k, &index_count, 4);
+      { uint32_t pt = uint32_t(primitive_type); k = fhash(k, &pt, 4); }
+      // render state (register VALUES, address-free): RB_*/PA_SC_* block + cull/w-divide/vgt/exp_bias
+      k = fhash(k, &regs[0x4900], 40 * 4);    // bool/loop consts
+      k = fhash(k, &regs[0x2000], 0x400 * 4); // RB_*/PA_SC_* (blend/depth/stencil/mask/scissor/surface/colorinfo)
+      { const auto r0 = register_file_->Get<reg::PA_SU_SC_MODE_CNTL>(); k = fhash(k, &r0, sizeof(r0));
+        const auto r1 = register_file_->Get<reg::PA_CL_VTE_CNTL>();     k = fhash(k, &r1, sizeof(r1));
+        const auto r2 = register_file_->Get<reg::VGT_INDX_OFFSET>();    k = fhash(k, &r2, sizeof(r2));
+        const auto r3 = register_file_->Get<reg::VGT_MIN_VTX_INDX>();   k = fhash(k, &r3, sizeof(r3));
+        const auto r4 = register_file_->Get<reg::VGT_MAX_VTX_INDX>();   k = fhash(k, &r4, sizeof(r4)); }
+      k = fhash(k, &vpi, sizeof(vpi));        // resolved viewport/ndc
+      // used VS+PS float constants (object transform + material) = the dynamic per-object state
+      auto hashFloats = [&](rg::Shader* sh, bool pixel, uint64_t h) -> uint64_t {
+        if (!sh) return h;
+        const uint32_t rb = pixel ? 0x4400u : 0x4000u;
+        const auto& crm = sh->constant_register_map();
+        for (uint32_t i = 0; i < 4; ++i) { uint64_t bits = crm.float_bitmap[i];
+          while (bits) { uint32_t s = i * 64u + uint32_t(std::countr_zero(bits)); bits &= bits - 1;
+            h = fhash(h, &regs[rb + s * 4], 16); } }
+        return h;
+      };
+      k = hashFloats(beta_current_vs_, false, k);
+      k = hashFloats(eff_ps, true, k);
+      // vertex-stream CONTENT + per-binding non-address format bits (slot/size/type) — never the address
+      for (const auto& vb : beta_current_vs_->vertex_bindings()) {
+        const uint32_t i2 = vb.fetch_constant * 2;
+        xenos::xe_gpu_vertex_fetch_t vf{}; vf.dword_0 = regs[0x4800 + i2]; vf.dword_1 = regs[0x4800 + i2 + 1];
+        const uint32_t typebits = vf.dword_0 & 0x3u, vsize = vf.size;
+        k = fhash(k, &vb.fetch_constant, 4); k = fhash(k, &typebits, 4); k = fhash(k, &vsize, 4);
+        k = hashMem(k, vf.address << 2, vf.size << 2, uint32_t(dc_hashlen));
+      }
+      // index CONTENT (default 512 B prefix; 0 => full)
+      if (result.index_buffer_type ==
+              rex::graphics::PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA &&
+          index_buffer_info)
+        k = hashMem(k, uint32_t(index_buffer_info->guest_base),
+                    uint32_t(index_buffer_info->length), uint32_t(dc_hashlen));
+      // texture: format/dims/swizzle (non-address) + the SAME 512 B content prefix the untile cache keys
+      // on (incl. the VS skinning bone palette = the player-animation signal). No more/less tex staleness.
+      auto hashTex = [&](const std::vector<rex::graphics::SpirvShader::TextureBinding>& binds) {
+        for (const auto& tb : binds) {
+          xenos::xe_gpu_texture_fetch_t tf{};
+          std::memcpy(&tf, &regs[0x4800 + tb.fetch_constant * 6], 24);
+          const uint32_t shape[4] = {uint32_t(tf.format), uint32_t(tf.size_2d.width),
+                                     uint32_t(tf.size_2d.height), uint32_t(tf.swizzle)};
+          k = fhash(k, shape, sizeof(shape));
+          k = hashMem(k, uint32_t(tf.base_address) << 12, 512u, 512u);
+        }
+      };
+      hashTex(p3_ps_texbinds); hashTex(p3_vs_texbinds);
+      dc_key = k;
+      dc_eligible = true;
+      // HIT? (never on the first draw of a frame — that path must run the per-frame commit below.)
+      const bool first_of_frame =
+          (pc != highcut_last_present_count_) || (frame_index_ != highcut_last_frame_index_);
+      auto it = s_drawPrev.find(dc_key);
+      if (!first_of_frame && it != s_drawPrev.end() && it->second.pkt) {
+        ++s_drawHits;
+        HighcutLivePushDraw(std::vector<uint8_t>(*it->second.pkt));  // copy for the by-move bridge
+        s_drawNext.emplace(dc_key, it->second);                      // carry forward (refcount bump)
+        ++highcut_capture_idx_;                                      // push-order index (consumer renders in order)
+        if (hc_profile) s_tTotal += hc_secs(_hc_t0, hc_clock::now());
+        ++beta_takeover_rendered_;
+        return;
+      }
+      ++s_drawMisses;
+    }
+
     // Fetch constants: the full 192-dword fetch register space -> the shader's uvec4[48] UBO.
     // Capture ALL vertex bindings: 3D meshes stream position / normal / uv / weights from SEPARATE
     // guest addresses (one fetch constant each). PACK every binding's bytes tightly into one shared-
@@ -2154,11 +2290,31 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     // which left every OTHER stream pointing at its original huge guest address -> garbage positions
     // -> exploded 3D geometry. (kVtxTotalCap bounds the SSBO; per-stream sizes are dword multiples,
     // so packed offsets stay dword-aligned and the type bits survive.)
+    // F-5 BY-ID GEOMETRY (NHL_HIGHCUT_GEOM_BYID, live only): the per-frame packet inlines the vertex +
+    // index bytes — most of its size — and the producer copies them every frame even though geometry is
+    // CAMERA- and ANIMATION-INDEPENDENT (verts are bind-pose; the transform/skinning is in the VS). Stream
+    // geometry by CONTENT id (like shaders/textures) so it's sent ONCE per unique mesh, the packet carries
+    // only the id, and later frames SKIP the gather copy entirely. (This is the lever the moving camera
+    // defeated for whole-packet caching: it changes float constants, not geometry content.) `s_sentGeo`
+    // dedups across frames; ids are domain-tagged so they can't collide with shader/texture ids.
+    static const bool geo_byid = (std::getenv("NHL_HIGHCUT_GEOM_BYID") != nullptr) && hc_live_feed;
+    static std::unordered_set<uint64_t> s_sentGeo;
+    auto geo_hash = [](uint64_t h, const void* p, size_t n) -> uint64_t {
+      const uint8_t* b = static_cast<const uint8_t*>(p); size_t i = 0;
+      for (; i + 8 <= n; i += 8) { uint64_t w; std::memcpy(&w, b + i, 8); h = (h ^ w) * 1099511628211ull; }
+      for (; i < n; ++i) { h = (h ^ b[i]) * 1099511628211ull; }
+      return h;
+    };
     uint32_t fetch_blob[192];
     std::memcpy(fetch_blob, &regs[0x4800], sizeof(fetch_blob));
     std::vector<uint8_t> shared_blob;
+    uint64_t vtx_id = 0;
     {
       constexpr uint32_t kVtxTotalCap = 16u * 0x100000u;  // 16 MB total across all streams
+      // Pass 1: rebase fetch offsets (deterministic from sizes) + hash the concatenated content in place.
+      struct VStream { uint32_t base, size, off; };
+      VStream streams[64]; uint32_t nStreams = 0, total = 0;
+      uint64_t h = 1469598103934665603ull;
       for (const auto& vb : beta_current_vs_->vertex_bindings()) {
         const uint32_t idx = vb.fetch_constant * 2;
         xenos::xe_gpu_vertex_fetch_t f{};
@@ -2167,17 +2323,30 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
         const uint32_t base = f.address << 2;  // guest byte base
         uint32_t size = f.size << 2;           // byte size (size is in dwords)
         if (!size) continue;
-        const uint32_t packed_off = uint32_t(shared_blob.size());  // dword-aligned (sizes are *4)
+        const uint32_t packed_off = total;  // dword-aligned (sizes are *4)
         if (packed_off + size > kVtxTotalCap) {
           if (packed_off >= kVtxTotalCap) break;
           size = kVtxTotalCap - packed_off;
         }
-        const uint8_t* src = memory_ ? memory_->TranslatePhysical<const uint8_t*>(base) : nullptr;
-        shared_blob.resize(packed_off + size);
-        if (src) std::memcpy(shared_blob.data() + packed_off, src, size);
-        else std::memset(shared_blob.data() + packed_off, 0, size);
         // Rebase: dword_0 = (packed_dword_offset << 2) | type_bits. packed_off is a dword multiple.
         fetch_blob[idx] = packed_off | (fetch_blob[idx] & 0x3u);
+        const uint8_t* src = memory_ ? memory_->TranslatePhysical<const uint8_t*>(base) : nullptr;
+        h = geo_hash(h, &idx, 4); h = geo_hash(h, &size, 4);
+        if (src) h = geo_hash(h, src, size);
+        if (nStreams < 64) streams[nStreams++] = {base, size, packed_off};
+        total += size;
+      }
+      vtx_id = total ? (h ^ 0x9E3779B97F4A7C15ull) : 0;  // domain tag (vertex)
+      // Build the concatenated blob (the gather COPY) only when we must: non-by-id always; by-id only on
+      // the FIRST sight of this content (so it can be streamed). Later frames skip the copy + the resend.
+      const bool vtx_seen = geo_byid && vtx_id && s_sentGeo.count(vtx_id);
+      if (total && (!geo_byid || !vtx_seen)) {
+        shared_blob.resize(total);
+        for (uint32_t i = 0; i < nStreams; ++i) {
+          const uint8_t* src = memory_ ? memory_->TranslatePhysical<const uint8_t*>(streams[i].base) : nullptr;
+          if (src) std::memcpy(shared_blob.data() + streams[i].off, src, streams[i].size);
+          else std::memset(shared_blob.data() + streams[i].off, 0, streams[i].size);
+        }
       }
     }
     // C-5d: kGuestDMA index buffer — the bulk of 3D draws are INDEXED (idx_type=1); the index buffer
@@ -2189,15 +2358,19 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     // RAM) don't appear in this title's frames; if they ever do they fall back to drawInstanced.
     std::vector<uint8_t> index_blob;
     uint32_t index_format = 0;  // 0=none, 1=u16, 2=u32
+    uint64_t idx_id = 0;        // F-5 by-id: content hash of the index buffer (domain-tagged)
     if (result.index_buffer_type ==
             rex::graphics::PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA &&
         index_buffer_info && memory_) {
       const uint32_t ilen = uint32_t(index_buffer_info->length);
       const uint8_t* isrc = memory_->TranslatePhysical<const uint8_t*>(index_buffer_info->guest_base);
       if (isrc && ilen) {
-        index_blob.assign(isrc, isrc + ilen);
         index_format =
             (index_buffer_info->format == xenos::IndexFormat::kInt32) ? 2u : 1u;
+        idx_id = geo_hash(geo_hash(1469598103934665603ull, &ilen, 4), isrc, ilen) ^ 0xC2B2AE3D27D4EB4Full;
+        // Build (copy) only when needed: non-by-id always; by-id only on first sight (to stream it).
+        const bool idx_seen = geo_byid && s_sentGeo.count(idx_id);
+        if (!geo_byid || !idx_seen) index_blob.assign(isrc, isrc + ilen);
       }
     }
     // System constants (SPIR-V layout): NDC transform + vertex index params + (C-4) the
@@ -2606,7 +2779,10 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     }
     hdr.fetch_bytes = sizeof(fetch_blob);
     hdr.sys_bytes = sizeof(spv_sys);
-    hdr.shared_bytes = vtx_src ? vtx_size : 0u;
+    // F-5 by-id geometry: in by-id mode the packet carries only the vtx_id; the bytes are streamed once
+    // (consumer resolves from the dict). Otherwise inline as before.
+    hdr.shared_bytes = geo_byid ? 0u : (vtx_src ? vtx_size : 0u);
+    hdr.vtx_id = geo_byid ? vtx_id : 0u;
     hdr.bool_bytes = kBoolLoopBytes;
     hdr.vs_float_bytes = uint32_t(vs_floats.size());
     hdr.ps_float_bytes = uint32_t(ps_floats.size());
@@ -2617,7 +2793,8 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     hdr.vs_texture_count = uint32_t(vs_tex_descs.size());  // C-5d.3: set2 (skinning) textures
     hdr.vs_sampler_count = p3_vs_sampler_count;
     hdr.index_format = index_format;                     // C-5d: kGuestDMA indices (0 => non-indexed)
-    hdr.index_bytes = uint32_t(index_blob.size());
+    hdr.index_bytes = geo_byid ? 0u : uint32_t(index_blob.size());
+    hdr.idx_id = geo_byid ? idx_id : 0u;
     // C-5a: per-draw viewport (final vpi) so the plume replay places each draw correctly.
     hdr.vp_x = float(vpi.xy_offset[0]);
     hdr.vp_y = float(vpi.xy_offset[1]);
@@ -2762,6 +2939,23 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
           {
             static uint32_t s_fpsFrames = 0;
             static auto s_fpsT0 = std::chrono::steady_clock::now();
+            // F-4 first-step DECISIVE probe (NHL_HIGHCUT_BUSYPROBE): is the ~31ms OUTSIDE
+            // RenderBetaOwnedDraw CPU-busy (SDK PM4 decode — F-4 still NEEDS it) or BLOCKED
+            // (coexistence GPU wait — F-4 removes it ~free, ~2x fps)? This code runs on the guest CP
+            // thread, which does BOTH the SDK front-end PM4 walk AND our RenderBetaOwnedDraw work, then
+            // blocks at the coexistence sync. GetThreadTimes splits the window wall into CPU-busy
+            // (kernel+user) vs blocked. busy/wall ~= 1.0 => decode-bound (F-4 doesn't free the 31ms);
+            // busy/wall << 1.0 => the thread idles waiting on coexistence => F-4 reclaims it.
+            static const bool hc_busyprobe = std::getenv("NHL_HIGHCUT_BUSYPROBE") != nullptr;
+            auto hc_cpu_secs = []() -> double {
+              FILETIME c{}, e{}, k{}, u{};
+              if (!GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u)) return 0.0;
+              auto to64 = [](const FILETIME& f) {
+                return (uint64_t(f.dwHighDateTime) << 32) | f.dwLowDateTime;
+              };
+              return double(to64(k) + to64(u)) * 1e-7;  // 100ns ticks -> seconds
+            };
+            static double s_cpuBase = hc_busyprobe ? hc_cpu_secs() : 0.0;
             static double s_prevXlat = 0.0, s_prevUntile = 0.0, s_prevPacket = 0.0, s_prevTotal = 0.0;
             static double s_prevGap1 = 0.0, s_prevGap2 = 0.0;                        // F-3.4
             static double s_winXlat = 0.0, s_winUntile = 0.0, s_winPacket = 0.0;     // window accumulator
@@ -2794,6 +2988,37 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
                           (s_texHits + s_texMisses) ? 100.0 * double(s_texHits) / double(s_texHits + s_texMisses) : 0.0,
                           s_texClears);
               s_texHits = s_texMisses = s_texClears = 0;
+              // F-5 draw-level cache: hit rate = fraction of draws whose full per-draw work was skipped.
+              if (dc_on) {
+                REXLOG_INFO("[highcut-perf]   draw cache: {} hits, {} misses ({:.0f}% hit), {}+{} entries, {} MB, {} drops",
+                            s_drawHits, s_drawMisses,
+                            (s_drawHits + s_drawMisses) ? 100.0 * double(s_drawHits) / double(s_drawHits + s_drawMisses) : 0.0,
+                            s_drawPrev.size(), s_drawNext.size(), s_drawNextBytes / (1024 * 1024), s_drawDrops);
+                s_drawHits = s_drawMisses = s_drawDrops = 0;
+              }
+              // F-4 first-step decision: CPU-busy vs blocked split of the CP-thread frame wall.
+              if (hc_busyprobe) {
+                const double cpuNow = hc_cpu_secs();
+                const double cpuBusy = cpuNow - s_cpuBase;          // CP-thread CPU time this window
+                s_cpuBase = cpuNow;
+                const double wall = secs;
+                const double blocked = wall > cpuBusy ? wall - cpuBusy : 0.0;
+                const double busyPct = wall > 0.0 ? 100.0 * cpuBusy / wall : 0.0;
+                const double f = s_fpsFrames > 0 ? double(s_fpsFrames) : 1.0;
+                // Our in-function busy (sum of the profiled buckets, if NHL_HIGHCUT_PROFILE is on) lets
+                // us further attribute CPU-busy into our work vs SDK PM4 decode.
+                const double ours = (s_winXlat + s_winUntile + s_winPacket + s_winGap1 + s_winGap2);
+                REXLOG_INFO("[highcut-perf]   F4-busyprobe: CP-thread CPU-busy={:.0f}% ({:.1f}ms/frame) "
+                            "blocked(coexist GPU wait)={:.1f}ms/frame  [busy<<wall => F-4 frees it; "
+                            "busy~=wall => SDK-decode-bound]",
+                            busyPct, cpuBusy / f * 1000.0, blocked / f * 1000.0);
+                if (ours > 0.0) {
+                  const double sdkBusy = cpuBusy > ours ? cpuBusy - ours : 0.0;
+                  REXLOG_INFO("[highcut-perf]   F4-busyprobe: of CPU-busy: our RenderBetaOwnedDraw={:.1f}ms/frame "
+                              "SDK-PM4-decode(+other)={:.1f}ms/frame",
+                              ours / f * 1000.0, sdkBusy / f * 1000.0);
+                }
+              }
               if (hc_profile) {
                 const double ms = 1000.0;
                 REXLOG_INFO("[highcut-perf]   window cost: translate={:.0f}ms untile={:.0f}ms "
@@ -2869,6 +3094,14 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
         };
         if (hdr.vs_spirv_bytes) { stream(hdr.vs_shader_id, p3_vs_spirv.data(), hdr.vs_spirv_bytes); hdr.vs_spirv_bytes = 0; }
         if (hdr.ps_spirv_bytes) { stream(hdr.ps_shader_id, p3_ps_spirv.data(), hdr.ps_spirv_bytes); hdr.ps_spirv_bytes = 0; }
+        // F-5 by-id GEOMETRY: stream the vtx/idx blobs ONCE (s_sentGeo). A blob is non-empty here only on
+        // first sight (the gather builds it only when not yet seen), so non-empty == not-yet-streamed.
+        if (geo_byid) {
+          if (vtx_id && !shared_blob.empty() && s_sentGeo.insert(vtx_id).second)
+            HighcutLivePushResource(vtx_id, shared_blob.data(), uint32_t(shared_blob.size()));
+          if (idx_id && !index_blob.empty() && s_sentGeo.insert(idx_id).second)
+            HighcutLivePushResource(idx_id, index_blob.data(), uint32_t(index_blob.size()));
+        }
         for (size_t i = 0; i < tex_descs.size(); ++i)
           if (tex_descs[i].tex_id && tex_descs[i].data_bytes) {
             stream(tex_descs[i].tex_id, tex_blobs[i]->data(), tex_descs[i].data_bytes);
@@ -2902,6 +3135,17 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
 
       bool wrote = false;
       if (live_feed) {
+        // F-5: store this serialized packet into s_drawNext for draw-level reuse next frame (the HIT
+        // path above re-pushes it). One copy into the shared_ptr (this miss only); budget-capped.
+        if (dc_eligible && s_drawNext.find(dc_key) == s_drawNext.end()) {
+          if (s_drawNextBytes + pkt.size() <= kDrawCacheBudget) {
+            auto sp = std::make_shared<const std::vector<uint8_t>>(pkt);  // copy
+            s_drawNextBytes += sp->size();
+            s_drawNext.emplace(dc_key, HcDrawCacheEntry{std::move(sp)});
+          } else {
+            ++s_drawDrops;
+          }
+        }
         HighcutLivePushDraw(std::move(pkt));  // C-6: move the built packet into the plume thread's frame
         wrote = true;
       } else if (std::FILE* pf = std::fopen(pkt_path, "wb")) {

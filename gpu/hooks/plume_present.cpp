@@ -846,6 +846,13 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
     const uint8_t* fetch = take(hdr.fetch_bytes);
     const uint8_t* sysc = take(hdr.sys_bytes);
     const uint8_t* shared = take(hdr.shared_bytes);
+    // v12 by-id geometry: when the vertex bytes were streamed (shared_bytes==0, vtx_id!=0), resolve them
+    // from the dictionary. `sharedN` is the effective vertex byte count from here on.
+    uint32_t sharedN = hdr.shared_bytes;
+    if (hdr.shared_bytes == 0 && hdr.vtx_id) {
+        auto r = c.resourceBytes.find(hdr.vtx_id);
+        if (r != c.resourceBytes.end()) { shared = r->second.data(); sharedN = uint32_t(r->second.size()); }
+    }
     const uint8_t* boolc = take(hdr.bool_bytes);
     const uint8_t* vsf = take(hdr.vs_float_bytes);
     const uint8_t* psf = take(hdr.ps_float_bytes);
@@ -889,6 +896,12 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
     // C-5d: kGuestDMA index blob (raw guest indices, last in the packet).
     const uint8_t* idxData = hdr.index_bytes ? take(hdr.index_bytes) : nullptr;
     if (hdr.index_bytes && !idxData) return false;
+    // v12 by-id geometry: resolve streamed indices from the dictionary. `idxN` = effective index bytes.
+    uint32_t idxN = hdr.index_bytes;
+    if (hdr.index_bytes == 0 && hdr.idx_id) {
+        auto r = c.resourceBytes.find(hdr.idx_id);
+        if (r != c.resourceBytes.end()) { idxData = r->second.data(); idxN = uint32_t(r->second.size()); }
+    }
 
     // by-ID: reuse the compiled shader module across draws/frames (keyed by the producer's shader id).
     // On a miss we compile the inline SPIR-V (Step 1 still ships bytes every draw; Step 2 ships once).
@@ -954,7 +967,7 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
     // capture cap). Floor only 4K (was 64K): a dense frame creates one of these per draw, so a 64K floor
     // over-allocated thousands of small draws to 64K each — wasted alloc time + memory at 4000+ draws.
     const uint64_t kShared = std::min<uint64_t>(
-        std::max<uint64_t>(hdr.shared_bytes, 1u << 12), 16u * 0x100000u);
+        std::max<uint64_t>(sharedN, 1u << 12), 16u * 0x100000u);
     auto mkUbo = [&](uint64_t sz, const uint8_t* src, uint32_t srcN) {
         auto b = c.device->createBuffer(RenderBufferDesc::UploadBuffer(sz, RenderBufferFlag::CONSTANT));
         if (b) {
@@ -974,7 +987,7 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
     if (d.sharedBuf) {
         void* p = d.sharedBuf->map();
         std::memset(p, 0, kShared);
-        if (shared && hdr.shared_bytes) std::memcpy(p, shared, std::min<uint64_t>(hdr.shared_bytes, kShared));
+        if (shared && sharedN) std::memcpy(p, shared, std::min<uint64_t>(sharedN, kShared));
         d.sharedBuf->unmap();
     }
     if (!d.sysBuf || !d.boolBuf || !d.fetchBuf || !d.vsFloatBuf || !d.psFloatBuf || !d.sharedBuf)
@@ -1228,13 +1241,13 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
             if (d.indexBuf) { void* p = d.indexBuf->map(); std::memcpy(p, idx.data(), bytes); d.indexBuf->unmap(); }
             if (d.indexBuf) { d.indexCount = uint32_t(idx.size()); d.indexU32 = true; }
         }
-    } else if (hdr.index_format != 0 && idxData && hdr.index_bytes) {
+    } else if (hdr.index_format != 0 && idxData && idxN) {
         // C-5d: kGuestDMA indexed draw — upload the raw guest indices verbatim (the VS swaps
         // gl_VertexIndex via vertex_index_endian, so no host byte-swap), then drawIndexedInstanced.
-        // vertex_count carries the INDEX count for these draws.
+        // vertex_count carries the INDEX count for these draws. (idxN = inline or by-id streamed size.)
         d.indexBuf = c.device->createBuffer(
-            RenderBufferDesc::IndexBuffer(hdr.index_bytes, RenderHeapType::UPLOAD));
-        if (d.indexBuf) { void* p = d.indexBuf->map(); std::memcpy(p, idxData, hdr.index_bytes); d.indexBuf->unmap(); }
+            RenderBufferDesc::IndexBuffer(idxN, RenderHeapType::UPLOAD));
+        if (d.indexBuf) { void* p = d.indexBuf->map(); std::memcpy(p, idxData, idxN); d.indexBuf->unmap(); }
         if (d.indexBuf) { d.indexCount = hdr.vertex_count; d.indexU32 = (hdr.index_format == 2); }
     }
     RenderGraphicsPipelineDesc pd;
