@@ -2726,7 +2726,11 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
   if (hc_mt_producer && p3_dump_data && beta_current_vs_ && memory_) {
     MaybeCommitLiveFrame();  // CP-thread frame boundary (serial body does this inline; MT skips it)
     HcDrawTask task;
-    task.use_snapshot = false;  // 1a: live read; 1b: snapshot rf + vtx/idx
+    // 1b-step1: default = SNAPSHOT (read register banks + guest vtx/idx from the copy, as a worker will);
+    // NHL_HIGHCUT_MT_LIVEREAD forces the 1a-verified live-read path for A/B. The snapshot is the only new
+    // CP-thread cost (~1ms, F-5b) — proven cheap; this step verifies it's also CORRECT before threading.
+    static const bool mt_liveread = std::getenv("NHL_HIGHCUT_MT_LIVEREAD") != nullptr;
+    task.use_snapshot = !mt_liveread;
     task.primitive_type = primitive_type;
     task.index_count = index_count;
     task.result = result;
@@ -2751,6 +2755,31 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
       task.idx_guest_base = uint32_t(index_buffer_info->guest_base);
       task.idx_length = uint32_t(index_buffer_info->length);
       task.idx_format = index_buffer_info->format;
+    }
+    if (task.use_snapshot) {
+      // Snapshot the mutable state a worker can't read live: full register file + each bound vertex
+      // stream's guest bytes (ring-buffered within a frame) + the index buffer's bytes. (Texture source
+      // is read live in the consumer — textures aren't ring-buffered.) Mirrors what the gather/hash in
+      // ProduceLiveDrawPacket consumes via guestVtx(base)/t.guest_idx.
+      task.rf = *register_file_;
+      for (const auto& vb : beta_current_vs_->vertex_bindings()) {
+        xenos::xe_gpu_vertex_fetch_t f{};
+        f.dword_0 = register_file_->values[0x4800 + vb.fetch_constant * 2];
+        f.dword_1 = register_file_->values[0x4800 + vb.fetch_constant * 2 + 1];
+        const uint32_t base = f.address << 2;
+        const uint32_t sz = f.size << 2;
+        if (!sz) continue;
+        auto& slot = task.guest_vtx[base];
+        if (slot.size() < sz) {  // keep the largest request for a shared base
+          const uint8_t* src = memory_->TranslatePhysical<const uint8_t*>(base);
+          if (src) slot.assign(src, src + sz);
+          else slot.assign(sz, 0);
+        }
+      }
+      if (task.has_index_buffer && task.idx_length) {
+        const uint8_t* isrc = memory_->TranslatePhysical<const uint8_t*>(task.idx_guest_base);
+        if (isrc) task.guest_idx.assign(isrc, isrc + task.idx_length);
+      }
     }
     ProduceLiveDrawPacket(task);
   } else if (p3_dump_data && beta_current_vs_ && memory_) {
