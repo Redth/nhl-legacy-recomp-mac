@@ -1548,11 +1548,30 @@ void NhlD3D12CommandProcessor::CommitLiveFrameOnWorker(const std::vector<uint8_t
   HighcutLiveCommitFrame(resolve_bytes.data(), resolve_bytes.size());
   static uint32_t s_fpsFrames = 0;
   static auto s_fpsT0 = std::chrono::steady_clock::now();
+  // Worker busy-probe: this runs on the WORKER thread (threaded mode), so GetThreadTimes on the current
+  // thread measures the worker's own CPU time. busy/wall ~= 1.0 => the worker is CPU-bound and its work
+  // is being inflated by contention (memory bandwidth / core sharing) => N workers + pinning is the lever.
+  // busy << wall => the worker is STARVED (waiting for the CP to feed it) => the CP decode/snapshot is the
+  // bottleneck, not the worker => more workers won't help (need a leaner decoder).
+  auto cpuSecs = []() -> double {
+    FILETIME c{}, e{}, k{}, u{};
+    if (!GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u)) return 0.0;
+    auto to64 = [](const FILETIME& f) { return (uint64_t(f.dwHighDateTime) << 32) | f.dwLowDateTime; };
+    return double(to64(k) + to64(u)) * 1e-7;  // 100ns ticks -> seconds
+  };
+  static double s_cpuBase = cpuSecs();
   if (++s_fpsFrames >= 60) {
     const auto now = std::chrono::steady_clock::now();
     const double secs = std::chrono::duration_cast<std::chrono::duration<double>>(now - s_fpsT0).count();
-    REXLOG_INFO("[highcut-mt] live takeover (MT): {:.1f} fps over {} frames ({} draws last frame)",
-                secs > 0.0 ? s_fpsFrames / secs : 0.0, s_fpsFrames, highcut_capture_idx_);
+    const double cpuNow = cpuSecs();
+    const double busy = cpuNow - s_cpuBase;
+    s_cpuBase = cpuNow;
+    const double busyPct = secs > 0.0 ? 100.0 * busy / secs : 0.0;
+    REXLOG_INFO("[highcut-mt] live takeover (MT): {:.1f} fps over {} frames ({} draws last); worker "
+                "CPU-busy={:.0f}% ({:.1f}ms/frame) [~100% => worker-bound (contention) -> N workers; "
+                "<<100% => worker starved -> CP/decode-bound]",
+                secs > 0.0 ? s_fpsFrames / secs : 0.0, s_fpsFrames, highcut_capture_idx_, busyPct,
+                busy / s_fpsFrames * 1000.0);
     s_fpsFrames = 0;
     s_fpsT0 = now;
   }
