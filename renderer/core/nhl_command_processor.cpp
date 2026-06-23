@@ -1420,6 +1420,7 @@ static double g_f4BaseSwap = 0.0;
 // the CP prep is dominated by our SNAPSHOT (reducible -> FSI hope) or SDK-coupled work (the wall).
 static double g_f4Translate = 0.0;
 static double g_f4Snapshot = 0.0;
+static double g_f4Process = 0.0;  // SDK primitive-processor Process() — the prime bypass candidate
 
 // ===== MT PRODUCER (NHL_HIGHCUT_MT_PRODUCER) — Stage 1, docs/mt-producer-stage1-plan.md ============
 // Per-draw snapshot handed from the CP thread to ProduceLiveDrawPacket. The SDK rewrites register_file_
@@ -2143,6 +2144,7 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
   (void)index_count;
   namespace draw_util = rex::graphics::draw_util;
   namespace reg = rex::graphics::reg;
+  static const bool f4probe = std::getenv("NHL_HIGHCUT_F4PROBE") != nullptr;  // CP sub-breakdown timing
   if (!beta_current_vs_ || !CreateBetaOffscreenTarget(1280, 720)) {
     REXLOG_ERROR("[nhl-beta] owned-draw: no current VS or RT create failed");
     return;
@@ -2176,7 +2178,10 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
   }
 
   rex::graphics::PrimitiveProcessor::ProcessingResult result{};
-  if (!beta_primitive_processor_->Process(result)) {
+  const auto _f4pp0 = f4probe ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+  const bool _pp_ok = beta_primitive_processor_->Process(result);
+  if (f4probe) g_f4Process += std::chrono::duration<double>(std::chrono::steady_clock::now() - _f4pp0).count();
+  if (!_pp_ok) {
     REXLOG_INFO("[nhl-beta] owned-draw: Process() false (nothing to draw)");
     return;
   }
@@ -2407,7 +2412,6 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
   // seam are in place; the per-draw body has not yet been lifted into the consumer, so when the flag is
   // set we log once and still run the proven serial path. Stage 1a-cont wires the consumer; 1b threads it.
   static const bool hc_mt_producer = std::getenv("NHL_HIGHCUT_MT_PRODUCER") != nullptr;
-  static const bool f4probe = std::getenv("NHL_HIGHCUT_F4PROBE") != nullptr;  // CP sub-breakdown timing
   if (hc_mt_producer) {
     static bool s_mtNotice = false;
     if (!s_mtNotice) {
@@ -2936,14 +2940,16 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
                           swapMs, ourMs, wallMs - ourMs - swapMs, wallMs);
               const double xlatMs = g_f4Translate / f * 1000.0;
               const double snapMs2 = g_f4Snapshot / f * 1000.0;
-              REXLOG_INFO("[highcut-mt]   F4-ourDraw breakdown: translate={:.1f}ms/frame snapshot={:.1f}ms/frame "
-                          "rest(Process+interp+enqueue+bp-wait)={:.1f}ms/frame [snapshot-dominated => reducible "
-                          "(FSI hope); SDK-coupled-dominated => the wall]",
-                          xlatMs, snapMs2, ourMs - xlatMs - snapMs2);
+              const double procMs = g_f4Process / f * 1000.0;
+              REXLOG_INFO("[highcut-mt]   F4-ourDraw breakdown: SDK-Process()={:.1f}ms/frame translate={:.1f}ms/frame "
+                          "snapshot={:.1f}ms/frame rest(interp+enqueue+bp-wait)={:.1f}ms/frame "
+                          "[Process is the bypass prize — its host index buffer is unused by our path]",
+                          procMs, xlatMs, snapMs2, ourMs - xlatMs - snapMs2 - procMs);
               g_f4OurDraw = 0.0;
               g_f4BaseSwap = 0.0;
               g_f4Translate = 0.0;
               g_f4Snapshot = 0.0;
+              g_f4Process = 0.0;
             }
             s_cpF = 0;
             s_cpT0 = now;
