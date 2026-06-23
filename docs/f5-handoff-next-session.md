@@ -60,6 +60,35 @@ artifacts) = an UPPER bound on the post-MT CP-thread floor.
   worker pool (shard/lock `s_texCache`/xlat caches) would have been wasted effort on a doomed approach.
   Needs the user at the controller (autonomous attract is too light to be representative).
 
+### ★★ F-5b RESULT — DENSE CONTROLLER RUN 2026-06-23: **MT PRODUCER IS GO (decisive)**
+
+Log `t241432`, ~1300–1660 draws/frame, ~14–19 fps, ~50–66 ms/frame CP-busy. The worst-case input
+snapshot costs **~1.0–1.2 ms/frame** (30–38 MB) — **~30× cheaper than our ~34 ms of per-draw work**.
+The byte copy is a non-issue (pure memcpy bandwidth). Context held steady with prior runs: CP-thread
+CPU-busy 92–95%, blocked (coexist GPU wait) only ~3–5 ms, of CPU-busy our RenderBetaOwnedDraw ~26–37 ms
++ SDK-PM4-decode ~23–29 ms.
+
+**Implication — the projected ceiling:** move our ~34 ms onto a worker pool ⇒ post-MT CP wall ≈
+SDK-decode (~25 ms) + snapshot (~1 ms) ≈ **~26 ms ⇒ ~38 fps** (from ~15–16 ⇒ ~2.4×). The ~25 ms SDK
+PM4 decode stays serial on the CP thread (upstream of the snapshot), so **~34–40 fps is the MT-producer
+ceiling**; 60 fps still needs F-4 (cut the throwaway base-render slice of the ~25 ms) and/or the leaner
+custom decoder. But MT alone is a large, real win and is now GO with evidence.
+
+**The MT producer build (next):**
+1. **Snapshot struct** per draw on the CP thread: the two register ranges + guest vtx/idx bytes (≈ what
+   SNAPPROBE copies) + shader handles/ids + a monotonically-increasing **sequence number**.
+2. **Worker pool** runs the deferred work (translate-hit / gap1 / untile-hit / packet serialize) from the
+   snapshot, producing the serialized packet.
+3. **Ordering:** consumer renders in push order, so workers must NOT push directly — write each packet to
+   its sequence slot and **drain in sequence order** at frame commit (reorder buffer).
+4. **Thread-safety of the static caches** (`s_texCache`, `s_vsXlat`/`s_psXlat`, `s_sentGeo`/`s_sentRes`,
+   `s_drawPrev`/`s_drawNext`): reads dominate (100% untile-hit, by-id shaders/geo mostly seen), so a
+   `shared_mutex` with read-mostly locking, or sharded maps, is cheap. **First-sight heavy work** (shader
+   translate, untile, geometry gather+stream) MUTATES the caches — keep those rare paths either on the CP
+   thread or behind a write-lock; the per-draw HIT path (the ~34 ms steady state) is the parallel target.
+5. Gate behind a flag (`NHL_HIGHCUT_MT_PRODUCER`), keep BUSYPROBE on to confirm the CP wall drops toward
+   ~26 ms. Validate with the user at the controller (geometry correctness + fps).
+
 ## Performance reality (manage expectations)
 
 - **Likely reachable** (MT producer + F-4 + gap1/untile micro-opts): **~30–35 fps dense**, higher on
