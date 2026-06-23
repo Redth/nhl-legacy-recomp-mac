@@ -89,7 +89,20 @@ custom decoder. But MT alone is a large, real win and is now GO with evidence.
 5. Gate behind a flag (`NHL_HIGHCUT_MT_PRODUCER`), keep BUSYPROBE on to confirm the CP wall drops toward
    ~26 ms. Validate with the user at the controller (geometry correctness + fps).
 
-### ▶ NEXT: execute the MT producer — STAGED (1 worker first). Plan: [mt-producer-stage1-plan.md](mt-producer-stage1-plan.md)
+### ✅ MT PRODUCER — DONE (parallel ceiling reached, 2026-06-23)
+
+Shipped `NHL_HIGHCUT_MT_PRODUCER` (default-off, opt-in): the per-draw packet production runs on a worker
+thread overlapping the SDK PM4 decode. **Result: dense ~24 fps (was 16 serial, ~1.5×), light ~74 fps**,
+render-correct (bounded <0.15-frame texture lag). Both busy-probes proved it's **CP-feed-bound** at dense
+(CP 88–94% busy ≈ 36–39 ms/frame; worker 83–86%). Wins came from making the CP per-draw path copy/alloc-free
+(lean+pooled snapshot, SPIR-V & vpi off the CP thread) + a drain-free deepened pipeline — **not** from more
+workers (N workers capped at ~26–27 fps by the CP floor; not worth the complexity). **The ~25 ms SDK decode
+is the wall** — only the leaner custom PM4 decoder beats it. Commits `c29e287`…`8b0cb8b`. Debug ladder:
+`NHL_HIGHCUT_MT_SYNC` / `NHL_HIGHCUT_MT_LIVEREAD`; driver `scripts/_mtproducer.ps1 [-Off]`. Build/measure
+detail lives in `mt-producer-stage1-plan.md` + the memory note. **Next big lever (if pursued): custom PM4
+decoder; or draw-count reduction (crowd instancing / culling) for dense scenes.**
+
+### ▶ ORIGINAL PLAN (now executed). Plan: [mt-producer-stage1-plan.md](mt-producer-stage1-plan.md)
 
 User chose **stage it: 1 worker first, then widen** (de-risks the ~1000-line body extraction from
 concurrency). Full execution spec — seam (CP thread 1405–2144 + 2922–3068; worker 2149–2920+3073–3190),
