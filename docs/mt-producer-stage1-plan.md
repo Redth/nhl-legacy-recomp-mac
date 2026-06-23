@@ -72,6 +72,31 @@ data. Snapshot per draw into a heap `HcDrawTask`:
   per draw: setup+translate+vpi, build the snapshot task, `worker.enqueue(std::move(task))`, return.
 - Process shutdown / takeover end: `worker.drain()` + join.
 
+## Reconnaissance findings (exact, so the extraction is mechanical)
+
+- **Body block** = `if (p3_dump_data && beta_current_vs_ && memory_) { … }` at **2149–3247** (the
+  `if (hc_profile) s_tPacket` at 3246 is the last line inside). **Tail**: 3253–3257
+  `if (skip_owned_render) { s_tTotal += …; ++beta_takeover_rendered_; return; }` — in live mode
+  `skip_owned_render` is always true, so everything after 3257 (the real D3D12 owned render) is DEAD.
+- **Body inputs** the task must carry (per-draw, computed before 2149): `primitive_type`, `index_count`,
+  `index_buffer_info` (param), `vpi` (2108), `result` (1447, POD `ProcessingResult`), `eff_ps` (1487),
+  and the **translate outputs** declared at **1641–1658** and written at 1692–1965:
+  `p3_dump_data`, `p3_vs_id`, `p3_ps_id`, `p3_vs_spirv`, `p3_ps_spirv`, `p3_vs_texbinds`,
+  `p3_ps_texbinds`, `p3_vs_sampbinds`, `p3_ps_sampbinds`, `p3_vs_sampler_count`, `p3_ps_sampler_count`.
+  Move these into the task (translate writes `t.*`, body reads `t.*`). `beta_current_vs_` is a member
+  (stable per draw) — read via `this`; pass `eff_ps` in the task.
+- **ACCOUNTING-COUPLING gotcha:** the drawcache-HIT early path (2272–2280) does `s_tTotal += …` (2277),
+  `++beta_takeover_rendered_` (2278), `return` (2279) — it does NOT reach the tail's `s_tTotal`/`++` at
+  3254–3255. A naïve extract that returns from the method and then runs the tail would **double-count**.
+  Since DRAWCACHE is menu-only/off and unsupported under MT, route accounting uniformly through the tail
+  (drop the hit-path's own `s_tTotal`/`++`), or have the method return a status the caller honors.
+- **Static-hoist is NOT purely mechanical:** `s_cpuBase` (2958) initializes from the local lambda
+  `hc_cpu_secs` and the static `hc_busyprobe`; several profiling statics interlock. The frame-commit
+  (2922–3068) reads the profiling accumulators (`s_tXlat`/`s_tUntile`/`s_tPacket`/`s_tGap1`/`s_tGap2`)
+  AND the untile stats (`s_texHits`…) that the body writes — so once body→method and commit→`CommitLiveFrame`,
+  those shared statics move to **class members** (cleanest) or file scope. Do this as part of 1b (when the
+  commit actually separates); in 1a the commit stays inline so the statics stay function-local.
+
 ## Increments (each compiles; land in order)
 
 - **1a — extract, still synchronous (behavior-identical, compile + reason verified).** Move the body

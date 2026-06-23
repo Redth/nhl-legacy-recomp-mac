@@ -1402,6 +1402,51 @@ extern "C" void HighcutLiveCommitFrame(const uint8_t* resolves, size_t rsize);
 // delimited to ONE guest frame instead of stacking 2–3.
 extern "C" uint64_t HighcutGuestPresentCount();
 
+// ===== MT PRODUCER (NHL_HIGHCUT_MT_PRODUCER) — Stage 1, docs/mt-producer-stage1-plan.md ============
+// Per-draw snapshot handed from the CP thread to ProduceLiveDrawPacket. The SDK rewrites register_file_
+// for the next draw and RING-BUFFERS guest vtx/idx WITHIN a frame, so a worker on draw N would read
+// corruption — those are copied here. Stable inputs (memory_ for texture source, beta_current_vs_,
+// beta_rt_*) are read via `this` on the worker. Cheap per-draw context (vpi/result/translate outputs)
+// is always carried. `use_snapshot=false` => the method reads LIVE register_file_/memory_ (the serial
+// path), so flag-off behavior is byte-identical and the method is self-verifying on every normal run.
+struct NhlD3D12CommandProcessor::HcDrawTask {
+  uint64_t seq = 0;
+  bool use_snapshot = false;  // true: MT (read rf/guest_vtx/guest_idx); false: serial (read live state)
+
+  // --- snapshotted mutable state (filled only when use_snapshot) ---
+  rex::graphics::RegisterFile rf;                                  // full register copy (~82 KB)
+  std::unordered_map<uint32_t, std::vector<uint8_t>> guest_vtx;    // vertex-stream base -> bytes
+  std::vector<uint8_t> guest_idx;                                  // index-buffer bytes
+
+  // --- per-draw context (always carried; cheap) ---
+  rex::graphics::xenos::PrimitiveType primitive_type{};
+  uint32_t index_count = 0;
+  bool has_index_buffer = false;                                   // kGuestDMA index present
+  uint32_t idx_guest_base = 0, idx_length = 0;
+  rex::graphics::xenos::IndexFormat idx_format{};
+  rex::graphics::PrimitiveProcessor::ProcessingResult result{};
+  rex::graphics::draw_util::ViewportInfo vpi{};
+  rex::graphics::d3d12::D3D12Shader* eff_ps = nullptr;             // beta_current_ps_ or null this draw
+
+  // --- translate outputs (produced CP-side, consumed by the body) ---
+  bool p3_dump_data = false;
+  uint64_t p3_vs_id = 0, p3_ps_id = 0;
+  std::vector<uint8_t> p3_vs_spirv, p3_ps_spirv;
+  std::vector<rex::graphics::SpirvShader::TextureBinding> p3_vs_texbinds, p3_ps_texbinds;
+  std::vector<rex::graphics::SpirvShader::SamplerBinding> p3_vs_sampbinds, p3_ps_sampbinds;
+  uint32_t p3_vs_sampler_count = 0, p3_ps_sampler_count = 0;
+};
+
+// Stage 1a-cont (TODO): lift the per-draw packet-production body (geometry gather+hash → float pack →
+// spv_sys → untile → sampler descs → header → resource stream → serialize → HighcutLivePushDraw) here,
+// reading register banks from `t.use_snapshot ? t.rf : *register_file_`, vtx/idx from the snapshot when
+// `t.use_snapshot` (else live memory_), texture source always from live memory_. Profiling buckets +
+// frame-commit + drawcache stay on the CP thread (per-thread/per-frame, not part of this unit). Until
+// wired, RenderBetaOwnedDraw runs the inline serial body and this is never called.
+void NhlD3D12CommandProcessor::ProduceLiveDrawPacket(HcDrawTask& t) {
+  (void)t;
+}
+
 void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     xenos::PrimitiveType primitive_type, uint32_t index_count,
     rex::graphics::CommandProcessor::IndexBufferInfo* index_buffer_info) {
@@ -1668,6 +1713,19 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
   // build+push) and report it with the FPS readout, so the remaining live-takeover cost is MEASURED, not
   // guessed. Accumulated across draws, logged + reset every 60 committed frames. Cheap when off.
   static const bool hc_profile = std::getenv("NHL_HIGHCUT_PROFILE") != nullptr;
+  // MT producer (docs/mt-producer-stage1-plan.md). Stage 1a: the HcDrawTask type + ProduceLiveDrawPacket
+  // seam are in place; the per-draw body has not yet been lifted into the consumer, so when the flag is
+  // set we log once and still run the proven serial path. Stage 1a-cont wires the consumer; 1b threads it.
+  static const bool hc_mt_producer = std::getenv("NHL_HIGHCUT_MT_PRODUCER") != nullptr;
+  if (hc_mt_producer) {
+    static bool s_mtNotice = false;
+    if (!s_mtNotice) {
+      s_mtNotice = true;
+      REXLOG_INFO("[highcut-mt] NHL_HIGHCUT_MT_PRODUCER set — Stage 1a scaffolding present "
+                  "(HcDrawTask + ProduceLiveDrawPacket seam); consumer not yet wired, using the proven "
+                  "serial path this build.");
+    }
+  }
   // LIVE-TAKEOVER FREEZE FIX (owned-draw cut): in high-cut LIVE mode plume renders from the captured
   // packets, so the SDK's D3D12 owned-draw that follows the capture is NOT displayed — yet it costs the
   // most per draw on the guest CP thread (per-draw residency RequestRange thrash against the 16MB live
