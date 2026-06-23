@@ -1415,6 +1415,11 @@ extern "C" uint64_t HighcutGuestPresentCount();
 // and (b) the base IssueSwap [the throwaway]; reported + reset in the CP busy-probe window. CP thread.
 static double g_f4OurDraw = 0.0;
 static double g_f4BaseSwap = 0.0;
+// Sub-breakdown of our-IssueDraw: the translate section + the MT snapshot block. The remainder
+// (our-IssueDraw - translate - snapshot) = SDK Process() + interpolator + enqueue + misc. Decides whether
+// the CP prep is dominated by our SNAPSHOT (reducible -> FSI hope) or SDK-coupled work (the wall).
+static double g_f4Translate = 0.0;
+static double g_f4Snapshot = 0.0;
 
 // ===== MT PRODUCER (NHL_HIGHCUT_MT_PRODUCER) — Stage 1, docs/mt-producer-stage1-plan.md ============
 // Per-draw snapshot handed from the CP thread to ProduceLiveDrawPacket. The SDK rewrites register_file_
@@ -2402,6 +2407,7 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
   // seam are in place; the per-draw body has not yet been lifted into the consumer, so when the flag is
   // set we log once and still run the proven serial path. Stage 1a-cont wires the consumer; 1b threads it.
   static const bool hc_mt_producer = std::getenv("NHL_HIGHCUT_MT_PRODUCER") != nullptr;
+  static const bool f4probe = std::getenv("NHL_HIGHCUT_F4PROBE") != nullptr;  // CP sub-breakdown timing
   if (hc_mt_producer) {
     static bool s_mtNotice = false;
     if (!s_mtNotice) {
@@ -2432,6 +2438,7 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
   static std::atomic<int> highcut_p3_count{0};
   constexpr int kP3MaxDraws = 32;
   const auto _hc_tx0 = hc_profile ? hc_clock::now() : hc_clock::time_point{};
+  const auto _f4tx0 = f4probe ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
   if (std::getenv("NHL_HIGHCUT_XLAT_TEST") || frame_capture) {
     // C-4: only survey INTERESTING draws (a vfetch VS or a textured PS) — skip the many trivial
     // boot-overlay draws so textured menu draws are reached. (Bindings come from the SDK's shader
@@ -2708,6 +2715,7 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
   }
 
   if (hc_profile) { const auto _e = hc_clock::now(); s_tXlat += hc_secs(_hc_tx0, _e); _hc_eXlat = _e; }
+  if (f4probe) g_f4Translate += std::chrono::duration<double>(std::chrono::steady_clock::now() - _f4tx0).count();
 
   // LIVE-TAKEOVER FREEZE FIX: the SDK DXBC translate + the per-new-shader async-translation / PSO
   // SPIN-WAITS below (Sleep-loops up to ~200ms each + a 1000ms PSO wait) are owned-draw prep ONLY. On
@@ -2926,8 +2934,16 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
                           "our-IssueDraw(CP setup +bp-wait)={:.1f}ms/frame  PM4-decode(remainder)~={:.1f}ms/frame "
                           "(of {:.1f}ms wall) [big base-swap => F-4 frees it => FSI-parity reachable]",
                           swapMs, ourMs, wallMs - ourMs - swapMs, wallMs);
+              const double xlatMs = g_f4Translate / f * 1000.0;
+              const double snapMs2 = g_f4Snapshot / f * 1000.0;
+              REXLOG_INFO("[highcut-mt]   F4-ourDraw breakdown: translate={:.1f}ms/frame snapshot={:.1f}ms/frame "
+                          "rest(Process+interp+enqueue+bp-wait)={:.1f}ms/frame [snapshot-dominated => reducible "
+                          "(FSI hope); SDK-coupled-dominated => the wall]",
+                          xlatMs, snapMs2, ourMs - xlatMs - snapMs2);
               g_f4OurDraw = 0.0;
               g_f4BaseSwap = 0.0;
+              g_f4Translate = 0.0;
+              g_f4Snapshot = 0.0;
             }
             s_cpF = 0;
             s_cpT0 = now;
@@ -2967,6 +2983,7 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
       task.idx_length = uint32_t(index_buffer_info->length);
       task.idx_format = index_buffer_info->format;
     }
+    const auto _f4ss0 = f4probe ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (task.use_snapshot) {
       // LEAN snapshot of the mutable state a worker can't read live: ONLY the two register ranges the
       // consumer reads (~13 KB, not the full 82 KB) into the pooled rf buffer, plus each bound vertex
@@ -3001,6 +3018,7 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
         if (isrc) task.idx_buf.insert(task.idx_buf.end(), isrc, isrc + task.idx_length);
       }
     }
+    if (f4probe) g_f4Snapshot += std::chrono::duration<double>(std::chrono::steady_clock::now() - _f4ss0).count();
     if (mt_sync) {
       ProduceLiveDrawPacket(task);    // synchronous (debug / extraction verify)
       mt_worker_->release(tp);        // recycle immediately
