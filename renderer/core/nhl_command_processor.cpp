@@ -3,6 +3,7 @@
 #include "renderer/core/nhl_command_processor.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -1418,9 +1419,17 @@ struct NhlD3D12CommandProcessor::HcDrawTask {
   bool use_snapshot = false;  // true: MT (read rf/guest_vtx/guest_idx); false: serial (read live state)
 
   // --- snapshotted mutable state (filled only when use_snapshot) ---
-  rex::graphics::RegisterFile rf;                                  // full register copy (~82 KB)
-  std::unordered_map<uint32_t, std::vector<uint8_t>> guest_vtx;    // vertex-stream base -> bytes
-  std::vector<uint8_t> guest_idx;                                  // index-buffer bytes
+  // rf is a FULL-SIZE register buffer (so the consumer's RF.Get<>()/regs[] index by absolute register),
+  // but only the two ranges the consumer reads — [0x2000,0x2400) (RB_/PA_/VGT_ context) and
+  // [0x4000,0x4940) (ALU floats + fetch + bool/loop) — are copied per draw (~13 KB, not 82 KB). The
+  // buffer itself is allocated ONCE per pooled task and reused. vtx_buf concatenates the bound vertex
+  // streams (reused; clear() keeps capacity) with vtx_ents mapping each stream's guest base to its slice.
+  rex::graphics::RegisterFile rf;
+  std::vector<uint8_t> vtx_buf;                                    // bound vertex streams, concatenated
+  struct VtxEnt { uint32_t base = 0, offset = 0, size = 0; };      // guest base -> slice of vtx_buf
+  std::array<VtxEnt, 64> vtx_ents{};
+  uint32_t vtx_n = 0;
+  std::vector<uint8_t> idx_buf;                                    // index-buffer bytes (reused)
 
   // --- per-draw context (always carried; cheap) ---
   rex::graphics::xenos::PrimitiveType primitive_type{};
@@ -1455,8 +1464,21 @@ struct NhlD3D12CommandProcessor::HcLiveWorker {
     fn_ = std::move(fn);
     thread_ = std::thread([this] { run(); });
   }
-  void enqueue(HcDrawTask&& t) {
-    { std::lock_guard<std::mutex> lk(m_); q_.push_back(std::move(t)); }
+  // Pooled tasks: acquire a recycled HcDrawTask (its rf buffer + vtx/idx vectors keep their capacity, so
+  // the per-draw fill does NO allocation after warmup), and the QUEUE carries pointers — so enqueue moves
+  // a pointer, never the 82 KB task. The worker returns each task to the free list after processing.
+  HcDrawTask* acquire() {
+    std::lock_guard<std::mutex> lk(m_);
+    if (!free_.empty()) { HcDrawTask* t = free_.back(); free_.pop_back(); return t; }
+    storage_.push_back(std::make_unique<HcDrawTask>());
+    return storage_.back().get();
+  }
+  void release(HcDrawTask* t) {  // sync path returns tasks here directly
+    std::lock_guard<std::mutex> lk(m_);
+    free_.push_back(t);
+  }
+  void enqueue(HcDrawTask* t) {
+    { std::lock_guard<std::mutex> lk(m_); q_.push_back(t); }
     cv_.notify_one();
   }
   void drain() {  // block until the queue is empty AND the in-flight task (if any) finished
@@ -1471,18 +1493,19 @@ struct NhlD3D12CommandProcessor::HcLiveWorker {
  private:
   void run() {
     for (;;) {
-      HcDrawTask t;
+      HcDrawTask* t = nullptr;
       {
         std::unique_lock<std::mutex> lk(m_);
         cv_.wait(lk, [this] { return !q_.empty() || stop_; });
         if (q_.empty()) { if (stop_) return; else continue; }
-        t = std::move(q_.front());
+        t = q_.front();
         q_.pop_front();
         busy_ = true;
       }
-      fn_(t);
+      fn_(*t);
       {
         std::lock_guard<std::mutex> lk(m_);
+        free_.push_back(t);  // recycle
         busy_ = false;
         if (q_.empty()) drain_cv_.notify_all();
       }
@@ -1491,7 +1514,9 @@ struct NhlD3D12CommandProcessor::HcLiveWorker {
   std::thread thread_;
   std::mutex m_;
   std::condition_variable cv_, drain_cv_;
-  std::deque<HcDrawTask> q_;
+  std::deque<HcDrawTask*> q_;                            // in-flight (pointers into storage_)
+  std::vector<std::unique_ptr<HcDrawTask>> storage_;     // owns the pooled tasks
+  std::deque<HcDrawTask*> free_;                         // recycled, ready to reuse
   std::function<void(HcDrawTask&)> fn_;
   bool stop_ = false, busy_ = false;
 };
@@ -1556,7 +1581,11 @@ void NhlD3D12CommandProcessor::ProduceLiveDrawPacket(HcDrawTask& t) {
   static const bool geo_byid = std::getenv("NHL_HIGHCUT_GEOM_BYID") != nullptr;  // live MT == live_feed
   static const bool beta_noblend = std::getenv("NHL_BETA_NOBLEND") != nullptr;
   auto guestVtx = [&](uint32_t base) -> const uint8_t* {
-    if (t.use_snapshot) { auto it = t.guest_vtx.find(base); return it != t.guest_vtx.end() ? it->second.data() : nullptr; }
+    if (t.use_snapshot) {
+      for (uint32_t i = 0; i < t.vtx_n; ++i)
+        if (t.vtx_ents[i].base == base) return t.vtx_buf.data() + t.vtx_ents[i].offset;
+      return nullptr;
+    }
     return memory_ ? memory_->TranslatePhysical<const uint8_t*>(base) : nullptr;
   };
 
@@ -1612,7 +1641,7 @@ void NhlD3D12CommandProcessor::ProduceLiveDrawPacket(HcDrawTask& t) {
   if (t.has_index_buffer) {
     const uint32_t ilen = t.idx_length;
     const uint8_t* isrc = t.use_snapshot
-                              ? (t.guest_idx.empty() ? nullptr : t.guest_idx.data())
+                              ? (t.idx_buf.empty() ? nullptr : t.idx_buf.data())
                               : (memory_ ? memory_->TranslatePhysical<const uint8_t*>(t.idx_guest_base) : nullptr);
     if (isrc && ilen) {
       index_format = (t.idx_format == xenos::IndexFormat::kInt32) ? 2u : 1u;
@@ -2796,7 +2825,14 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
         MaybeCommitLiveFrame();
       }
     }
-    HcDrawTask task;
+    // Lazily create the worker (also owns the task pool, used even in sync mode); start its thread only
+    // when threaded.
+    if (!mt_worker_) {
+      mt_worker_ = new HcLiveWorker();
+      if (!mt_sync) mt_worker_->start([this](HcDrawTask& tk) { ProduceLiveDrawPacket(tk); });
+    }
+    HcDrawTask* tp = mt_worker_->acquire();  // recycled — its rf/vtx/idx buffers keep capacity (no malloc)
+    HcDrawTask& task = *tp;
     // SNAPSHOT by default (the worker must read register banks + guest vtx/idx from the copy). MT_LIVEREAD
     // (sync only) forces the 1a-verified live-read path for A/B; threaded mode ALWAYS snapshots.
     task.use_snapshot = !(mt_sync && mt_liveread);
@@ -2810,14 +2846,15 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     task.p3_dump_data = p3_dump_data;
     task.p3_vs_id = p3_vs_id;
     task.p3_ps_id = p3_ps_id;
-    task.p3_vs_spirv = p3_vs_spirv;
-    task.p3_ps_spirv = p3_ps_spirv;
-    task.p3_vs_texbinds = p3_vs_texbinds;
-    task.p3_ps_texbinds = p3_ps_texbinds;
-    task.p3_vs_sampbinds = p3_vs_sampbinds;
-    task.p3_ps_sampbinds = p3_ps_sampbinds;
+    task.p3_vs_spirv.assign(p3_vs_spirv.begin(), p3_vs_spirv.end());  // assign reuses the pooled capacity
+    task.p3_ps_spirv.assign(p3_ps_spirv.begin(), p3_ps_spirv.end());
+    task.p3_vs_texbinds.assign(p3_vs_texbinds.begin(), p3_vs_texbinds.end());
+    task.p3_ps_texbinds.assign(p3_ps_texbinds.begin(), p3_ps_texbinds.end());
+    task.p3_vs_sampbinds.assign(p3_vs_sampbinds.begin(), p3_vs_sampbinds.end());
+    task.p3_ps_sampbinds.assign(p3_ps_sampbinds.begin(), p3_ps_sampbinds.end());
     task.p3_vs_sampler_count = p3_vs_sampler_count;
     task.p3_ps_sampler_count = p3_ps_sampler_count;
+    task.has_index_buffer = false;
     if (result.index_buffer_type ==
             rex::graphics::PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA &&
         index_buffer_info) {
@@ -2827,11 +2864,15 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
       task.idx_format = index_buffer_info->format;
     }
     if (task.use_snapshot) {
-      // Snapshot the mutable state a worker can't read live: full register file + each bound vertex
-      // stream's guest bytes (ring-buffered within a frame) + the index buffer's bytes. (Texture source
-      // is read live in the consumer — textures aren't ring-buffered.) Mirrors what the gather/hash in
-      // ProduceLiveDrawPacket consumes via guestVtx(base)/t.guest_idx.
-      task.rf = *register_file_;
+      // LEAN snapshot of the mutable state a worker can't read live: ONLY the two register ranges the
+      // consumer reads (~13 KB, not the full 82 KB) into the pooled rf buffer, plus each bound vertex
+      // stream's guest bytes concatenated into the reused vtx_buf (ring-buffered within a frame) and the
+      // index bytes. Texture source is read live in the consumer (textures aren't ring-buffered). No
+      // per-draw allocation after warmup: rf/vtx_buf/idx_buf keep their capacity across pool reuse.
+      std::memcpy(&task.rf.values[0x2000], &register_file_->values[0x2000], 0x400 * 4);
+      std::memcpy(&task.rf.values[0x4000], &register_file_->values[0x4000], 0x940 * 4);
+      task.vtx_buf.clear();
+      task.vtx_n = 0;
       for (const auto& vb : beta_current_vs_->vertex_bindings()) {
         xenos::xe_gpu_vertex_fetch_t f{};
         f.dword_0 = register_file_->values[0x4800 + vb.fetch_constant * 2];
@@ -2839,26 +2880,28 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
         const uint32_t base = f.address << 2;
         const uint32_t sz = f.size << 2;
         if (!sz) continue;
-        auto& slot = task.guest_vtx[base];
-        if (slot.size() < sz) {  // keep the largest request for a shared base
-          const uint8_t* src = memory_->TranslatePhysical<const uint8_t*>(base);
-          if (src) slot.assign(src, src + sz);
-          else slot.assign(sz, 0);
-        }
+        bool dup = false;  // distinct fetch constants almost always have distinct bases
+        for (uint32_t i = 0; i < task.vtx_n; ++i)
+          if (task.vtx_ents[i].base == base) { dup = true; break; }
+        if (dup) continue;
+        const uint32_t off = uint32_t(task.vtx_buf.size());
+        const uint8_t* src = memory_->TranslatePhysical<const uint8_t*>(base);
+        if (src) task.vtx_buf.insert(task.vtx_buf.end(), src, src + sz);
+        else task.vtx_buf.resize(size_t(off) + sz, 0);
+        if (task.vtx_n < task.vtx_ents.size())
+          task.vtx_ents[task.vtx_n++] = {base, off, sz};
       }
+      task.idx_buf.clear();
       if (task.has_index_buffer && task.idx_length) {
         const uint8_t* isrc = memory_->TranslatePhysical<const uint8_t*>(task.idx_guest_base);
-        if (isrc) task.guest_idx.assign(isrc, isrc + task.idx_length);
+        if (isrc) task.idx_buf.insert(task.idx_buf.end(), isrc, isrc + task.idx_length);
       }
     }
     if (mt_sync) {
-      ProduceLiveDrawPacket(task);  // synchronous (debug / extraction verify)
+      ProduceLiveDrawPacket(task);    // synchronous (debug / extraction verify)
+      mt_worker_->release(tp);        // recycle immediately
     } else {
-      if (!mt_worker_) {
-        mt_worker_ = new HcLiveWorker();
-        mt_worker_->start([this](HcDrawTask& tk) { ProduceLiveDrawPacket(tk); });
-      }
-      mt_worker_->enqueue(std::move(task));  // overlap our ~34ms work with the SDK PM4 decode
+      mt_worker_->enqueue(tp);        // overlap our ~34ms work with the SDK PM4 decode
     }
   } else if (p3_dump_data && beta_current_vs_ && memory_) {
     namespace rg = rex::graphics;
