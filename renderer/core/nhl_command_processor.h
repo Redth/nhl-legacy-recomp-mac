@@ -197,6 +197,10 @@ class NhlD3D12CommandProcessor : public rex::graphics::d3d12::D3D12CommandProces
   // Defined in the .cpp (heavy SDK types); forward-declared here as a nested type.
   struct HcDrawTask;
   void ProduceLiveDrawPacket(HcDrawTask& t);
+  // MT producer frame boundary: detect a new guest present, commit the just-ended frame's resolve
+  // sidecar to the plume bridge, reset per-frame counters, and emit the live fps readout. The serial
+  // path does this inline; the MT path skips the serial body, so it runs this on the CP thread per draw.
+  void MaybeCommitLiveFrame();
   // Loose-asset texture injection (replay only): some textures are never written
   // by the GPU trace (static assets cached before capture), so guest RAM is zero
   // at their fetch-constant base and they render black. NHL_BETA_INJECT supplies

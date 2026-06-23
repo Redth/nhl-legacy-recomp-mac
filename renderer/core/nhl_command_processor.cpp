@@ -1426,6 +1426,7 @@ struct NhlD3D12CommandProcessor::HcDrawTask {
   rex::graphics::xenos::IndexFormat idx_format{};
   rex::graphics::PrimitiveProcessor::ProcessingResult result{};
   rex::graphics::draw_util::ViewportInfo vpi{};
+  rex::graphics::reg::RB_DEPTHCONTROL ndc{};                       // normalized depth/stencil control
   rex::graphics::d3d12::D3D12Shader* eff_ps = nullptr;             // beta_current_ps_ or null this draw
 
   // --- translate outputs (produced CP-side, consumed by the body) ---
@@ -1443,8 +1444,521 @@ struct NhlD3D12CommandProcessor::HcDrawTask {
 // `t.use_snapshot` (else live memory_), texture source always from live memory_. Profiling buckets +
 // frame-commit + drawcache stay on the CP thread (per-thread/per-frame, not part of this unit). Until
 // wired, RenderBetaOwnedDraw runs the inline serial body and this is never called.
+// MT producer per-draw frame-boundary handling (CP thread). Mirrors the live_feed commit embedded in
+// RenderBetaOwnedDraw's serial body: when the guest-present counter advances, commit the just-ended
+// frame (resolve sidecar) to the plume bridge and reset the per-frame draw index. The fps readout shows
+// whether the threaded producer keeps up.
+void NhlD3D12CommandProcessor::MaybeCommitLiveFrame() {
+  const uint64_t present_count = HighcutGuestPresentCount();
+  if (present_count == highcut_last_present_count_ && frame_index_ == highcut_last_frame_index_) return;
+  std::vector<uint8_t> rbytes;
+  const uint32_t rmagic = nhl::highcut::kResolveSidecarMagic;
+  const uint32_t rcount = uint32_t(highcut_resolves_.size());
+  auto ap = [&](const void* p, size_t n) {
+    const uint8_t* b = static_cast<const uint8_t*>(p);
+    rbytes.insert(rbytes.end(), b, b + n);
+  };
+  ap(&rmagic, 4);
+  ap(&rcount, 4);
+  for (const auto& m : highcut_resolves_) ap(&m, sizeof(m));
+  HighcutLiveCommitFrame(rbytes.data(), rbytes.size());
+  {
+    static uint32_t s_fpsFrames = 0;
+    static auto s_fpsT0 = std::chrono::steady_clock::now();
+    if (++s_fpsFrames >= 60) {
+      const auto now = std::chrono::steady_clock::now();
+      const double secs = std::chrono::duration_cast<std::chrono::duration<double>>(now - s_fpsT0).count();
+      REXLOG_INFO("[highcut-mt] live takeover (MT): {:.1f} fps over {} frames ({} draws last frame)",
+                  secs > 0.0 ? s_fpsFrames / secs : 0.0, s_fpsFrames, highcut_capture_idx_);
+      s_fpsFrames = 0;
+      s_fpsT0 = now;
+    }
+  }
+  highcut_last_present_count_ = present_count;
+  highcut_last_frame_index_ = frame_index_;
+  highcut_capture_idx_ = 0;
+  highcut_resolves_.clear();
+}
+
 void NhlD3D12CommandProcessor::ProduceLiveDrawPacket(HcDrawTask& t) {
-  (void)t;
+  namespace rg = rex::graphics;
+  namespace reg = rex::graphics::reg;
+  namespace draw_util = rex::graphics::draw_util;
+  namespace xenos = rex::graphics::xenos;
+  // Register banks: snapshot (MT) or live (serial/self-verify). vtx/idx: snapshot (ring-buffered) or
+  // live. Texture source: ALWAYS live memory_ (textures aren't ring-buffered; stable within a frame).
+  rg::RegisterFile& RF = t.use_snapshot ? t.rf : *register_file_;
+  const uint32_t* regs = RF.values;
+  rg::d3d12::D3D12Shader* eff_ps = t.eff_ps;
+  const draw_util::ViewportInfo& vpi = t.vpi;
+  const auto& result = t.result;
+  const xenos::PrimitiveType primitive_type = t.primitive_type;
+  const uint32_t index_count = t.index_count;
+  const reg::RB_DEPTHCONTROL ndc = t.ndc;
+  static const bool geo_byid = std::getenv("NHL_HIGHCUT_GEOM_BYID") != nullptr;  // live MT == live_feed
+  static const bool beta_noblend = std::getenv("NHL_BETA_NOBLEND") != nullptr;
+  auto guestVtx = [&](uint32_t base) -> const uint8_t* {
+    if (t.use_snapshot) { auto it = t.guest_vtx.find(base); return it != t.guest_vtx.end() ? it->second.data() : nullptr; }
+    return memory_ ? memory_->TranslatePhysical<const uint8_t*>(base) : nullptr;
+  };
+
+  // ===== geometry gather + content hash (vtx_id) — F-5 by-id =====
+  auto geo_hash = [](uint64_t h, const void* p, size_t n) -> uint64_t {
+    const uint8_t* b = static_cast<const uint8_t*>(p); size_t i = 0;
+    for (; i + 8 <= n; i += 8) { uint64_t w; std::memcpy(&w, b + i, 8); h = (h ^ w) * 1099511628211ull; }
+    for (; i < n; ++i) { h = (h ^ b[i]) * 1099511628211ull; }
+    return h;
+  };
+  static std::unordered_set<uint64_t> s_sentGeo;  // MT path's own by-id geometry dedup
+  uint32_t fetch_blob[192];
+  std::memcpy(fetch_blob, &regs[0x4800], sizeof(fetch_blob));
+  std::vector<uint8_t> shared_blob;
+  uint64_t vtx_id = 0;
+  {
+    constexpr uint32_t kVtxTotalCap = 16u * 0x100000u;
+    struct VStream { uint32_t base, size, off; };
+    VStream streams[64]; uint32_t nStreams = 0, total = 0;
+    uint64_t h = 1469598103934665603ull;
+    for (const auto& vb : beta_current_vs_->vertex_bindings()) {
+      const uint32_t idx = vb.fetch_constant * 2;
+      xenos::xe_gpu_vertex_fetch_t f{};
+      f.dword_0 = regs[0x4800 + idx];
+      f.dword_1 = regs[0x4800 + idx + 1];
+      const uint32_t base = f.address << 2;
+      uint32_t size = f.size << 2;
+      if (!size) continue;
+      const uint32_t packed_off = total;
+      if (packed_off + size > kVtxTotalCap) { if (packed_off >= kVtxTotalCap) break; size = kVtxTotalCap - packed_off; }
+      fetch_blob[idx] = packed_off | (fetch_blob[idx] & 0x3u);
+      const uint8_t* src = guestVtx(base);
+      h = geo_hash(h, &idx, 4); h = geo_hash(h, &size, 4);
+      if (src) h = geo_hash(h, src, size);
+      if (nStreams < 64) streams[nStreams++] = {base, size, packed_off};
+      total += size;
+    }
+    vtx_id = total ? (h ^ 0x9E3779B97F4A7C15ull) : 0;
+    const bool vtx_seen = geo_byid && vtx_id && s_sentGeo.count(vtx_id);
+    if (total && (!geo_byid || !vtx_seen)) {
+      shared_blob.resize(total);
+      for (uint32_t i = 0; i < nStreams; ++i) {
+        const uint8_t* src = guestVtx(streams[i].base);
+        if (src) std::memcpy(shared_blob.data() + streams[i].off, src, streams[i].size);
+        else std::memset(shared_blob.data() + streams[i].off, 0, streams[i].size);
+      }
+    }
+  }
+  // ===== index gather (idx_id) =====
+  std::vector<uint8_t> index_blob;
+  uint32_t index_format = 0;
+  uint64_t idx_id = 0;
+  if (t.has_index_buffer) {
+    const uint32_t ilen = t.idx_length;
+    const uint8_t* isrc = t.use_snapshot
+                              ? (t.guest_idx.empty() ? nullptr : t.guest_idx.data())
+                              : (memory_ ? memory_->TranslatePhysical<const uint8_t*>(t.idx_guest_base) : nullptr);
+    if (isrc && ilen) {
+      index_format = (t.idx_format == xenos::IndexFormat::kInt32) ? 2u : 1u;
+      idx_id = geo_hash(geo_hash(1469598103934665603ull, &ilen, 4), isrc, ilen) ^ 0xC2B2AE3D27D4EB4Full;
+      const bool idx_seen = geo_byid && s_sentGeo.count(idx_id);
+      if (!geo_byid || !idx_seen) index_blob.assign(isrc, isrc + ilen);
+    }
+  }
+
+  // ===== system constants (SPIR-V) =====
+  rg::SpirvShaderTranslator::SystemConstants spv_sys{};
+  for (int i = 0; i < 3; ++i) { spv_sys.ndc_scale[i] = vpi.ndc_scale[i]; spv_sys.ndc_offset[i] = vpi.ndc_offset[i]; }
+  spv_sys.vertex_base_index = RF.Get<reg::VGT_INDX_OFFSET>().indx_offset;
+  spv_sys.vertex_index_endian = result.host_shader_index_endian;
+  spv_sys.vertex_index_min = RF.Get<reg::VGT_MIN_VTX_INDX>().min_indx;
+  spv_sys.vertex_index_max = RF.Get<reg::VGT_MAX_VTX_INDX>().max_indx;
+  spv_sys.flags |= rg::SpirvShaderTranslator::kSysFlag_AlphaPassIfLess |
+                   rg::SpirvShaderTranslator::kSysFlag_AlphaPassIfEqual |
+                   rg::SpirvShaderTranslator::kSysFlag_AlphaPassIfGreater;
+  {
+    const auto vte_pkt = RF.Get<reg::PA_CL_VTE_CNTL>();
+    if (vte_pkt.vtx_xy_fmt) spv_sys.flags |= rg::SpirvShaderTranslator::kSysFlag_XYDividedByW;
+    if (vte_pkt.vtx_z_fmt) spv_sys.flags |= rg::SpirvShaderTranslator::kSysFlag_ZDividedByW;
+    if (vte_pkt.vtx_w0_fmt) spv_sys.flags |= rg::SpirvShaderTranslator::kSysFlag_WNotReciprocal;
+  }
+  const bool polygonal = draw_util::IsPrimitivePolygonal(RF);
+  if (polygonal) spv_sys.flags |= rg::SpirvShaderTranslator::kSysFlag_PrimitivePolygonal;
+  if (draw_util::IsPrimitiveLine(RF)) spv_sys.flags |= rg::SpirvShaderTranslator::kSysFlag_PrimitiveLine;
+  if (!std::getenv("NHL_HIGHCUT_NO_YFLIP")) {
+    spv_sys.ndc_scale[1] = -spv_sys.ndc_scale[1];
+    spv_sys.ndc_offset[1] = -spv_sys.ndc_offset[1];
+  }
+  {
+    const int32_t guest_exp_bias = RF.Get<reg::RB_COLOR_INFO>().color_exp_bias;
+    const float color_scale = std::exp2f(float(guest_exp_bias));
+    for (int i = 0; i < 4; ++i) spv_sys.color_exp_bias[i] = color_scale;
+  }
+  const uint8_t* vtx_src = shared_blob.empty() ? nullptr : shared_blob.data();
+  const uint32_t vtx_size = uint32_t(shared_blob.size());
+  const uint8_t* bool_src = reinterpret_cast<const uint8_t*>(&regs[0x4900]);
+  constexpr uint32_t kBoolLoopBytes = 40 * 4;
+  auto pack_floats = [&](rg::Shader* sh, bool pixel) -> std::vector<uint8_t> {
+    std::vector<uint8_t> out;
+    if (!sh) return out;
+    const uint32_t reg_base = pixel ? 0x4400u : 0x4000u;
+    const auto& crm = sh->constant_register_map();
+    for (uint32_t i = 0; i < 4; ++i) {
+      uint64_t bits = crm.float_bitmap[i];
+      while (bits) {
+        const uint32_t s = i * 64u + uint32_t(std::countr_zero(bits));
+        bits &= bits - 1;
+        const uint8_t* src = reinterpret_cast<const uint8_t*>(&regs[reg_base + s * 4]);
+        out.insert(out.end(), src, src + 16);
+      }
+    }
+    return out;
+  };
+  const std::vector<uint8_t> vs_floats = pack_floats(beta_current_vs_, false);
+  const std::vector<uint8_t> ps_floats = pack_floats(eff_ps, true);
+
+  // ===== untile texture bindings into linear blobs + descs (PS set3, VS set2) =====
+  std::vector<nhl::highcut::TexturePacketDesc> tex_descs;
+  using HcBlob = std::shared_ptr<const std::vector<uint8_t>>;
+  std::vector<HcBlob> tex_blobs;
+  std::vector<nhl::highcut::TexturePacketDesc> vs_tex_descs;
+  std::vector<HcBlob> vs_tex_blobs;
+  struct HcTexCacheEntry {
+    HcBlob blob;
+    uint32_t width = 0, height = 0, tex_format = 0, row_pitch_bytes = 0, data_bytes = 0,
+             array_layers = 0, swizzle = 0;
+    uint64_t contentHash = 0;
+  };
+  static std::unordered_map<uint64_t, HcTexCacheEntry> s_texCache;  // MT path's own untile cache
+  static size_t s_texCacheBytes = 0;
+  constexpr size_t kTexCacheBudget = 512u * 1024u * 1024u;
+  auto untileBindings = [&](const std::vector<rg::SpirvShader::TextureBinding>& binds,
+                            std::vector<nhl::highcut::TexturePacketDesc>& out_descs,
+                            std::vector<HcBlob>& out_blobs, bool is_ps) {
+    (void)is_ps;
+    for (const auto& tb : binds) {
+      const uint32_t slot = tb.fetch_constant;
+      xenos::xe_gpu_texture_fetch_t tf{};
+      std::memcpy(&tf, &regs[0x4800 + slot * 6], 6 * 4);
+      if (slot * 6 + 4 < 192u) {
+        uint32_t& d4 = fetch_blob[slot * 6 + 4];
+        const uint32_t real_exp = (fetch_blob[slot * 6 + 3] >> 13) & 0x3Fu;
+        d4 = (d4 & ~(0x3FFu << 12)) | (real_exp << 13);
+      }
+      nhl::highcut::TexturePacketDesc td{};
+      td.fetch_slot = slot;
+      td.is_signed = tb.is_signed ? 1u : 0u;
+      td.array_layers = 1u;
+      const uint32_t width = uint32_t(tf.size_2d.width) + 1;
+      const uint32_t height = uint32_t(tf.size_2d.height) + 1;
+      const xenos::TextureFormat fmt = tf.format;
+      const rg::FormatInfo* fi = rg::FormatInfo::Get(fmt);
+      uint32_t pfmt = UINT32_MAX;
+      bool expand_r8 = false;
+      switch (fmt) {
+        case xenos::TextureFormat::k_8_8_8_8: pfmt = nhl::highcut::kTexRGBA8; break;
+        case xenos::TextureFormat::k_8: pfmt = nhl::highcut::kTexRGBA8; expand_r8 = true; break;
+        case xenos::TextureFormat::k_DXT1:    pfmt = nhl::highcut::kTexBC1; break;
+        case xenos::TextureFormat::k_DXT2_3:  pfmt = nhl::highcut::kTexBC2; break;
+        case xenos::TextureFormat::k_DXT4_5:  pfmt = nhl::highcut::kTexBC3; break;
+        case xenos::TextureFormat::k_DXN:     pfmt = nhl::highcut::kTexBC5; break;
+        case xenos::TextureFormat::k_16:      pfmt = nhl::highcut::kTexR16; break;
+        case xenos::TextureFormat::k_32_32_32_32_FLOAT: pfmt = nhl::highcut::kTexRGBA32F; break;
+        default: break;
+      }
+      const uint32_t tex_base = uint32_t(tf.base_address) << 12;
+      td.fetch_base_addr = tex_base;
+      const bool isCube = tb.dimension == xenos::FetchOpDimension::kCube;
+      const uint32_t cubeLayers = isCube ? 6u : 1u;
+      auto emitNeutralCube = [&]() {
+        td.width = 2; td.height = 2; td.tex_format = nhl::highcut::kTexRGBA8;
+        td.row_pitch_bytes = 2 * 4; td.swizzle = 0x688; td.array_layers = 6;
+        constexpr uint32_t kFace = 2u * 2u * 4u;
+        td.data_bytes = 6u * kFace;
+        std::vector<uint8_t> blob(td.data_bytes);
+        for (size_t i = 0; i < blob.size(); i += 4) { blob[i] = 32; blob[i + 1] = 32; blob[i + 2] = 32; blob[i + 3] = 255; }
+        out_descs.push_back(td); out_blobs.push_back(std::make_shared<const std::vector<uint8_t>>(std::move(blob)));
+      };
+      const bool okDim = xenos::DataDimension(tf.dimension) == xenos::DataDimension::k2DOrStacked || isCube;
+      const uint8_t* guest = (tex_base && memory_) ? memory_->TranslatePhysical<const uint8_t*>(tex_base) : nullptr;
+      if (pfmt == UINT32_MAX || !fi || !okDim || !guest || !width || !height || width > 8192 || height > 8192) {
+        if (isCube) { emitNeutralCube(); continue; }
+        td.width = 2; td.height = 2; td.tex_format = nhl::highcut::kTexRGBA8;
+        td.row_pitch_bytes = 2 * 4; td.data_bytes = 2 * 2 * 4; td.swizzle = 0x688;
+        const bool is_depth = (fmt == xenos::TextureFormat::k_24_8 || fmt == xenos::TextureFormat::k_24_8_FLOAT);
+        const uint8_t sg = is_depth ? 255 : 0;
+        std::vector<uint8_t> blob(td.data_bytes);
+        for (size_t i = 0; i < blob.size(); i += 4) { blob[i] = 255; blob[i + 1] = sg; blob[i + 2] = 255; blob[i + 3] = 255; }
+        out_descs.push_back(td); out_blobs.push_back(std::make_shared<const std::vector<uint8_t>>(std::move(blob)));
+        continue;
+      }
+      const uint32_t bw = fi->block_width, bh = fi->block_height, bpb = fi->bytes_per_block();
+      uint32_t bpb_log2 = 0;
+      for (uint32_t v = bpb; v > 1; v >>= 1) ++bpb_log2;
+      const uint32_t blocks_x = (width + bw - 1) / bw;
+      const uint32_t blocks_y = (height + bh - 1) / bh;
+      uint32_t pitch_texels = tf.pitch ? (uint32_t(tf.pitch) << 5) : ((width + 31u) & ~31u);
+      uint32_t pitch_blocks = pitch_texels / bw;
+      if (pitch_blocks < blocks_x) pitch_blocks = blocks_x;
+      const size_t faceBytes = size_t(blocks_y) * blocks_x * bpb;
+      uint32_t sliceStride = 0;
+      if (isCube) {
+        const auto gl = rg::texture_util::GetGuestTextureLayout(
+            xenos::DataDimension::kCube, tf.pitch, width, height, 6, tf.tiled != 0, fmt, false, true, 0);
+        sliceStride = gl.base.array_slice_stride_bytes;
+        if (!sliceStride) { emitNeutralCube(); continue; }
+      }
+      uint64_t addrKey, contentHash;
+      {
+        uint64_t a = 1469598103934665603ull;
+        auto mix = [&](uint64_t v) { a ^= v; a *= 1099511628211ull; };
+        mix(tex_base); mix(uint32_t(fmt)); mix((uint64_t(width) << 32) | height);
+        mix((uint64_t(tf.tiled) << 40) | (uint64_t(tf.endianness) << 32) |
+            (uint64_t(expand_r8 ? 1u : 0u) << 16) | cubeLayers);
+        mix(uint32_t(tf.swizzle));
+        addrKey = a;
+        uint64_t ch = 1469598103934665603ull;
+        const size_t prefixN = std::min<size_t>(512, faceBytes * cubeLayers);
+        for (size_t i = 0; i < prefixN; ++i) { ch ^= guest[i]; ch *= 1099511628211ull; }
+        contentHash = ch;
+        td.tex_id = addrKey ^ contentHash;
+        auto it = s_texCache.find(addrKey);
+        if (it != s_texCache.end() && it->second.contentHash == contentHash) {
+          const auto& e = it->second;
+          td.width = e.width; td.height = e.height; td.tex_format = e.tex_format;
+          td.row_pitch_bytes = e.row_pitch_bytes; td.data_bytes = e.data_bytes;
+          td.array_layers = e.array_layers; td.swizzle = e.swizzle;
+          out_descs.push_back(td);
+          out_blobs.push_back(e.blob);
+          continue;
+        }
+      }
+      std::vector<uint8_t> blob(faceBytes * cubeLayers);
+      for (uint32_t face = 0; face < cubeLayers; ++face) {
+        const uint8_t* fguest = guest + size_t(face) * sliceStride;
+        uint8_t* fdst = blob.data() + size_t(face) * faceBytes;
+        for (uint32_t by = 0; by < blocks_y; ++by) {
+          for (uint32_t bx = 0; bx < blocks_x; ++bx) {
+            size_t src;
+            if (tf.tiled) {
+              src = size_t(uint32_t(rg::texture_util::GetTiledOffset2D(int32_t(bx), int32_t(by), pitch_blocks, bpb_log2)));
+            } else {
+              src = (size_t(by) * pitch_blocks + bx) * bpb;
+            }
+            std::memcpy(fdst + (size_t(by) * blocks_x + bx) * bpb, fguest + src, bpb);
+          }
+        }
+      }
+      const xenos::Endian end = xenos::Endian(tf.endianness);
+      if (end != xenos::Endian::kNone) {
+        if (pfmt == nhl::highcut::kTexRGBA8 || pfmt == nhl::highcut::kTexRGBA32F) {
+          for (size_t i = 0; i + 4 <= blob.size(); i += 4) {
+            uint32_t v; std::memcpy(&v, &blob[i], 4); v = xenos::GpuSwap(v, end); std::memcpy(&blob[i], &v, 4);
+          }
+        } else {
+          for (size_t i = 0; i + 2 <= blob.size(); i += 2) {
+            uint16_t v; std::memcpy(&v, &blob[i], 2); v = xenos::GpuSwap(v, end); std::memcpy(&blob[i], &v, 2);
+          }
+        }
+      }
+      td.width = width; td.height = height; td.tex_format = pfmt;
+      td.row_pitch_bytes = blocks_x * bpb; td.data_bytes = uint32_t(blob.size());
+      td.array_layers = cubeLayers;
+      td.swizzle = expand_r8 ? 0x688u : uint32_t(tf.swizzle);
+      if (expand_r8) {
+        std::vector<uint8_t> rgba(blob.size() * 4);
+        for (size_t i = 0; i < blob.size(); ++i) { const uint8_t v = blob[i]; rgba[i * 4 + 0] = v; rgba[i * 4 + 1] = v; rgba[i * 4 + 2] = v; rgba[i * 4 + 3] = v; }
+        blob = std::move(rgba);
+        td.row_pitch_bytes = blocks_x * 4u;
+        td.data_bytes = uint32_t(blob.size());
+      }
+      auto shared = std::make_shared<const std::vector<uint8_t>>(std::move(blob));
+      {
+        auto it = s_texCache.find(addrKey);
+        if (it != s_texCache.end() && it->second.blob) s_texCacheBytes -= it->second.blob->size();
+        if (s_texCacheBytes + shared->size() > kTexCacheBudget) { s_texCache.clear(); s_texCacheBytes = 0; }
+        s_texCacheBytes += shared->size();
+        s_texCache[addrKey] = HcTexCacheEntry{shared, td.width, td.height, td.tex_format, td.row_pitch_bytes,
+                                              td.data_bytes, td.array_layers, td.swizzle, contentHash};
+      }
+      out_descs.push_back(td); out_blobs.push_back(shared);
+    }
+  };
+  untileBindings(t.p3_ps_texbinds, tex_descs, tex_blobs, true);
+  untileBindings(t.p3_vs_texbinds, vs_tex_descs, vs_tex_blobs, false);
+
+  // ===== per-sampler descriptors =====
+  auto buildSamplerDescs = [&](const std::vector<rg::SpirvShader::SamplerBinding>& binds,
+                               std::vector<nhl::highcut::SamplerPacketDesc>& out) {
+    for (const auto& sb : binds) {
+      const uint32_t slot = sb.fetch_constant;
+      xenos::xe_gpu_texture_fetch_t tf{};
+      std::memcpy(&tf, &regs[0x4800 + slot * 6], 6 * 4);
+      nhl::highcut::SamplerPacketDesc sd{};
+      sd.fetch_slot = slot;
+      sd.mag_filter = uint32_t(tf.mag_filter);
+      sd.min_filter = uint32_t(tf.min_filter);
+      sd.mip_filter = uint32_t(tf.mip_filter);
+      sd.clamp_x = uint32_t(tf.clamp_x);
+      sd.clamp_y = uint32_t(tf.clamp_y);
+      sd.clamp_z = uint32_t(tf.clamp_z);
+      sd.aniso = uint32_t(tf.aniso_filter);
+      out.push_back(sd);
+    }
+  };
+  std::vector<nhl::highcut::SamplerPacketDesc> ps_samp_descs, vs_samp_descs;
+  buildSamplerDescs(t.p3_ps_sampbinds, ps_samp_descs);
+  buildSamplerDescs(t.p3_vs_sampbinds, vs_samp_descs);
+
+  // ===== draw packet header =====
+  nhl::highcut::DrawPacketHeader hdr{};
+  hdr.magic = nhl::highcut::kDrawPacketMagic;
+  hdr.version = nhl::highcut::kDrawPacketVersion;
+  hdr.vs_shader_id = t.p3_vs_id;
+  hdr.ps_shader_id = t.p3_ps_id;
+  if (result.guest_primitive_type == xenos::PrimitiveType::kRectangleList) {
+    hdr.topology = nhl::highcut::kTopoTriangleStrip;
+    hdr.vertex_count = (index_count / 3) * 4;
+  } else if (result.guest_primitive_type == xenos::PrimitiveType::kQuadList) {
+    hdr.topology = nhl::highcut::kTopoTriangleListQuadExpand;
+    hdr.vertex_count = index_count;
+  } else if (result.guest_primitive_type == xenos::PrimitiveType::kTriangleStrip) {
+    hdr.topology = nhl::highcut::kTopoTriangleStrip;
+    hdr.vertex_count = index_count;
+  } else {
+    hdr.topology = nhl::highcut::kTopoTriangleList;
+    hdr.vertex_count = index_count;
+  }
+  hdr.fetch_bytes = sizeof(fetch_blob);
+  hdr.sys_bytes = sizeof(spv_sys);
+  hdr.shared_bytes = geo_byid ? 0u : (vtx_src ? vtx_size : 0u);
+  hdr.vtx_id = geo_byid ? vtx_id : 0u;
+  hdr.bool_bytes = kBoolLoopBytes;
+  hdr.vs_float_bytes = uint32_t(vs_floats.size());
+  hdr.ps_float_bytes = uint32_t(ps_floats.size());
+  hdr.vs_spirv_bytes = uint32_t(t.p3_vs_spirv.size());
+  hdr.ps_spirv_bytes = uint32_t(t.p3_ps_spirv.size());
+  hdr.texture_count = uint32_t(tex_descs.size());
+  hdr.ps_sampler_count = t.p3_ps_sampler_count;
+  hdr.vs_texture_count = uint32_t(vs_tex_descs.size());
+  hdr.vs_sampler_count = t.p3_vs_sampler_count;
+  hdr.index_format = index_format;
+  hdr.index_bytes = geo_byid ? 0u : uint32_t(index_blob.size());
+  hdr.idx_id = geo_byid ? idx_id : 0u;
+  hdr.vp_x = float(vpi.xy_offset[0]);
+  hdr.vp_y = float(vpi.xy_offset[1]);
+  hdr.vp_w = float(vpi.xy_extent[0]);
+  hdr.vp_h = float(vpi.xy_extent[1]);
+  hdr.vp_zmin = vpi.z_min;
+  hdr.vp_zmax = vpi.z_max;
+  const uint32_t bc0 = beta_noblend ? 0x00010001u : RF[beta_reg::kBlendControl[0]];
+  hdr.blend_enable = 1;
+  hdr.blend_src = (bc0 >> 0) & 0x1F;
+  hdr.blend_op = (bc0 >> 5) & 0x7;
+  hdr.blend_dst = (bc0 >> 8) & 0x1F;
+  hdr.blend_src_a = (bc0 >> 16) & 0x1F;
+  hdr.blend_op_a = (bc0 >> 21) & 0x7;
+  hdr.blend_dst_a = (bc0 >> 24) & 0x1F;
+  hdr.color_write_mask = RF.Get<reg::RB_COLOR_MASK>().value & 0xFu;
+  {
+    const auto wstl = RF.Get<reg::PA_SC_WINDOW_SCISSOR_TL>();
+    const auto wsbr = RF.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
+    int32_t gl = int32_t(wstl.tl_x), gt = int32_t(wstl.tl_y);
+    int32_t gr = int32_t(wsbr.br_x), gb = int32_t(wsbr.br_y);
+    uint32_t gw = RF.Get<reg::RB_SURFACE_INFO>().surface_pitch;
+    if (!gw) gw = beta_rt_width_;
+    const uint32_t gh = gw * beta_rt_height_ / beta_rt_width_;
+    if (gr <= gl || gb <= gt) { gl = 0; gt = 0; gr = int32_t(gw); gb = int32_t(gh); }
+    auto sx = [&](int32_t v) -> uint32_t {
+      int64_t s = int64_t(v) * beta_rt_width_ / int64_t(gw);
+      return uint32_t(s < 0 ? 0 : (s > beta_rt_width_ ? beta_rt_width_ : s));
+    };
+    auto sy = [&](int32_t v) -> uint32_t {
+      int64_t s = int64_t(v) * beta_rt_height_ / int64_t(gh ? gh : beta_rt_height_);
+      return uint32_t(s < 0 ? 0 : (s > beta_rt_height_ ? beta_rt_height_ : s));
+    };
+    hdr.sc_left = sx(gl); hdr.sc_top = sy(gt); hdr.sc_right = sx(gr); hdr.sc_bottom = sy(gb);
+  }
+  hdr.depth_enable = ndc.z_enable;
+  hdr.depth_write = ndc.z_write_enable;
+  hdr.depth_func = uint32_t(ndc.zfunc);
+  hdr.stencil_enable = ndc.stencil_enable;
+  {
+    reg::RB_STENCILREFMASK sref;
+    sref.value = RF[0x210D];
+    hdr.stencil_ref = sref.stencilref;
+    hdr.stencil_read_mask = sref.stencilmask;
+    hdr.stencil_write_mask = sref.stencilwritemask;
+    hdr.front_func = uint32_t(ndc.stencilfunc);
+    hdr.front_fail_op = uint32_t(ndc.stencilfail);
+    hdr.front_pass_op = uint32_t(ndc.stencilzpass);
+    hdr.front_depth_fail_op = uint32_t(ndc.stencilzfail);
+    if (ndc.backface_enable) {
+      hdr.back_func = uint32_t(ndc.stencilfunc_bf);
+      hdr.back_fail_op = uint32_t(ndc.stencilfail_bf);
+      hdr.back_pass_op = uint32_t(ndc.stencilzpass_bf);
+      hdr.back_depth_fail_op = uint32_t(ndc.stencilzfail_bf);
+    } else {
+      hdr.back_func = hdr.front_func;
+      hdr.back_fail_op = hdr.front_fail_op;
+      hdr.back_pass_op = hdr.front_pass_op;
+      hdr.back_depth_fail_op = hdr.front_depth_fail_op;
+    }
+  }
+  {
+    const auto mc = RF.Get<reg::PA_SU_SC_MODE_CNTL>();
+    uint32_t cull = mc.cull_front ? 1u : (mc.cull_back ? 2u : 0u);
+    if (std::getenv("NHL_HIGHCUT_NOCULL")) cull = 0u;
+    hdr.cull_mode = cull;
+    hdr.front_ccw = mc.face ? 0u : 1u;
+  }
+  {
+    const auto ci = RF.Get<reg::RB_COLOR_INFO>();
+    const auto di = RF.Get<reg::RB_DEPTH_INFO>();
+    const auto si = RF.Get<reg::RB_SURFACE_INFO>();
+    hdr.surface_color_base = ci.color_base | (uint32_t(ci.color_base_bit_11) << 11);
+    hdr.surface_depth_base = di.depth_base;
+    hdr.surface_pitch = si.surface_pitch;
+    hdr.surface_msaa = uint32_t(si.msaa_samples);
+    hdr.surface_color_format = uint32_t(ci.color_format);
+  }
+
+  // ===== stream resources by-id (once each) + serialize + push =====
+  static std::unordered_set<uint64_t> s_sentRes;
+  auto streamRes = [&](uint64_t id, const uint8_t* data, uint32_t n) {
+    if (!id || !data || !n) return;
+    if (s_sentRes.insert(id).second) HighcutLivePushResource(id, data, n);
+  };
+  if (hdr.vs_spirv_bytes) { streamRes(hdr.vs_shader_id, t.p3_vs_spirv.data(), hdr.vs_spirv_bytes); hdr.vs_spirv_bytes = 0; }
+  if (hdr.ps_spirv_bytes) { streamRes(hdr.ps_shader_id, t.p3_ps_spirv.data(), hdr.ps_spirv_bytes); hdr.ps_spirv_bytes = 0; }
+  if (geo_byid) {
+    if (vtx_id && !shared_blob.empty() && s_sentGeo.insert(vtx_id).second)
+      HighcutLivePushResource(vtx_id, shared_blob.data(), uint32_t(shared_blob.size()));
+    if (idx_id && !index_blob.empty() && s_sentGeo.insert(idx_id).second)
+      HighcutLivePushResource(idx_id, index_blob.data(), uint32_t(index_blob.size()));
+  }
+  for (size_t i = 0; i < tex_descs.size(); ++i)
+    if (tex_descs[i].tex_id && tex_descs[i].data_bytes) { streamRes(tex_descs[i].tex_id, tex_blobs[i]->data(), tex_descs[i].data_bytes); tex_descs[i].data_bytes = 0; }
+  for (size_t i = 0; i < vs_tex_descs.size(); ++i)
+    if (vs_tex_descs[i].tex_id && vs_tex_descs[i].data_bytes) { streamRes(vs_tex_descs[i].tex_id, vs_tex_blobs[i]->data(), vs_tex_descs[i].data_bytes); vs_tex_descs[i].data_bytes = 0; }
+
+  std::vector<uint8_t> pkt;
+  auto app = [&](const void* p, size_t n) { const uint8_t* b = static_cast<const uint8_t*>(p); pkt.insert(pkt.end(), b, b + n); };
+  app(&hdr, sizeof(hdr));
+  app(fetch_blob, sizeof(fetch_blob));
+  app(&spv_sys, sizeof(spv_sys));
+  if (hdr.shared_bytes) app(vtx_src, hdr.shared_bytes);
+  app(bool_src, kBoolLoopBytes);
+  if (hdr.vs_float_bytes) app(vs_floats.data(), hdr.vs_float_bytes);
+  if (hdr.ps_float_bytes) app(ps_floats.data(), hdr.ps_float_bytes);
+  if (hdr.vs_spirv_bytes) app(t.p3_vs_spirv.data(), hdr.vs_spirv_bytes);
+  if (hdr.ps_spirv_bytes) app(t.p3_ps_spirv.data(), hdr.ps_spirv_bytes);
+  for (size_t i = 0; i < tex_descs.size(); ++i) { app(&tex_descs[i], sizeof(tex_descs[i])); if (tex_descs[i].data_bytes) app(tex_blobs[i]->data(), tex_descs[i].data_bytes); }
+  for (size_t i = 0; i < vs_tex_descs.size(); ++i) { app(&vs_tex_descs[i], sizeof(vs_tex_descs[i])); if (vs_tex_descs[i].data_bytes) app(vs_tex_blobs[i]->data(), vs_tex_descs[i].data_bytes); }
+  for (const auto& sd : ps_samp_descs) app(&sd, sizeof(sd));
+  for (const auto& sd : vs_samp_descs) app(&sd, sizeof(sd));
+  if (hdr.index_bytes) app(index_blob.data(), hdr.index_bytes);
+
+  HighcutLivePushDraw(std::move(pkt));
+  ++highcut_capture_idx_;
 }
 
 void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
@@ -1721,9 +2235,9 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     static bool s_mtNotice = false;
     if (!s_mtNotice) {
       s_mtNotice = true;
-      REXLOG_INFO("[highcut-mt] NHL_HIGHCUT_MT_PRODUCER set — Stage 1a scaffolding present "
-                  "(HcDrawTask + ProduceLiveDrawPacket seam); consumer not yet wired, using the proven "
-                  "serial path this build.");
+      REXLOG_INFO("[highcut-mt] NHL_HIGHCUT_MT_PRODUCER set — Stage 1a WIRED: per-draw packet production "
+                  "routed through ProduceLiveDrawPacket (synchronous, use_snapshot=false / live read). A "
+                  "correct render here verifies the extraction; 1b adds the snapshot + worker thread.");
     }
   }
   // LIVE-TAKEOVER FREEZE FIX (owned-draw cut): in high-cut LIVE mode plume renders from the captured
@@ -2204,7 +2718,42 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
   // C-3b.2: dump this draw's data packet (system + fetch constants + shared-memory vertex bytes)
   // for the plume thread, so the translated Xenos VS can fetch + transform real vertices. Only
   // for the selected survey draw; gated by NHL_HIGHCUT_XLAT_TEST (p3_dump_data). vpi is final here.
-  if (p3_dump_data && beta_current_vs_ && memory_) {
+  // MT PRODUCER route (NHL_HIGHCUT_MT_PRODUCER). Stage 1a: build the per-draw task from live state and
+  // run ProduceLiveDrawPacket SYNCHRONOUSLY with use_snapshot=false (reads live register_file_/memory_) —
+  // so a correct render here proves the extraction/transcription is faithful BEFORE the snapshot (1b
+  // sets use_snapshot=true + threads it). The proven serial body is untouched as the else-if. (Drawcache
+  // and the disk-capture/survey branches are not part of the MT path — live-feed only.)
+  if (hc_mt_producer && p3_dump_data && beta_current_vs_ && memory_) {
+    MaybeCommitLiveFrame();  // CP-thread frame boundary (serial body does this inline; MT skips it)
+    HcDrawTask task;
+    task.use_snapshot = false;  // 1a: live read; 1b: snapshot rf + vtx/idx
+    task.primitive_type = primitive_type;
+    task.index_count = index_count;
+    task.result = result;
+    task.vpi = vpi;
+    task.ndc = ndc;
+    task.eff_ps = eff_ps;
+    task.p3_dump_data = p3_dump_data;
+    task.p3_vs_id = p3_vs_id;
+    task.p3_ps_id = p3_ps_id;
+    task.p3_vs_spirv = p3_vs_spirv;
+    task.p3_ps_spirv = p3_ps_spirv;
+    task.p3_vs_texbinds = p3_vs_texbinds;
+    task.p3_ps_texbinds = p3_ps_texbinds;
+    task.p3_vs_sampbinds = p3_vs_sampbinds;
+    task.p3_ps_sampbinds = p3_ps_sampbinds;
+    task.p3_vs_sampler_count = p3_vs_sampler_count;
+    task.p3_ps_sampler_count = p3_ps_sampler_count;
+    if (result.index_buffer_type ==
+            rex::graphics::PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA &&
+        index_buffer_info) {
+      task.has_index_buffer = true;
+      task.idx_guest_base = uint32_t(index_buffer_info->guest_base);
+      task.idx_length = uint32_t(index_buffer_info->length);
+      task.idx_format = index_buffer_info->format;
+    }
+    ProduceLiveDrawPacket(task);
+  } else if (p3_dump_data && beta_current_vs_ && memory_) {
     namespace rg = rex::graphics;
     const uint32_t* regs = register_file_->values;
 
