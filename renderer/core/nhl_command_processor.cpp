@@ -1440,7 +1440,6 @@ struct NhlD3D12CommandProcessor::HcDrawTask {
   uint32_t idx_guest_base = 0, idx_length = 0;
   rex::graphics::xenos::IndexFormat idx_format{};
   rex::graphics::PrimitiveProcessor::ProcessingResult result{};
-  rex::graphics::draw_util::ViewportInfo vpi{};
   rex::graphics::reg::RB_DEPTHCONTROL ndc{};                       // normalized depth/stencil control
   rex::graphics::d3d12::D3D12Shader* vs = nullptr;                 // beta_current_vs_ this draw (per-draw!)
   rex::graphics::d3d12::D3D12Shader* eff_ps = nullptr;             // beta_current_ps_ or null this draw
@@ -1538,6 +1537,11 @@ struct NhlD3D12CommandProcessor::HcLiveWorker {
   bool stop_ = false, busy_ = false;
 };
 
+// Forward decl (defined just before RenderBetaOwnedDraw) so ProduceLiveDrawPacket below can call it.
+static rex::graphics::draw_util::ViewportInfo HcComputeViewport(
+    rex::graphics::RegisterFile& rf, rex::graphics::reg::RB_DEPTHCONTROL ndc, uint32_t rt_w, uint32_t rt_h,
+    bool edram);
+
 // Out-of-line destructor — here, where HcLiveWorker (and the beta-cache types via the .cpp includes) are
 // complete. Deletes the MT worker (stop + join) as a backstop; ShutdownContext normally deleted + nulled
 // it already, so this is usually a no-op. The unique_ptr<beta cache> members destroy after this body.
@@ -1594,7 +1598,9 @@ void NhlD3D12CommandProcessor::ProduceLiveDrawPacket(HcDrawTask& t) {
   const uint32_t* regs = RF.values;
   rg::d3d12::D3D12Shader* vs = t.vs;       // snapshotted: beta_current_vs_ changes per draw on the CP thread
   rg::d3d12::D3D12Shader* eff_ps = t.eff_ps;
-  const draw_util::ViewportInfo& vpi = t.vpi;
+  // vpi computed HERE (worker thread) from the snapshot, off the CP thread — the registers it reads are
+  // all inside the snapshot's [0x2000,0x2400) range.
+  const draw_util::ViewportInfo vpi = HcComputeViewport(RF, t.ndc, beta_rt_width_, beta_rt_height_, beta_edram_enabled_);
   const auto& result = t.result;
   const xenos::PrimitiveType primitive_type = t.primitive_type;
   const uint32_t index_count = t.index_count;
@@ -2067,6 +2073,50 @@ void NhlD3D12CommandProcessor::ProduceLiveDrawPacket(HcDrawTask& t) {
 
   HighcutLivePushDraw(std::move(pkt));
   ++highcut_capture_idx_;
+}
+
+// Per-draw host viewport (GetHostViewportInfo + the NHL_BETA_FLAT un-fold) computed from a register file.
+// Factored out so the MT worker computes it from its snapshot (off the CP thread) while the serial path
+// computes it live — every register it reads (PA_CL_VPORT_*/VTE/SC, RB_SURFACE/DEPTH) is inside the
+// snapshot's [0x2000,0x2400) range. rt_w/rt_h/edram are the caller's beta RT state.
+static rex::graphics::draw_util::ViewportInfo HcComputeViewport(
+    rex::graphics::RegisterFile& rf, rex::graphics::reg::RB_DEPTHCONTROL ndc, uint32_t rt_w, uint32_t rt_h,
+    bool edram) {
+  namespace reg = rex::graphics::reg;
+  namespace draw_util = rex::graphics::draw_util;
+  uint32_t guest_w = rf.Get<reg::RB_SURFACE_INFO>().surface_pitch;
+  if (!guest_w) guest_w = rt_w;
+  const uint32_t guest_h = guest_w * rt_h / rt_w;
+  uint32_t x_max = guest_w, y_max = guest_h;
+  const auto vte_vp = rf.Get<reg::PA_CL_VTE_CNTL>();
+  const bool vport_xform = vte_vp.vport_x_scale_ena && vte_vp.vport_y_scale_ena;
+  static const bool flat_mode = std::getenv("NHL_BETA_FLAT") != nullptr;
+  if ((edram || flat_mode) && vport_xform) { x_max = 8192; y_max = 8192; }
+  draw_util::ViewportInfo vpi{};
+  draw_util::GetHostViewportInfo(rf, 1, 1, true, x_max, y_max, false, ndc, false, false, false, vpi);
+  static const bool no_unfold = std::getenv("NHL_BETA_NO_UNFOLD") != nullptr;
+  if (flat_mode && vport_xform && !edram && !no_unfold) {
+    auto reg_f = [&](uint32_t idx) -> float {
+      const uint32_t u = rf[idx];
+      float f;
+      std::memcpy(&f, &u, sizeof(f));
+      return f;
+    };
+    const float xs_raw = reg_f(0x210F);  // PA_CL_VPORT_XSCALE
+    const float xscale = xs_raw < 0.0f ? -xs_raw : xs_raw;
+    const float xoffset = reg_f(0x2110);  // PA_CL_VPORT_XOFFSET
+    const uint32_t logical_w = uint32_t(2.0f * xscale + 0.5f);
+    LONG l = LONG((xoffset - xscale) + 0.5f);
+    if (l < 0) l = 0;
+    if (logical_w > vpi.xy_extent[0] && uint32_t(l) < rt_w) {
+      const uint32_t w = std::min(logical_w, rt_w - uint32_t(l));
+      vpi.xy_offset[0] = uint32_t(l);
+      vpi.xy_extent[0] = w;
+      vpi.ndc_scale[0] = 1.0f;
+      vpi.ndc_offset[0] = 0.0f;
+    }
+  }
+  return vpi;
 }
 
 void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
@@ -2766,68 +2816,20 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
   // Feed the GUEST surface size instead: width = RB_SURFACE_INFO.surface_pitch,
   // height scaled to our RT's aspect (the surface and frontbuffer share 16:9). Then
   // render to the FULL RT viewport so the native-res content upscales to fill it.
+  // vport_xform / guest_w / guest_h / flat_mode are also read by the (skipped-in-live) owned-render
+  // scissor + EDRAM placement below, so compute these cheap locals here. The EXPENSIVE part —
+  // GetHostViewportInfo + the NHL_BETA_FLAT un-fold — is factored into HcComputeViewport and run on the
+  // CP thread ONLY for the serial path; the MT worker computes its own vpi from the snapshot (off this
+  // thread), so in MT mode this leaves vpi default here (the owned tail that would use it is skipped).
   uint32_t guest_w = register_file_->Get<reg::RB_SURFACE_INFO>().surface_pitch;
   if (!guest_w) guest_w = beta_rt_width_;
   const uint32_t guest_h = guest_w * beta_rt_height_ / beta_rt_width_;
-  // x_max/y_max bound the viewport extent inside GetHostViewportInfo. For 2D draws (guest
-  // viewport transform DISABLED) the viewport IS x_max/y_max, so they must equal the guest
-  // surface size — this is the menu/intro calibration. But for 3D draws (viewport transform
-  // ENABLED) the guest programs its own PA_CL_VPORT scale/offset and may legitimately use a
-  // viewport WIDER than the surface pitch (the create-player 1280-wide player into a 640-pitch
-  // surface; the scene_04 arena). Base Xenia passes D3D12_VIEWPORT_BOUNDS_MAX there (NOT the
-  // pitch) so the viewport keeps full width and ndc_scale stays ~1, then clamps the SCISSOR to
-  // surface_pitch instead. Passing the pitch as x_max (the old behavior) forced the clamp-and-
-  // rescale path => ndc_scale bumped to 2, 3D geometry squeezed/clipped out of the resolved
-  // region (blank player). Match base: big x_max for vport-enabled draws, scissor clamp below.
-  uint32_t x_max = guest_w, y_max = guest_h;
   const auto vte_vp = register_file_->Get<reg::PA_CL_VTE_CNTL>();
   const bool vport_xform = vte_vp.vport_x_scale_ena && vte_vp.vport_y_scale_ena;
-  // NHL_BETA_FLAT (route a): 3D passes render flat with their NATIVE guest viewport into
-  // the logical-sized scratch RT — surface_pitch never enters, so the wide-into-narrow
-  // EDRAM fold cannot form. Needs the un-clamped x_max so the true 1280-wide extent/ndc
-  // is reported (else the player's viewport clamps to the 640 pitch and wraps).
   static const bool flat_mode = std::getenv("NHL_BETA_FLAT") != nullptr;
-  if ((edram || flat_mode) && vport_xform) {
-    x_max = 8192;  // ~xenos max RT size; viewport not clamped to pitch (scissor clamps instead)
-    y_max = 8192;
-  }
   draw_util::ViewportInfo vpi{};
-  draw_util::GetHostViewportInfo(*register_file_, 1, 1, true, x_max, y_max, false, ndc, false,
-                                 false, false, vpi);
-  // FLAT un-fold (NHL_BETA_FLAT): scene_04's arena renders a guest viewport WIDER than the
-  // surface pitch — PA_CL_VPORT_XSCALE=640 → window width 2*640=1280 — into a surface_pitch=640
-  // EDRAM surface, relying on EDRAM address wrap. GetHostViewportInfo CROPS the X extent to
-  // surface_pitch (640) regardless of the big x_max above (Y stays uncropped — the proven
-  // asymmetry) and sets ndc_scale_x=2.0 to squish the 1280-wide projection into 640 → the fold.
-  // On a FLAT host RT there is NO EDRAM wrap, so we render at the TRUE logical width: recompute
-  // the X viewport straight from the guest VPORT registers (un-cropped) and reset X ndc to
-  // identity. scene_02's player (XSCALE=320 → width 640 ≤ pitch 640) is never cropped, so the
-  // `logical_w > extent` gate makes this a no-op there (and for any draw that already fits).
-  if (flat_mode && vport_xform && !edram && !std::getenv("NHL_BETA_NO_UNFOLD")) {
-    auto reg_f = [&](uint32_t idx) -> float {
-      const uint32_t u = (*register_file_)[idx];
-      float f;
-      std::memcpy(&f, &u, sizeof(f));
-      return f;
-    };
-    const float xs_raw = reg_f(0x210F);  // PA_CL_VPORT_XSCALE
-    const float xscale = xs_raw < 0.0f ? -xs_raw : xs_raw;
-    const float xoffset = reg_f(0x2110);  // PA_CL_VPORT_XOFFSET
-    const uint32_t logical_w = uint32_t(2.0f * xscale + 0.5f);
-    LONG l = LONG((xoffset - xscale) + 0.5f);  // window-space left edge of the guest viewport
-    if (l < 0) l = 0;
-    if (logical_w > vpi.xy_extent[0] && uint32_t(l) < beta_rt_width_) {
-      const uint32_t w = std::min(logical_w, beta_rt_width_ - uint32_t(l));
-      vpi.xy_offset[0] = uint32_t(l);
-      vpi.xy_extent[0] = w;
-      vpi.ndc_scale[0] = 1.0f;
-      vpi.ndc_offset[0] = 0.0f;
-      if (std::getenv("NHL_BETA_DEPTH_DIAG")) {
-        REXLOG_INFO("[nhl-beta] UNFOLD #{}: pitch-cropped X {} -> logical {} (vp x={} w={})",
-                    beta_takeover_rendered_, x_max == 8192 ? guest_w : x_max, logical_w, l, w);
-      }
-    }
-  }
+  if (!hc_mt_producer)
+    vpi = HcComputeViewport(*register_file_, ndc, beta_rt_width_, beta_rt_height_, edram);
 
   // C-3b.2: dump this draw's data packet (system + fetch constants + shared-memory vertex bytes)
   // for the plume thread, so the translated Xenos VS can fetch + transform real vertices. Only
@@ -2891,7 +2893,6 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     task.primitive_type = primitive_type;
     task.index_count = index_count;
     task.result = result;
-    task.vpi = vpi;
     task.ndc = ndc;
     task.eff_ps = eff_ps;
     task.p3_dump_data = p3_dump_data;
