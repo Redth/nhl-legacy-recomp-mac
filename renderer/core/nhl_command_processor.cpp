@@ -2881,6 +2881,33 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
           mk->resolve_bytes = std::move(rb);
           mt_worker_->enqueue(mk);
         }
+        // CP-thread busy-probe (mirror of the worker's): this boundary runs on the CP thread, once/frame.
+        // CP-busy ~= 100% (== frame) => the CP thread IS the bottleneck (decode + setup fill the frame) =>
+        // N workers WON'T help. CP-busy << 100% => the CP is blocked on enqueue backpressure waiting for
+        // the worker => WORKER-bound => N workers WOULD help (split the worker stage).
+        if (!mt_sync) {
+          static uint32_t s_cpF = 0;
+          static auto s_cpT0 = std::chrono::steady_clock::now();
+          auto cpuSecs = []() -> double {
+            FILETIME c{}, e{}, k{}, u{};
+            if (!GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u)) return 0.0;
+            auto to64 = [](const FILETIME& f) { return (uint64_t(f.dwHighDateTime) << 32) | f.dwLowDateTime; };
+            return double(to64(k) + to64(u)) * 1e-7;
+          };
+          static double s_cpBase = cpuSecs();
+          if (++s_cpF >= 60) {
+            const auto now = std::chrono::steady_clock::now();
+            const double secs = std::chrono::duration_cast<std::chrono::duration<double>>(now - s_cpT0).count();
+            const double cpuNow = cpuSecs();
+            const double busy = cpuNow - s_cpBase;
+            s_cpBase = cpuNow;
+            REXLOG_INFO("[highcut-mt] CP-thread CPU-busy={:.0f}% ({:.1f}ms/frame) [~=100% => CP-bound, N "
+                        "workers won't help; <<100% => worker-bound, N workers help]",
+                        secs > 0.0 ? 100.0 * busy / secs : 0.0, busy / s_cpF * 1000.0);
+            s_cpF = 0;
+            s_cpT0 = now;
+          }
+        }
       }
     }
     HcDrawTask* tp = mt_worker_->acquire();  // recycled — its rf/vtx/idx buffers keep capacity (no malloc)
