@@ -2299,6 +2299,13 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     // dedups across frames; ids are domain-tagged so they can't collide with shader/texture ids.
     static const bool geo_byid = (std::getenv("NHL_HIGHCUT_GEOM_BYID") != nullptr) && hc_live_feed;
     static std::unordered_set<uint64_t> s_sentGeo;
+    // PARALLEL-PRODUCER SNAPSHOT-COST PROBE (NHL_HIGHCUT_SNAPPROBE) — the decisive measurement (handoff
+    // f5). Accumulators read by the 60-frame window report below; the probe block itself is after the
+    // index gather. Pure measurement: it copies the bytes a worker thread would need and times them.
+    static const bool hc_snapprobe = std::getenv("NHL_HIGHCUT_SNAPPROBE") != nullptr;
+    static double s_snapSecs = 0.0;
+    static size_t s_snapBytes = 0;
+    static uint64_t s_snapDraws = 0;
     auto geo_hash = [](uint64_t h, const void* p, size_t n) -> uint64_t {
       const uint8_t* b = static_cast<const uint8_t*>(p); size_t i = 0;
       for (; i + 8 <= n; i += 8) { uint64_t w; std::memcpy(&w, b + i, 8); h = (h ^ w) * 1099511628211ull; }
@@ -2372,6 +2379,53 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
         const bool idx_seen = geo_byid && s_sentGeo.count(idx_id);
         if (!geo_byid || !idx_seen) index_blob.assign(isrc, isrc + ilen);
       }
+    }
+    // ===== PARALLEL-PRODUCER SNAPSHOT-COST PROBE (NHL_HIGHCUT_SNAPPROBE) ===========================
+    // The decisive question for off-thread parallelization (handoff f5): to move the ~34ms per-draw work
+    // (translate / gather+hash / untile / packet) off the CP thread, the CP thread must FIRST snapshot
+    // each draw's inputs from MUTABLE SDK state — the register banks + guest vertex/index bytes, which
+    // the SDK front-end rewrites between draws. That snapshot copy is the IRREDUCIBLE new CP-thread cost
+    // after parallelization, so the post-MT CP wall ≈ SDK-decode + snapshot. If snapshot << our ~34ms,
+    // the work parallelizes (a worker pool does the rest → ~25ms SDK-decode wall → ~33fps); if snapshot
+    // ≈ 34ms, the byte copy alone eats the win and 60fps needs the leaner custom decoder, not threads.
+    // This probe MEASURES that snapshot WITHOUT building the pool: it copies exactly the bytes a worker
+    // would need into a reusable scratch buffer, times it on the CP thread, and reports ms/frame +
+    // MB/frame in the 60-frame window. It changes NOTHING about rendering (the scratch is discarded) —
+    // pure measurement. WORST-CASE model: workers re-derive everything from the raw snapshot, so we copy
+    // the FULL guest vtx/idx (not the deduped by-id artifacts) — an UPPER bound. If even this is cheap,
+    // the MT producer is GO. (Needs the live-feed recipe, like BUSYPROBE — the dense-gameplay path.)
+    if (hc_snapprobe) {
+      static thread_local std::vector<uint8_t> s_snapScratch;
+      const auto _snap_t0 = hc_clock::now();
+      s_snapScratch.clear();
+      size_t bytes = 0;
+      auto put = [&](const void* p, size_t n) {
+        if (!p || !n) return;
+        const size_t off = s_snapScratch.size();
+        s_snapScratch.resize(off + n);
+        std::memcpy(s_snapScratch.data() + off, p, n);
+        bytes += n;
+      };
+      // (a) register banks the per-draw work reads: RB_/PA_SC_ state block + VS/PS float + fetch + b/loop.
+      put(&regs[0x2000], 0x400 * 4);   // RB_*/PA_SC_* render state
+      put(&regs[0x4000], 0x940 * 4);   // 0x4000 VS floats .. 0x4400 PS floats .. 0x4800 fetch .. 0x4900 b/loop
+      // (b) guest VERTEX bytes — every bound stream (the gather+hash input).
+      for (const auto& vb : beta_current_vs_->vertex_bindings()) {
+        xenos::xe_gpu_vertex_fetch_t f{};
+        f.dword_0 = regs[0x4800 + vb.fetch_constant * 2];
+        f.dword_1 = regs[0x4800 + vb.fetch_constant * 2 + 1];
+        const uint32_t sz = f.size << 2;  // size is in dwords
+        if (sz) put(memory_->TranslatePhysical<const uint8_t*>(f.address << 2), sz);
+      }
+      // (c) guest INDEX bytes.
+      if (result.index_buffer_type ==
+              rex::graphics::PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA &&
+          index_buffer_info)
+        put(memory_->TranslatePhysical<const uint8_t*>(index_buffer_info->guest_base),
+            uint32_t(index_buffer_info->length));
+      s_snapSecs += hc_secs(_snap_t0, hc_clock::now());
+      s_snapBytes += bytes;
+      ++s_snapDraws;
     }
     // System constants (SPIR-V layout): NDC transform + vertex index params + (C-4) the
     // PS-critical fields. color_exp_bias MUST be set or the PS's final `oC0 = color * exp_bias`
@@ -3018,6 +3072,18 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
                               "SDK-PM4-decode(+other)={:.1f}ms/frame",
                               ours / f * 1000.0, sdkBusy / f * 1000.0);
                 }
+              }
+              // PARALLEL-PRODUCER SNAPSHOT-COST PROBE report (NHL_HIGHCUT_SNAPPROBE): the per-draw input
+              // snapshot a worker pool would require, in ms/frame — the floor on the post-MT CP-thread wall.
+              if (hc_snapprobe) {
+                const double frames = s_fpsFrames > 0 ? double(s_fpsFrames) : 1.0;
+                REXLOG_INFO("[highcut-perf]   SNAPPROBE: per-draw input snapshot = {:.1f}ms/frame "
+                            "({:.1f} MB/frame, {} draws/frame)  [<< our ~34ms => MT producer GO; "
+                            "~= ~34ms => byte-copy eats the win, needs leaner decoder not threads]",
+                            s_snapSecs / frames * 1000.0,
+                            double(s_snapBytes) / frames / (1024.0 * 1024.0),
+                            uint64_t(s_snapDraws / uint64_t(frames)));
+                s_snapSecs = 0.0; s_snapBytes = 0; s_snapDraws = 0;
               }
               if (hc_profile) {
                 const double ms = 1000.0;
