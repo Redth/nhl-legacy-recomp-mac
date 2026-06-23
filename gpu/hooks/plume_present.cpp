@@ -403,12 +403,7 @@ HWND CreatePlumeWindow() {
                                 WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
                                 r.right - r.left, r.bottom - r.top, nullptr, nullptr,
                                 wc.hInstance, nullptr);
-    // NHL_HIGHCUT_HIDE_WINDOW: keep the plume present window hidden (headless perf/dev runs where the
-    // result comes from the log, not the window). The swapchain still renders/presents to its surface,
-    // so producer/consumer/render costs are unaffected. The 2nd window disappears entirely at F-4, when
-    // plume presents to the real game window and rexglue's GPU is off.
-    static const bool hideWin = std::getenv("NHL_HIGHCUT_HIDE_WINDOW") != nullptr;
-    if (hwnd) ShowWindow(hwnd, hideWin ? SW_HIDE : SW_SHOWNOACTIVATE);
+    if (hwnd) ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     return hwnd;
 }
 
