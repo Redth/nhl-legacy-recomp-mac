@@ -77,6 +77,12 @@ play a session → `llvm-profdata merge -output=pgo\nhllegacy.profdata *.profraw
   contains only a path. `setup_sdk.ps1` now materializes the symlink targets
   automatically — the resulting working-tree diff is the same class of change
   the dev tree carried.
+- **Color grade is a no-op in rebuilt runtimes:** the SDK-side `present_grade_*`
+  compute pass (overlay "Lighting / Color Grade") was never captured in the
+  title patch. `src/present_grade_compat.cpp` defines the cvars so the game
+  links; the overlay section works but has no visual effect until the pass is
+  reimplemented in the SDK's Vulkan present path (shader already in-repo:
+  `renderer/shaders/nhl_grade.comp`).
 - `docs/rexglue-vulkan-nhl-legacy.patch` is the original (historical) patch; the
   canonical one that applies to public `bd9b5191` is under `sdk/`.
 - The optional `tdb-rx2-ffi` static lib (runtime `.dds` → `.rx2` texture

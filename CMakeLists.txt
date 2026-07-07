@@ -16,6 +16,10 @@ set(NHLLEGACY_SOURCES
     src/main.cpp
     src/kernel_stubs.cpp
     src/diag_hooks.cpp
+    # Game-side present_grade_* cvar definitions: the SDK-side color-grade pass
+    # was never captured in the title patch, so a from-public-source runtime
+    # doesn't define them. Remove when the pass is reimplemented SDK-side.
+    src/present_grade_compat.cpp
     # Intel hybrid (P/E-core) thread placement: pins the process default CPU set to
     # the Performance cores so the recomp's heavy threads don't land on E-cores.
     # Env-gated (NHL_PIN_PCORES, default ON); no-op on AMD / non-hybrid CPUs. Called
