@@ -118,3 +118,49 @@ then steady-state `r3=BFB37AC8 r4=BD95F37C r5=8232E02A r6=707BFBC0`.
   docs' ffmpeg reference (Path A characterization), or overwrite the planes /
   swap the texture upload source with host-decoded frames (Path B fix at the
   cleanest possible seam — host-side, no guest-memory writes needed).
+
+## Session 3 (2026-07-07) — BREAKTHROUGH: the decoder is innocent
+
+Method: SDK-side upload tap (NHL_VP6_TAP in vulkan/texture_cache.cpp
+LoadTextureDataFromResidentMemoryImpl) + game-side RGBA sampler thread
+(NHL_VP6_RGBA=1CF32000 in diag_hooks) + Xenos untile in python
+(GetTiledOffset2D port).
+
+Facts established:
+1. The movie is presented via a per-frame re-upload of ONE texture:
+   k_8_8_8_8 (fmt=6) 1280x720 at guest phys 0x1CF32000 (stable across runs;
+   393 uploads/movie). The guest decodes VP6 on CPU, the GPU converts YUV->RGB
+   into a render target, and the RESOLVE of that RT lands at 0x1CF32000 in
+   Xenos TILED layout.
+2. The resolve needs CPU readback for the guest copy: our size gate
+   (NHL_VK_READBACK_MAX_LEN=3MB) skips this 3.68MB surface, so guest RAM reads
+   zero; capture runs need NHL_VK_READBACK_MODE=full +
+   NHL_VK_READBACK_MAX_LEN=999999999.
+3. **The decoded+converted frames are PIXEL-PERFECT.** Untiled dumps
+   (out/build/.../vp6_untiled_*.rgba, PNGs in the session notes) show crisp
+   legal text + clouds, zero corruption. The long-standing "recompiled
+   arithmetic-precision bug in VP6 dequant/IDCT" theory is DEAD.
+4. Therefore the corruption enters between the resolve and the screen — the
+   texture cache / shared memory consumption of the resolve (GPU-resident
+   path). Channel/endian swap of the final buffer does NOT reproduce the
+   on-screen pattern (smooth tint, not blocks); the blocky dot-crawl says
+   tiling-interpretation or stale/racing data.
+5. With FULL ungated readback, the on-screen movie corruption drops to sparse
+   small green bars (out/vp6_fullrb_movie.png) vs full-screen blocks with the
+   gate. Consistent with a resolve->texture invalidation/race: correct CPU
+   data mostly wins, GPU-resident stale reads still leak through.
+6. This is the SAME bug class that forced readback_resolve=full for equipment
+   compositing. One real fix in the SDK's resolve-consumption path likely
+   fixes movies AND equipment, and could obsolete full readback (perf win).
+
+Next steps:
+1. Extend the tap to log texture_key.tiled / scaled_resolve / endian +
+   whether the load sourced shared memory vs the scaled-resolve buffer for
+   the movie texture.
+2. Inspect VulkanTextureCache/SharedMemory: how a range written by resolve
+   (MarkRangeAsResolved) is consumed by a texture load of the same range —
+   look for tiling mismatch or missing invalidation when the texture was
+   cached before the resolve.
+3. Candidate cheap mitigation while the real fix lands: exempt the movie
+   resolve (or fmt=6 1280x720 resolves) from the size gate + force texture
+   invalidation after readback.

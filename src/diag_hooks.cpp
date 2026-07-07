@@ -309,6 +309,74 @@ NHL_VP6_SWEEP_HOOK(82778BE8)
 NHL_VP6_SWEEP_HOOK(82776BD8)
 NHL_VP6_SWEEP_HOOK(82776AE0)
 
+// RGBA frame dumper (env NHL_VP6_RGBA=<hex guest addr>, from the SDK-side
+// NHL_VP6_TAP log, e.g. 1CF32000): after each frame-driver call, dump the
+// guest-converted 1280x720 RGBA movie frame to vp6_rgba_NNN.raw for diffing
+// against the ffmpeg reference decode. ~3.7MB per frame; first 12 frames.
+static uint32_t Vp6RgbaAddr() {
+  static uint32_t addr = [] {
+    const char* e = std::getenv("NHL_VP6_RGBA");
+    return e ? uint32_t(std::strtoull(e, nullptr, 16)) : 0u;
+  }();
+  return addr;
+}
+
+static void DumpVp6Rgba(int frame_n, uint8_t* base) {
+  uint32_t addr = Vp6RgbaAddr();
+  if (!addr || frame_n >= 12) return;
+  constexpr size_t kBytes = 1280u * 720u * 4u;
+  // addr is a raw PHYSICAL address (texture-key base): translate via the
+  // kernel memory system, not the virtual-window offset.
+  auto* ks = rex::runtime::current_kernel_state();
+  if (!ks || !ks->memory()) return;
+  uint8_t* host = ks->memory()->TranslatePhysical<uint8_t*>(addr);
+  MEMORY_BASIC_INFORMATION mbi{};
+  if (!VirtualQuery(host, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT) return;
+  uint8_t* buf = host;
+  size_t got = kBytes;
+  char name[64];
+  std::snprintf(name, sizeof(name), "vp6_rgba_%03d.raw", frame_n);
+  FILE* f = std::fopen(name, "wb");
+  if (f) {
+    std::fwrite(buf, 1, got, f);
+    std::fclose(f);
+  }
+}
+
+// Sampler thread: the frame driver runs ONCE per movie (setup; decode is
+// async on workers), so per-call dumps see an empty buffer. Instead poll the
+// RGBA buffer during playback and dump distinct frames (dedup by checksum).
+static const int g_vp6_rgba_sampler = [] {
+  if (!Vp6RgbaAddr()) return 0;
+  std::thread([] {
+    std::this_thread::sleep_for(std::chrono::seconds(25));
+    auto* ks = rex::runtime::current_kernel_state();
+    if (!ks || !ks->memory()) return;
+    constexpr size_t kBytes = 1280u * 720u * 4u;
+    uint8_t* host = ks->memory()->TranslatePhysical<uint8_t*>(Vp6RgbaAddr());
+    uint64_t last_sum = 0;
+    int dumped = 0;
+    for (int iter = 0; iter < 600 && dumped < 16; ++iter) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      MEMORY_BASIC_INFORMATION mbi{};
+      if (!VirtualQuery(host, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT)
+        continue;
+      uint64_t sum = 0;
+      for (size_t k = 0; k < kBytes; k += 4096) sum = sum * 31 + host[k];
+      if (sum == last_sum || sum == 0) continue;
+      last_sum = sum;
+      char name[64];
+      std::snprintf(name, sizeof(name), "vp6_rgba_%03d.raw", dumped++);
+      FILE* f = std::fopen(name, "wb");
+      if (f) {
+        std::fwrite(host, 1, kBytes, f);
+        std::fclose(f);
+      }
+    }
+  }).detach();
+  return 0;
+}();
+
 // Frame driver tap: dump the codec object (r3) at entry, find plane-candidate
 // pointers inside it (physical-alloc range), and dump a slice of each plane
 // PRE and POST frame decode -> vp6_frame.txt. Plane slices that change every
@@ -316,6 +384,12 @@ NHL_VP6_SWEEP_HOOK(82776AE0)
 REX_EXTERN(__imp__sub_8277ABB8);
 static std::atomic<int> g_vp6_frame_n{0};
 extern "C" REX_FUNC(sub_8277ABB8) {
+  if (Vp6RgbaAddr()) {
+    int fn = g_vp6_frame_n.fetch_add(1);
+    __imp__sub_8277ABB8(ctx, base);
+    DumpVp6Rgba(fn, base);
+    return;
+  }
   int n = g_vp6_harness ? g_vp6_frame_n.fetch_add(1) : 1000;
   if (n >= 4) {
     __imp__sub_8277ABB8(ctx, base);
