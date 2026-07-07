@@ -71,3 +71,24 @@ then steady-state `r3=BFB37AC8 r4=BD95F37C r5=8232E02A r6=707BFBC0`.
   this machine; 95s reaches the title screen).
 - The probe prints `[diag] vp6_blockdrv stack: ...` lines into
   `logs/nhllegacy_*.log` and `vp6_probe.txt` next to the exe.
+
+## Session 2 additions (2026-07-07)
+
+- Reference decode works: `ffmpeg -i ealogo.vp6 frames_%03d.png` (365 frames;
+  ignore the EA-audio "revision2" warning). Dark frames decode clean in-game;
+  bright high-AC content corrupts — consistent with the arithmetic diagnosis.
+- Job-record layout at the block driver (recon harness, `vp6_harness.txt`):
+  records of `{count, dataPtr, completionFn(=sub_826FF200/826FF220 - event
+  signalers), srcPtr, dstPtr}`. The block driver `sub_8276AC70` posts command
+  **#26** via `vtable[0]` of the manager singleton at `*(0x83B3AA10)`
+  (obj 0x83B5D9D4, vt 0x823A404C) — but that vt[0] (sub_833FBEA0) is an empty
+  `blr`, so consumption is asynchronous (worker ring), NOT through this call.
+- The two immediate-constant IDCTs (`sub_827D2FE8` file 30, `sub_82898660`
+  file 37 — hooks left in diag_hooks) do NOT fire during the movie. The VP6
+  transform is elsewhere (likely table-driven constants), unfound so far.
+- Frame driver = `sub_8277ABB8` (file 27, lines ~35420); direct callees swept
+  (`vp6_sweep.txt`): per-frame setup only. Codec context object = `0xFE0B7280`.
+- NEXT: dump the codec object at frame-driver entry; find plane pointers
+  (candidates look like 0x707xxxxx physical); diff planes vs the ffmpeg
+  reference per frame. Then either characterize the arithmetic bug (Path A)
+  or inject host-decoded planes per frame at frame-driver level (Path B).

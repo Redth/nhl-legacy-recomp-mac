@@ -162,8 +162,207 @@ extern "C" REX_FUNC(sub_829BCC18) {
 static constexpr bool g_vp6_probe = false;  // chain mapped 2026-07-06 - see docs/vp6-fork-investigation.md
 static std::atomic<int> g_vp6_n{0};
 
+// --- VP6 differential harness (Path A, iteration 1: layout reconnaissance) ---
+// Dump r3..r10 plus guest memory around the pointer-like args BEFORE and AFTER
+// each selected per-block call -> vp6_harness.txt. Goal: identify which region
+// holds the int16 coefficient block (nonzero small BE values before the call)
+// and which region the call writes (output pixels), so iteration 2 can diff
+// them against a host FFmpeg reference decode of the same movie.
+static constexpr bool g_vp6_harness = true;  // ACTIVE (recon run)
+static bool GuestPtrLike(uint32_t a) { return a >= 0x10000u && a < 0xC0000000u; }
+
+// Copy guest bytes into buf (VirtualQuery-guarded per page). Returns bytes valid.
+static size_t ReadGuestBytes(uint8_t* base, uint32_t addr, uint8_t* buf,
+                             size_t len) {
+  size_t got = 0;
+  while (got < len) {
+    uint32_t a = addr + static_cast<uint32_t>(got);
+    uint8_t* host = base + a + REX_PHYS_HOST_OFFSET(a);
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery(host, &mbi, sizeof(mbi))) break;
+    if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+      break;
+    size_t page_left =
+        reinterpret_cast<uint8_t*>(mbi.BaseAddress) + mbi.RegionSize - host;
+    size_t chunk = page_left < (len - got) ? page_left : (len - got);
+    std::memcpy(buf + got, host, chunk);
+    got += chunk;
+  }
+  return got;
+}
+
+static void PrintHexBlock(FILE* f, const char* tag, uint32_t addr,
+                          const uint8_t* buf, size_t len) {
+  std::fprintf(f, "  %s @%08X (%zu bytes):\n", tag, addr, len);
+  for (size_t i = 0; i < len; i += 16) {
+    std::fprintf(f, "    +%03zX:", i);
+    for (size_t k = i; k < i + 16 && k < len; k += 2) {
+      // print as big-endian u16 (PPC byte order; DCT coeffs are int16)
+      std::fprintf(f, " %04X", (buf[k] << 8) | buf[k + 1]);
+    }
+    std::fprintf(f, "\n");
+  }
+}
+
+// --- VP6 IDCT differential taps (Path A, iteration 2) ------------------------
+// sub_827D2FE8 / sub_82898660 are the two scalar VP3-family IDCTs in the image
+// (identified by their fixed-point constants 46341/54491/60547/64277/36410).
+// Contract: r3 -> int16[64] coefficient block, transformed IN PLACE (row pass
+// to stack, column pass sth's back). Dump pre/post blocks for the first calls
+// so the math can be verified against a host reference -> vp6_idct_io.txt.
+static std::atomic<int> g_idct_a_n{0}, g_idct_b_n{0};
+
+static void DumpIdctIo(const char* which, int n, PPCContext& ctx, uint8_t* base,
+                       void (*impl)(PPCContext&, uint8_t*)) {
+  constexpr size_t kBlk = 128;  // int16[64]
+  uint8_t pre[kBlk]{}, post[kBlk]{};
+  uint32_t r3 = ctx.r3.u32, r4 = ctx.r4.u32, r5 = ctx.r5.u32;
+  size_t np = GuestPtrLike(r3) ? ReadGuestBytes(base, r3, pre, kBlk) : 0;
+  impl(ctx, base);
+  if (np != kBlk) return;
+  ReadGuestBytes(base, r3, post, kBlk);
+  FILE* f = std::fopen("vp6_idct_io.txt", "a");
+  if (!f) return;
+  std::fprintf(f, "=== %s#%d r3=%08X r4=%08X r5=%08X\nin :", which, n, r3, r4,
+               r5);
+  for (size_t k = 0; k < kBlk; k += 2)
+    std::fprintf(f, " %d", int16_t((pre[k] << 8) | pre[k + 1]));
+  std::fprintf(f, "\nout:");
+  for (size_t k = 0; k < kBlk; k += 2)
+    std::fprintf(f, " %d", int16_t((post[k] << 8) | post[k + 1]));
+  std::fprintf(f, "\n");
+  std::fclose(f);
+}
+
+REX_EXTERN(__imp__sub_827D2FE8);
+extern "C" REX_FUNC(sub_827D2FE8) {
+  int n = g_vp6_harness ? g_idct_a_n.fetch_add(1) : 1000;
+  if (n < 32) {
+    DumpIdctIo("idctA_827D2FE8", n, ctx, base, __imp__sub_827D2FE8);
+    return;
+  }
+  __imp__sub_827D2FE8(ctx, base);
+}
+
+REX_EXTERN(__imp__sub_82898660);
+extern "C" REX_FUNC(sub_82898660) {
+  int n = g_vp6_harness ? g_idct_b_n.fetch_add(1) : 1000;
+  if (n < 32) {
+    DumpIdctIo("idctB_82898660", n, ctx, base, __imp__sub_82898660);
+    return;
+  }
+  __imp__sub_82898660(ctx, base);
+}
+
+// Sweep: the frame driver sub_8277ABB8's direct callees (plus the block
+// driver's sibling sub_8276ADB0). One of these is/reaches the per-block
+// dequant+IDCT. Same pre/post dump as the recon harness -> vp6_sweep.txt.
+static void SweepDump(const char* which, std::atomic<int>& counter,
+                      PPCContext& ctx, uint8_t* base,
+                      void (*impl)(PPCContext&, uint8_t*)) {
+  int n = g_vp6_harness ? counter.fetch_add(1) : 1000;
+  if (n >= 12) {
+    impl(ctx, base);
+    return;
+  }
+  constexpr size_t kW = 192;
+  uint8_t pre4[kW]{}, pre5[kW]{}, post4[kW]{}, post5[kW]{};
+  uint32_t r3 = ctx.r3.u32, r4 = ctx.r4.u32, r5 = ctx.r5.u32, r6 = ctx.r6.u32,
+           r7 = ctx.r7.u32;
+  size_t n4 = GuestPtrLike(r4) ? ReadGuestBytes(base, r4, pre4, kW) : 0;
+  size_t n5 = GuestPtrLike(r5) ? ReadGuestBytes(base, r5, pre5, kW) : 0;
+  impl(ctx, base);
+  if (n4) ReadGuestBytes(base, r4, post4, kW);
+  if (n5) ReadGuestBytes(base, r5, post5, kW);
+  FILE* f = std::fopen("vp6_sweep.txt", "a");
+  if (!f) return;
+  std::fprintf(f, "=== %s#%d r3=%08X r4=%08X r5=%08X r6=%08X r7=%08X\n", which,
+               n, r3, r4, r5, r6, r7);
+  if (n4) {
+    PrintHexBlock(f, "r4.pre ", r4, pre4, n4 < 64 ? n4 : 64);
+    if (std::memcmp(pre4, post4, n4))
+      PrintHexBlock(f, "r4.POST", r4, post4, n4 < 64 ? n4 : 64);
+  }
+  if (n5) {
+    PrintHexBlock(f, "r5.pre ", r5, pre5, n5 < 64 ? n5 : 64);
+    if (std::memcmp(pre5, post5, n5))
+      PrintHexBlock(f, "r5.POST", r5, post5, n5 < 64 ? n5 : 64);
+  }
+  std::fclose(f);
+}
+
+#define NHL_VP6_SWEEP_HOOK(addr)                                     \
+  REX_EXTERN(__imp__sub_##addr);                                     \
+  static std::atomic<int> g_sw_##addr{0};                            \
+  extern "C" REX_FUNC(sub_##addr) {                                  \
+    SweepDump("sub_" #addr, g_sw_##addr, ctx, base,                  \
+              __imp__sub_##addr);                                    \
+  }
+
+NHL_VP6_SWEEP_HOOK(8276ADB0)
+NHL_VP6_SWEEP_HOOK(8277C350)
+NHL_VP6_SWEEP_HOOK(8277A248)
+NHL_VP6_SWEEP_HOOK(82779550)
+NHL_VP6_SWEEP_HOOK(82778BE8)
+NHL_VP6_SWEEP_HOOK(82776BD8)
+NHL_VP6_SWEEP_HOOK(82776AE0)
+
 REX_EXTERN(__imp__sub_8276AC70);
 extern "C" REX_FUNC(sub_8276AC70) {
+  if (g_vp6_harness) {
+    int hn = g_vp6_n.fetch_add(1);
+    if (hn < 24) {
+      constexpr size_t kR3 = 96, kR4 = 256, kR5 = 256, kR6 = 128;
+      uint8_t pre3[kR3]{}, pre4[kR4]{}, pre5[kR5]{}, pre6[kR6]{};
+      uint8_t post4[kR4]{}, post5[kR5]{}, post6[kR6]{};
+      uint32_t r3 = ctx.r3.u32, r4 = ctx.r4.u32, r5 = ctx.r5.u32,
+               r6 = ctx.r6.u32;
+      size_t n3 = GuestPtrLike(r3) ? ReadGuestBytes(base, r3, pre3, kR3) : 0;
+      size_t n4 = GuestPtrLike(r4) ? ReadGuestBytes(base, r4, pre4, kR4) : 0;
+      size_t n5 = GuestPtrLike(r5) ? ReadGuestBytes(base, r5, pre5, kR5) : 0;
+      size_t n6 = GuestPtrLike(r6) ? ReadGuestBytes(base, r6, pre6, kR6) : 0;
+
+      __imp__sub_8276AC70(ctx, base);
+
+      if (n4) ReadGuestBytes(base, r4, post4, kR4);
+      if (n5) ReadGuestBytes(base, r5, post5, kR5);
+      if (n6) ReadGuestBytes(base, r6, post6, kR6);
+      FILE* f = std::fopen("vp6_harness.txt", "a");
+      if (f) {
+        std::fprintf(f,
+                     "=== call#%d r3=%08X r4=%08X r5=%08X r6=%08X r7=%08X "
+                     "r8=%08X r9=%08X r10=%08X\n",
+                     hn, r3, r4, r5, r6, ctx.r7.u32, ctx.r8.u32, ctx.r9.u32,
+                     ctx.r10.u32);
+        if (n3) PrintHexBlock(f, "r3.pre ", r3, pre3, n3);
+        if (n4) {
+          PrintHexBlock(f, "r4.pre ", r4, pre4, n4);
+          if (std::memcmp(pre4, post4, n4))
+            PrintHexBlock(f, "r4.POST", r4, post4, n4);
+          else
+            std::fprintf(f, "  r4 unchanged\n");
+        }
+        if (n5) {
+          PrintHexBlock(f, "r5.pre ", r5, pre5, n5);
+          if (std::memcmp(pre5, post5, n5))
+            PrintHexBlock(f, "r5.POST", r5, post5, n5);
+          else
+            std::fprintf(f, "  r5 unchanged\n");
+        }
+        if (n6) {
+          PrintHexBlock(f, "r6.pre ", r6, pre6, n6);
+          if (std::memcmp(pre6, post6, n6))
+            PrintHexBlock(f, "r6.POST", r6, post6, n6);
+          else
+            std::fprintf(f, "  r6 unchanged\n");
+        }
+        std::fclose(f);
+      }
+      return;
+    }
+    __imp__sub_8276AC70(ctx, base);
+    return;
+  }
   int n = g_vp6_probe ? g_vp6_n.fetch_add(1) : 1000;
   if (n < 6) {
     uint32_t obj = 0, vt = 0, vt0 = 0;
