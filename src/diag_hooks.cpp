@@ -169,7 +169,7 @@ static std::atomic<int> g_vp6_n{0};
 // and which region the call writes (output pixels), so iteration 2 can diff
 // them against a host FFmpeg reference decode of the same movie.
 static constexpr bool g_vp6_harness = true;  // ACTIVE (recon run)
-static bool GuestPtrLike(uint32_t a) { return a >= 0x10000u && a < 0xC0000000u; }
+static bool GuestPtrLike(uint32_t a) { return a >= 0x10000u && a < 0xFFF00000u; }
 
 // Copy guest bytes into buf (VirtualQuery-guarded per page). Returns bytes valid.
 static size_t ReadGuestBytes(uint8_t* base, uint32_t addr, uint8_t* buf,
@@ -306,6 +306,62 @@ NHL_VP6_SWEEP_HOOK(82779550)
 NHL_VP6_SWEEP_HOOK(82778BE8)
 NHL_VP6_SWEEP_HOOK(82776BD8)
 NHL_VP6_SWEEP_HOOK(82776AE0)
+
+// Frame driver tap: dump the codec object (r3) at entry, find plane-candidate
+// pointers inside it (physical-alloc range), and dump a slice of each plane
+// PRE and POST frame decode -> vp6_frame.txt. Plane slices that change every
+// frame with pixel-like bytes = the decoded YUV output (Path A/B pivot data).
+REX_EXTERN(__imp__sub_8277ABB8);
+static std::atomic<int> g_vp6_frame_n{0};
+extern "C" REX_FUNC(sub_8277ABB8) {
+  int n = g_vp6_harness ? g_vp6_frame_n.fetch_add(1) : 1000;
+  if (n >= 4) {
+    __imp__sub_8277ABB8(ctx, base);
+    return;
+  }
+  constexpr size_t kObj = 768;
+  uint8_t obj[kObj]{};
+  uint32_t r3 = ctx.r3.u32;
+  size_t no = GuestPtrLike(r3) ? ReadGuestBytes(base, r3, obj, kObj) : 0;
+  // Collect up to 8 distinct plane-candidate pointers from the object: words
+  // in [0x70000000, 0x80000000) or [0xBD000000, 0xC0000000).
+  uint32_t cand[8]{};
+  int nc = 0;
+  for (size_t k = 0; k + 4 <= no && nc < 8; k += 4) {
+    uint32_t w = (obj[k] << 24) | (obj[k + 1] << 16) | (obj[k + 2] << 8) |
+                 obj[k + 3];
+    bool planeish = (w >= 0x70000000u && w < 0x80000000u);
+    if (!planeish) continue;
+    bool dup = false;
+    for (int i = 0; i < nc; ++i)
+      if (cand[i] == w) dup = true;
+    if (!dup) cand[nc++] = w;
+  }
+  constexpr size_t kPl = 64;
+  uint8_t pre[8][kPl]{}, post[8][kPl]{};
+  for (int i = 0; i < nc; ++i) ReadGuestBytes(base, cand[i], pre[i], kPl);
+
+  __imp__sub_8277ABB8(ctx, base);
+
+  for (int i = 0; i < nc; ++i) ReadGuestBytes(base, cand[i], post[i], kPl);
+  FILE* f = std::fopen("vp6_frame.txt", "a");
+  if (!f) return;
+  std::fprintf(f, "=== frame#%d r3=%08X r4=%08X r5=%08X r6=%08X r7=%08X\n", n,
+               r3, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32);
+  if (no) PrintHexBlock(f, "obj", r3, obj, no > 256 ? 256 : no);
+  uint8_t d4[96]{}, d5[96]{};
+  size_t nd4 = GuestPtrLike(ctx.r4.u32) ? ReadGuestBytes(base, ctx.r4.u32, d4, 96) : 0;
+  size_t nd5 = GuestPtrLike(ctx.r5.u32) ? ReadGuestBytes(base, ctx.r5.u32, d5, 96) : 0;
+  if (nd4) PrintHexBlock(f, "r4desc", ctx.r4.u32, d4, nd4);
+  if (nd5) PrintHexBlock(f, "r5desc", ctx.r5.u32, d5, nd5);
+  for (int i = 0; i < nc; ++i) {
+    std::fprintf(f, "  plane_cand[%d]=%08X %s\n", i, cand[i],
+                 std::memcmp(pre[i], post[i], kPl) ? "CHANGED" : "same");
+    PrintHexBlock(f, "  pre ", cand[i], pre[i], 32);
+    PrintHexBlock(f, "  post", cand[i], post[i], 32);
+  }
+  std::fclose(f);
+}
 
 REX_EXTERN(__imp__sub_8276AC70);
 extern "C" REX_FUNC(sub_8276AC70) {

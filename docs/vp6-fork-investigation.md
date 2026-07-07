@@ -92,3 +92,16 @@ then steady-state `r3=BFB37AC8 r4=BD95F37C r5=8232E02A r6=707BFBC0`.
   (candidates look like 0x707xxxxx physical); diff planes vs the ffmpeg
   reference per frame. Then either characterize the arithmetic bug (Path A)
   or inject host-decoded planes per frame at frame-driver level (Path B).
+- **Frame-driver signature established** (frame tap, `vp6_frame.txt`):
+  `sub_8277ABB8(r3=codec_obj@0xFE0B6BC0, r4=video_chunk_desc, r5=subtitle_desc,
+  r6=0x000C0020, r7=r4)`. The r4 descriptor contains the EA container tags
+  ("MV0F", "SCDl") + a chunk offset table + the raw chunk data pointer
+  (0xBD8A4910 on frame 0) — **the compressed VP6 frame input is fully located
+  (Path B input side solved).** r5 carries the .sub subtitle stream (UTF-16
+  text visible). Codec object's first 768B = job-queue nodes/list heads; NO
+  plane pointers there.
+- NEXT capture: hook the frame driver's CALLER (the movie-job fn containing
+  return addr 0x82671744) and dump its state AFTER the frame-driver returns —
+  the decoded plane pointers should be fetched there (getFrame pattern) before
+  texture upload. Once planes are located: diff vs ffmpeg reference frame
+  (Path A characterization) or overwrite with host-decoded planes (Path B fix).
