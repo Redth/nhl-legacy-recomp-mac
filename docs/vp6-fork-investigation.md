@@ -105,3 +105,16 @@ then steady-state `r3=BFB37AC8 r4=BD95F37C r5=8232E02A r6=707BFBC0`.
   the decoded plane pointers should be fetched there (getFrame pattern) before
   texture upload. Once planes are located: diff vs ffmpeg reference frame
   (Path A characterization) or overwrite with host-decoded planes (Path B fix).
+- Post-decode callees sub_82670768/sub_82671568 = generic utilities (event
+  handles 0xF80000xx, UI string tables) — not the frame publish path.
+- **BEST NEXT LEAD (do this first next session):** the movie renders via YUV
+  textures — boot log line "VulkanTextureCache: Format k_Cr_Y1_Cb_Y0_REP ...
+  fallback". Add a small tap in the SDK's vulkan/texture_cache.cpp upload path
+  for k_Cr_Y1_Cb_Y0_REP / k_Y1_Cr_Y0_Cb_REP textures: log the guest source
+  address + dims per upload during the movie. That is exactly where the
+  original dev's shipped-runtime vp6_luma.raw/vp6_chroma.raw tap lived (16
+  "vp6_luma" string hits in shipped rexruntime.dll, never captured in the
+  patch). Once plane addresses are known: dump planes per frame → diff vs
+  docs' ffmpeg reference (Path A characterization), or overwrite the planes /
+  swap the texture upload source with host-decoded frames (Path B fix at the
+  cleanest possible seam — host-side, no guest-memory writes needed).

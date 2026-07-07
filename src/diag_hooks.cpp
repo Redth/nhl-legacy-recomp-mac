@@ -168,7 +168,7 @@ static std::atomic<int> g_vp6_n{0};
 // holds the int16 coefficient block (nonzero small BE values before the call)
 // and which region the call writes (output pixels), so iteration 2 can diff
 // them against a host FFmpeg reference decode of the same movie.
-static constexpr bool g_vp6_harness = true;  // ACTIVE (recon run)
+static constexpr bool g_vp6_harness = false;  // flip on + rebuild to re-run captures
 static bool GuestPtrLike(uint32_t a) { return a >= 0x10000u && a < 0xFFF00000u; }
 
 // Copy guest bytes into buf (VirtualQuery-guarded per page). Returns bytes valid.
@@ -299,6 +299,8 @@ static void SweepDump(const char* which, std::atomic<int>& counter,
               __imp__sub_##addr);                                    \
   }
 
+NHL_VP6_SWEEP_HOOK(82670768)
+NHL_VP6_SWEEP_HOOK(82671568)
 NHL_VP6_SWEEP_HOOK(8276ADB0)
 NHL_VP6_SWEEP_HOOK(8277C350)
 NHL_VP6_SWEEP_HOOK(8277A248)
