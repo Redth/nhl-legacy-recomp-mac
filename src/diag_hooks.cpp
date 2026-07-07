@@ -146,6 +146,9 @@ extern "C" REX_FUNC(sub_829BCC18) {
   }
 }
 
+[[maybe_unused]] static void LogGuestStackHere(const char* tag, PPCContext& ctx,
+                                               uint8_t* base);
+
 // --- VP6 codec RE: capture the indirect transform target (gated on) ----------
 // The EA boot movie (ealogo.vp6) shows 8x8-block-aligned, high-AC-only green
 // corruption -> a recompiled arithmetic-precision bug in the VP6 dequant/inverse
@@ -156,7 +159,7 @@ extern "C" REX_FUNC(sub_829BCC18) {
 // target is the next codec layer (or the transform). Resolve the chain live and
 // dump the vtable + the per-block args (r3..r6 -> coefficient/block pointers we
 // will need for the differential I/O harness) -> vp6_probe.txt.
-static constexpr bool g_vp6_probe = false;  // VP6 RE paused (SDK-codegen bug)
+static constexpr bool g_vp6_probe = false;  // chain mapped 2026-07-06 - see docs/vp6-fork-investigation.md
 static std::atomic<int> g_vp6_n{0};
 
 REX_EXTERN(__imp__sub_8276AC70);
@@ -167,6 +170,7 @@ extern "C" REX_FUNC(sub_8276AC70) {
     bool ok = SafeGuestLoadU32(base, 0x83B3AA10u, &obj);  // singleton ptr
     if (obj) SafeGuestLoadU32(base, obj, &vt);            // vtable = *obj
     if (vt) SafeGuestLoadU32(base, vt, &vt0);             // vtable[0] = target
+    LogGuestStackHere("vp6_blockdrv", ctx, base);
     FILE* f = std::fopen("vp6_probe.txt", "a");
     if (f) {
       std::fprintf(f,

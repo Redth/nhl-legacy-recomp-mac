@@ -2,7 +2,7 @@
 
 [project]
 name = "nhllegacy"
-sdk_version = "0.8.0"
+sdk_version = "0.8.1"
 # Machine-specific: point game_root/file_path at any folder holding the vanilla
 # default.xex (an extracted disc dump, or the game/ dir of a builder install -
 # the builder hash-validates the xex, so it is bit-identical to the disc's).

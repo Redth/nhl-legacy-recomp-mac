@@ -31,18 +31,26 @@ if ($LASTEXITCODE -ne 0) { throw "git checkout $Pin failed" }
 git -C $SdkDir submodule update --init --recursive
 if ($LASTEXITCODE -ne 0) { throw "git submodule update failed" }
 
-# 2. Apply the title patch (skip if already applied).
-git -C $SdkDir apply --check $patch 2>$null
-if ($LASTEXITCODE -eq 0) {
-    git -C $SdkDir apply $patch
-    if ($LASTEXITCODE -ne 0) { throw "patch apply failed" }
-    Write-Host "[sdk] title patch applied"
-} else {
-    git -C $SdkDir apply --check --reverse $patch 2>$null
+# 2. Apply the pinned patches (skip each if already applied).
+#    - the title patch (Vulkan/texture/readback fixes)
+#    - upstream codegen cherry-picks that postdate the pin (e.g. the conditional
+#      bcctr tail-recovery fix, upstream 10cf1ad - a conditional bnectr/beqctr
+#      used to end the block and silently drop the rest of the function)
+$patches = @($patch, (Join-Path $repo "sdk\rexglue-codegen-bcctr-tail-fix.patch"))
+foreach ($p in $patches) {
+    $pname = Split-Path -Leaf $p
+    git -C $SdkDir apply --check $p 2>$null
     if ($LASTEXITCODE -eq 0) {
-        Write-Host "[sdk] title patch already applied - OK"
+        git -C $SdkDir apply $p
+        if ($LASTEXITCODE -ne 0) { throw "$pname apply failed" }
+        Write-Host "[sdk] $pname applied"
     } else {
-        throw "[sdk] patch does not apply (tree modified?). Reset with: git -C `"$SdkDir`" checkout -- . ; then re-run."
+        git -C $SdkDir apply --check --reverse $p 2>$null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "[sdk] $pname already applied - OK"
+        } else {
+            throw "[sdk] $pname does not apply (tree modified?). Reset with: git -C `"$SdkDir`" checkout -- . ; then re-run."
+        }
     }
 }
 
