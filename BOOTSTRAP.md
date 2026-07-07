@@ -70,11 +70,13 @@ play a session → `llvm-profdata merge -output=pgo\nhllegacy.profdata *.profraw
 
 ## Known deltas vs the original dev tree
 
-- The original SDK tree had **uncommitted edits inside the `libmspack` and
-  `o1heap` submodules** (the old patch recorded them only as `-dirty`). Those
-  edits are not recoverable from the repo; the pinned public submodule commits
-  are used instead. If the rebuilt runtime misbehaves around XEX decompression
-  or the guest heap, suspect this first.
+- **Solved:** the original SDK tree's unexplained `-dirty` state on the
+  `libmspack`/`o1heap` submodules is Windows git checking out their git
+  *symlinks* as plain text files (libmspack's `cabextract/mspack/*.{c,h}` point
+  at `../../libmspack/mspack/`); the build fails compiling a "file" that
+  contains only a path. `setup_sdk.ps1` now materializes the symlink targets
+  automatically — the resulting working-tree diff is the same class of change
+  the dev tree carried.
 - `docs/rexglue-vulkan-nhl-legacy.patch` is the original (historical) patch; the
   canonical one that applies to public `bd9b5191` is under `sdk/`.
 - The optional `tdb-rx2-ffi` static lib (runtime `.dds` → `.rx2` texture

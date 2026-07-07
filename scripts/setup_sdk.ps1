@@ -46,7 +46,29 @@ if ($LASTEXITCODE -eq 0) {
     }
 }
 
-# 3. Vendored high-cut deps (required unconditionally by CMakeLists for now).
+# 3. Materialize git symlinks that Windows git checks out as plain text files.
+#    libmspack's cabextract/mspack/*.{c,h} are symlinks to ../../libmspack/mspack;
+#    without this the SDK build fails compiling "files" that contain only a path
+#    (this is also what the original dev tree's unexplained submodule "-dirty"
+#    state was). Idempotent: already-materialized files have no 120000 ls-files
+#    entry content mismatch worth guarding - we just rewrite from the target.
+foreach ($sub in @("thirdparty\libmspack", "thirdparty\o1heap")) {
+    $subPath = Join-Path $SdkDir $sub
+    $links = git -C $subPath ls-files -s | Where-Object { $_ -match '^120000' } |
+             ForEach-Object { ($_ -split "`t")[1] }
+    foreach ($rel in $links) {
+        $file = Join-Path $subPath $rel
+        $content = (Get-Content -Raw $file -ErrorAction SilentlyContinue)
+        if ($null -eq $content -or $content.Length -gt 260 -or $content -match "`n.*`n") { continue }  # already materialized
+        $target = Join-Path (Split-Path -Parent $file) $content.Trim()
+        if (Test-Path $target) {
+            Copy-Item -Force $target $file
+            Write-Host "[sdk] materialized symlink $sub\$rel"
+        }
+    }
+}
+
+# 4. Vendored high-cut deps (required unconditionally by CMakeLists for now).
 & (Join-Path $repo "tools\fetch_thirdparty.ps1")
 
 Write-Host ""
