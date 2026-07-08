@@ -164,3 +164,129 @@ Next steps:
 3. Candidate cheap mitigation while the real fix lands: exempt the movie
    resolve (or fmt=6 1280x720 resolves) from the size gate + force texture
    invalidation after readback.
+
+## Session 4 (2026-07-07 afternoon) — ROOT CAUSE: lost invalidations in the
+## frame-end page-state clear (SetSystemPageBlocksValidWithGpuDataWritten)
+
+Post-session-3 fixes already in the SDK tree when this session started (all
+kept, all defensible, none cured the movie):
+- `VulkanSharedMemory::GetUsageMasks` kComputeWrite declared READ instead of
+  WRITE access (real barrier bug; after the fix a full sync-validation run —
+  `out/vp6_syncval.ps1`, VK_LAYER settings validate_sync=true — reports ZERO
+  hazards through boot+movie+menu).
+- `vp6_repack` in texture_cache.cpp (buffer-copy bypass of the load shader
+  for row-padded non-tiled k_8) — its vkCmdCopyBuffer was ILLEGAL until this
+  session added VK_BUFFER_USAGE_TRANSFER_DST_BIT to the scratch buffer
+  (VUID-vkCmdCopyBuffer-dstBuffer-00120, 20 hits in the syncval log).
+
+Instrumentation added (all env-gated, kept in tree):
+- `NHL_VP6_SM=<hexbase>:<hexlen>` — graphics/shared_memory.cpp logs every
+  gpu-written / cpu-invalidate / ram-upload touching the range;
+  vulkan/shared_memory.cpp re-compares each upload snapshot against guest RAM
+  (torn-upload detector).
+- `NHL_VP6_REQ` — logs every RequestRanges merged range >= 128KB.
+- The NHL_VP6_TAP / REQ caps were raised 400 -> 20000: **the 400-line caps
+  filled during BOOT (fmt=6 loads run at ~50/s from +2s), so all session-3
+  per-movie upload counts were actually pre-movie noise.** Movie window in a
+  50s smoke run is roughly +40s..+52s.
+
+Facts established by the traces (gated build, corruption reproducing):
+1. Movie texture 0x1CF32000 (fmt=6 tiled): 1588 gpu-written markings, ONE
+   initial ram-upload, ZERO cpu-invalidate over a whole run. Its bytes come
+   purely from the GPU resolve; nothing overwrites them; sync is clean.
+   => corruption is UPSTREAM of the resolve (the session-3 "resolve->texture
+   consumption" theory is dead).
+2. The YUV source region (fmt=18 texture at 0x1C98E000 + surroundings) shows
+   per-movie-frame cpu-invalidate (256KB-widened) + partial ram-uploads
+   (~350-500KB/frame — the EA player only rewrites CHANGED macroblock
+   regions). Torn-upload detector: 0 hits (uploads are stable during memcpy).
+3. Solid green = ZERO YUV bytes (Y=Cb=Cr=0 -> G~135). The corrupted areas
+   follow high-activity content; dark/static content is clean. So the GPU
+   consumed pages whose CPU updates never made it into the shared-memory
+   buffer.
+4. out/vp6_fullrb_movie.png ("full readback nearly fixes it") is a DARK
+   frame — the always-clean content class. That comparison was confounded;
+   readback mode was never the mechanism.
+
+ROOT CAUSE (src/graphics/shared_memory.cpp): this SDK refactored Xenia's
+`SetSystemPageBlocksValidWithGpuDataWritten` (valid := valid_and_gpu_written,
+i.e. drop CPU-page validity each frame; runs EVERY frame-end because
+`clear_memory_page_state` defaults TRUE here, unlike upstream) into a
+double-buffered pointer swap (`active_valid_flags_`/`staging_valid_flags_`)
+executed WITHOUT the global critical region. Guest threads clearing validity
+in `MemoryInvalidationCallback` (lock held) race the swap: their clears land
+in the swapped-out buffer and are LOST -> pages stay VALID while guest RAM
+has newer data -> RequestRanges skips the upload -> the GPU reads stale/zero
+bytes. For the movie that drops decoded macroblock updates (green blocks,
+worst when decode is heavy near frame end = bright/high-AC frames). Same
+lost-invalidation class as the equipment-compositing corruption. The
+incremental "dirty blocks" path additionally reverted non-dirty blocks to a
+two-swaps-old snapshot.
+
+FIX: rewrite the function as an in-place
+`memcpy(active, valid_and_gpu_written)` under the global lock, no pointer
+swap (staging buffer now unused). Residual (second-order, pre-existing):
+RequestRanges' lock-free all-valid fast path is check-then-act without the
+lock; an invalidation landing right after the check can still be missed for
+one frame. If any corruption remains, take the lock around that check next.
+
+## Session 4 continued — REVERSAL: the decoder IS guilty (for high-AC content)
+
+After the page-state fix, dark content (arena title screen, menu movies) is
+now CLEAN with the 3 MB gate — the "sparse green bars" class is gone. But the
+EA-logo movie still corrupts heavily. Further findings:
+
+1. **The EA-logo movie's real data path** (uncapped tap; the old 400-line tap
+   caps filled during BOOT — all session-3 "per-movie" counts were pre-movie
+   noise): ring of FOUR non-tiled k_8 luma textures 1280x720 pitch 1280 at
+   0x196B1000 / 0x19827000 / 0x1999D000 / 0x19A83000 + 640x360 pitch-768 k_8
+   chroma planes (several slots: 0x1C9B6000, 0x19C65000, 0x197DF000,
+   0x19797000, 0x19955000, 0x1990D000, ...), each reloaded every frame. The
+   fmt=18 packed CrY1CbY0 texture at 0x1C98E000 belongs to the CLOUD movie
+   (language/legal screens' background), which renders fine — session 3's
+   "pixel-perfect" dumps were of THAT easy low-AC content, which is why the
+   decoder looked innocent.
+2. **Torn uploads are real but secondary**: the guest decoder rewrites ring
+   slots while VulkanSharedMemory::UploadRanges memcpys them (85 torn uploads
+   per movie, up to 722 KB of a plane changed mid-copy; heavy CP-thread load
+   amplifies it dramatically — the per-byte diagnostic itself made the movie
+   far worse). FIXED with a bounded re-copy-until-stable loop in UploadRanges
+   (memcmp+yield, 8 tries). With the fix, all uploads read "stable" — and the
+   striping is UNCHANGED, so tears were not the visible corruption.
+3. **The decoded luma plane IN GUEST RAM is corrupted** (game-side dumper
+   NHL_VP6_RGBA=196B1000 → vp6_rgba_*.raw; one 3.6 MB dump covers 3 of the 4
+   luma slots; out/vp6_luma_slot0.png): dense black vertical dashes over the
+   bright, high-detail EA-ball content. GPU/emulator side fully exonerated
+   for this class — this is decoder output.
+4. **Arithmetic signature** (intrinsic analysis of the dump): dash pixels are
+   luma CLAMPED TO ZERO (96% in [0,16], mean 3 — underflow, not wrap), and
+   within 8x8 blocks they hit specific columns: x%8 = 7 strongly (4x
+   baseline), 2 and 3 moderately (~2x); y%8 is FLAT. Uniform-in-y +
+   column-specific = the ROW (horizontal) IDCT pass emits large negative
+   values at specific output columns for every row when high-AC coefficients
+   are present; the final clamp crushes the whole column to black. Dark/flat
+   content has no high-AC energy → decodes clean → explains every historical
+   "dark frames fine, bright frames break" observation.
+
+NEXT (decoder investigation restart, from the session-2 plan but now with the
+correct targets):
+- Differential harness at the block driver `sub_8276AC70` (hooks still in
+  src/diag_hooks.cpp): dump coefficient input + reconstructed output for
+  blocks landing in luma columns-7-heavy regions; implement the reference VP6
+  row IDCT on host; binary-search which term diverges; then find the
+  miscompiled PPC construct in the generated C++ (suspects: multiply-high /
+  saturating pack / arithmetic-shift rounding in the row butterfly).
+- OR Path B host-decode bridge: input side solved (session 2 - MV0F chunk
+  descriptor), output side now solved too (planar ring addresses above for
+  fullscreen movies; fmt=18 packed buffer for the cloud/menu movies).
+
+## Automation note
+
+The boot flow shows a language-select screen when the profile save is absent/
+incomplete (it waits for gamepad input — the user's DS4 "X"; keyboard/window
+message injection does NOT reach the SDL/MnK input path from an unfocused
+background script). For unattended movie captures: copy the user data tree to
+a scratch dir MINUS the incomplete `BEAPRO 20260707175841` + `PROFILE
+20260707175842` entries (half-written by a hard-killed run; their presence
+triggers first-boot flow) and launch with
+`--user_data_root "...\out\testuser"`. See out/vp6_auto1.ps1.
