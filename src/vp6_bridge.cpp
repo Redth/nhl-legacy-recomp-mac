@@ -29,6 +29,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <condition_variable>
 #include <deque>
 #include <mutex>
 #include <string>
@@ -68,11 +69,18 @@ void BridgeLog(const char* fmt, ...) {
 
 struct BridgeState {
   std::mutex m;
+  std::condition_variable cv;
   std::string host_path;   // current movie file on host
   HANDLE proc = nullptr;   // ffmpeg child
   HANDLE pipe_rd = nullptr;
   std::thread reader;
-  std::deque<uint8_t> buf;  // raw yuv420p byte stream from ffmpeg
+  // Frame-granular FIFO: whole decoded frames as moved vectors. NEVER buffer
+  // the raw byte stream in a std::deque<uint8_t> - MSVC's deque uses 16-byte
+  // blocks for byte elements, so bulk inserts/erases become millions of tiny
+  // allocations and the publish (game) thread stalls for seconds per frame.
+  std::deque<std::vector<uint8_t>> frames;
+  std::vector<uint8_t> staging;         // partial-frame accumulation
+  std::atomic<size_t> frame_size{0};    // w*h*3/2, set by the publish side
   std::atomic<bool> eof{false};
   std::atomic<bool> reader_stop{false};
   uint64_t frames_served = 0;
@@ -83,34 +91,55 @@ BridgeState& S() {
   return s;
 }
 
-constexpr size_t kMaxBuffered = 64ull << 20;  // 64MB ~ 46 frames of 720p
+constexpr size_t kMaxFrames = 24;             // decoded frames queued ahead
+constexpr size_t kMaxStaging = 32ull << 20;   // pre-first-publish cap
 
 void ReaderThread(HANDLE pipe_rd) {
   std::vector<uint8_t> chunk(1 << 20);
   for (;;) {
     if (S().reader_stop.load()) break;
     {
-      std::lock_guard<std::mutex> lk(S().m);
-      if (S().buf.size() > kMaxBuffered) {
-        // Backpressure: publish side drains at movie fps.
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      // Backpressure: wait until the publish side drains the FIFO.
+      std::unique_lock<std::mutex> lk(S().m);
+      S().cv.wait_for(lk, std::chrono::milliseconds(100), [] {
+        return S().reader_stop.load() || S().frames.size() < kMaxFrames ||
+               (S().frame_size.load() == 0 &&
+                S().staging.size() < kMaxStaging);
+      });
+      if (S().reader_stop.load()) break;
+      if (S().frames.size() >= kMaxFrames) continue;
+      if (S().frame_size.load() == 0 && S().staging.size() >= kMaxStaging)
         continue;
-      }
     }
     DWORD got = 0;
     if (!ReadFile(pipe_rd, chunk.data(), DWORD(chunk.size()), &got, nullptr) ||
         got == 0) {
       S().eof.store(true);
+      std::lock_guard<std::mutex> lk(S().m);
+      S().cv.notify_all();
       break;
     }
     std::lock_guard<std::mutex> lk(S().m);
-    S().buf.insert(S().buf.end(), chunk.data(), chunk.data() + got);
+    BridgeState& s = S();
+    s.staging.insert(s.staging.end(), chunk.data(), chunk.data() + got);
+    size_t fs = s.frame_size.load();
+    if (fs) {
+      size_t off = 0;
+      while (s.staging.size() - off >= fs) {
+        s.frames.emplace_back(s.staging.begin() + off,
+                              s.staging.begin() + off + fs);
+        off += fs;
+      }
+      if (off) s.staging.erase(s.staging.begin(), s.staging.begin() + off);
+    }
+    s.cv.notify_all();
   }
 }
 
 void StopMovie() {
   BridgeState& s = S();
   s.reader_stop.store(true);
+  s.cv.notify_all();
   if (s.pipe_rd) CancelIoEx(s.pipe_rd, nullptr);
   if (s.reader.joinable()) s.reader.join();
   if (s.pipe_rd) CloseHandle(s.pipe_rd);
@@ -123,7 +152,8 @@ void StopMovie() {
   s.reader_stop.store(false);
   s.eof.store(false);
   std::lock_guard<std::mutex> lk(s.m);
-  s.buf.clear();
+  s.frames.clear();
+  s.staging.clear();
 }
 
 std::string FfmpegPath() {
@@ -255,9 +285,22 @@ void Vp6BridgePublish(uint8_t* y, uint8_t* u, uint8_t* v, uint32_t w,
   std::vector<uint8_t> frame;
   {
     std::lock_guard<std::mutex> lk(s.m);
-    if (s.buf.size() >= fsz) {
-      frame.assign(s.buf.begin(), s.buf.begin() + fsz);
-      s.buf.erase(s.buf.begin(), s.buf.begin() + fsz);
+    if (s.frame_size.load() != fsz) {
+      // First publish (or dimension change): teach the reader the frame size
+      // and slice whatever it staged so far.
+      s.frame_size.store(fsz);
+      size_t off = 0;
+      while (s.staging.size() - off >= fsz) {
+        s.frames.emplace_back(s.staging.begin() + off,
+                              s.staging.begin() + off + fsz);
+        off += fsz;
+      }
+      if (off) s.staging.erase(s.staging.begin(), s.staging.begin() + off);
+    }
+    if (!s.frames.empty()) {
+      frame = std::move(s.frames.front());
+      s.frames.pop_front();
+      s.cv.notify_all();
     }
   }
   if (frame.empty()) {
@@ -290,4 +333,9 @@ void Vp6BridgePublish(uint8_t* y, uint8_t* u, uint8_t* v, uint32_t w,
       std::memcpy(v + size_t(ch - 1 - r) * c_pitch, fv + size_t(r) * cw, cw);
   }
   ++s.frames_served;
+  if (s.frames_served % 120 == 0) {
+    BridgeLog("served %llu frames tick=%lu queue=%zu",
+              (unsigned long long)s.frames_served,
+              (unsigned long)GetTickCount(), s.frames.size());
+  }
 }
