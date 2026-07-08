@@ -280,6 +280,65 @@ correct targets):
   descriptor), output side now solved too (planar ring addresses above for
   fullscreen movies; fmt=18 packed buffer for the cloud/menu movies).
 
+## Session 5 (2026-07-07 evening) — the transform is LOCATED
+
+Write-origin trap (NHL_VP6_TRAP=<hex phys>, src/diag_hooks.cpp) results:
+1. The display-ring luma (0x196B1000...) is written by a guest memcpy
+   (sub_8306B9A0, caller sub_83067DF8) copying FROM the decoder's INTERNAL
+   plane (~phys 0x0AF9xxxx, stride 0x560=1376 luma / 0x2B0=688 chroma - dims
+   live in the codec state struct at BD8B67CC-ish).
+2. Trapping the INTERNAL plane catches the real pixel writers:
+   - **sub_827C2848** (file 30, write sites lines 6949 & 7754) - main
+     per-block reconstruction, ~80% of writes;
+   - sub_827C6E88 (file 30:11748) and sub_8289EA40 (file 37:56376/56607) -
+     secondary paths;
+   - sub_830670E0 (memset-class).
+3. sub_827C2848 is a multi-mode WORKER (r3=ctx BD8B66D8, r4=job index/mode):
+   early modes parse the bitstream into a 6-byte-record coefficient stream
+   ({00FF,0004,0000}=end/empty, {0000,0000,DC}=DC-only records at cursor r9);
+   later modes consume records and write pixels.
+4. **The reconstruction/IDCT is VMX128 VECTOR FLOAT math**: vcsxwfp128
+   (int->float), lvx'd float cos table, vmulfp128, vcfpsxws128
+   (float->int saturate), vsraw128, vpkshus128 (saturating pack = the clamp
+   that turns negative overflow into the black/green columns). NOT the scalar
+   VP3 IDCTs (sub_827D2FE8/sub_82898660 never run during the movie —
+   NHL_VP6_IDCT counters prove it; session 2's "do not fire" observation was
+   right but its "table-driven scalar" conclusion wrong).
+5. Emitted code inspected & verified correct for: vaddsws (has the fixed
+   per-lane blendv pattern), vctsxs (simde_mm_vctsxs saturation/NaN
+   semantics), vperm128 (simde_mm_perm_epi8_ slli(3)+blendv trick), vsraw128
+   (per-element shifts, safe aliasing), vcsxwfp/vmulfp/vpkshus operand order.
+   The miscompile is NOT in those; remaining suspects: the transform's
+   vcfpsxws/vcsxwfp SCALE-immediate variants (only scale-0 was inspected),
+   vsldoi/vmrg lane plumbing, or the float cos-table indexing in the
+   generated code between lines ~3..8258 of nhllegacy_recomp.30.cpp.
+
+Tooling added this session (all env-gated, in src/diag_hooks.cpp):
+- NHL_VP6_IDCT: call counters + high-AC-gated pre/post dumps for the two
+  scalar IDCTs (vp6_idct_calls.txt / vp6_idct_io.txt).
+- NHL_VP6_TRAP=<hexphys>: vectored-handler write trap with guest-window alias
+  protection (raw 0x80/0xA0/0xC0/0xE0 windows; the movie player writes via
+  the 0xE0000000 window). Logs host RIP + guest lr/r3/r4/r5 -> vp6_trap.txt.
+  Symbolize RIPs: llvm-symbolizer --obj=nhllegacy.exe 0x140000000+rel.
+  NOTE: install the handler AFTER runtime init (it must precede the
+  runtime's own write-watch VEH), and re-arm on a timer (the runtime resets
+  page protection constantly).
+- NHL_VP6_RECON: pre/post r3..r10 + memory dumps of sub_827C2848 calls
+  (vp6_recon_io.txt). TODO: the content gate still catches the parser mode;
+  gate on r4 (mode) once the transform-mode index is identified.
+
+NEXT SESSION (pick one):
+- A: decode the 6-byte record format (parse-mode POST dumps show the
+  records being emitted; correlate with ffmpeg's VP6 coefficient parser),
+  then hook the TRANSFORM mode of sub_827C2848, dump coeff records + output
+  pixels for high-AC blocks, and diff against the float VP3 IDCT reference
+  (scratchpad vp3_idct_ref.py has the integer variant; the guest uses float).
+- B: extract sub_827C2848 + helpers from file 30 into a standalone host
+  harness (they are pure functions of PPCContext+memory), replay a captured
+  call, and single-step the vector state against a reference in Python.
+- C: skip the arithmetic hunt: host-decode bridge at sub_83067DF8's caller
+  (planar ring + internal plane addresses + strides now all known).
+
 ## Automation note
 
 The boot flow shows a language-select screen when the profile save is absent/

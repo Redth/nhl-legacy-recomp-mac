@@ -234,22 +234,75 @@ static void DumpIdctIo(const char* which, int n, PPCContext& ctx, uint8_t* base,
   std::fclose(f);
 }
 
+// Runtime-gated variant (env NHL_VP6_IDCT, no rebuild needed): count every
+// call (periodic timestamped totals -> vp6_idct_calls.txt, to establish
+// whether these transforms fire during the EA-logo movie window at all), and
+// dump pre/post only for HIGH-AC input blocks (>=6 nonzero AC coeffs or any
+// |AC| >= 300) - the row-IDCT column-crush bug (docs) only manifests on those;
+// low-AC cloud-movie blocks diff clean and would waste the dump budget.
+static bool IdctEnvOn() {
+  static const bool on = std::getenv("NHL_VP6_IDCT") != nullptr;
+  return on;
+}
+
+static bool IdctBlockInteresting(PPCContext& ctx, uint8_t* base) {
+  uint8_t buf[128];
+  if (!GuestPtrLike(ctx.r3.u32) ||
+      ReadGuestBytes(base, ctx.r3.u32, buf, sizeof(buf)) != sizeof(buf)) {
+    return false;
+  }
+  int nnz = 0, maxa = 0;
+  for (int i = 1; i < 64; ++i) {
+    int v = int16_t((buf[2 * i] << 8) | buf[2 * i + 1]);
+    if (v) ++nnz;
+    int a = v < 0 ? -v : v;
+    if (a > maxa) maxa = a;
+  }
+  return nnz >= 6 || maxa >= 300;
+}
+
+static void IdctCallTick(const char* which, std::atomic<int>& calls) {
+  int c = calls.fetch_add(1) + 1;
+  if ((c & 0x3FF) == 1) {
+    FILE* f = std::fopen("vp6_idct_calls.txt", "a");
+    if (f) {
+      std::fprintf(f, "%s calls=%d tick=%lu\n", which, c,
+                   (unsigned long)GetTickCount());
+      std::fclose(f);
+    }
+  }
+}
+
 REX_EXTERN(__imp__sub_827D2FE8);
+static std::atomic<int> g_idct_a_calls{0};
 extern "C" REX_FUNC(sub_827D2FE8) {
-  int n = g_vp6_harness ? g_idct_a_n.fetch_add(1) : 1000;
-  if (n < 32) {
-    DumpIdctIo("idctA_827D2FE8", n, ctx, base, __imp__sub_827D2FE8);
-    return;
+  if (IdctEnvOn()) {
+    IdctCallTick("idctA_827D2FE8", g_idct_a_calls);
+    if (g_idct_a_n.load(std::memory_order_relaxed) < 64 &&
+        IdctBlockInteresting(ctx, base)) {
+      int n = g_idct_a_n.fetch_add(1);
+      if (n < 64) {
+        DumpIdctIo("idctA_827D2FE8", n, ctx, base, __imp__sub_827D2FE8);
+        return;
+      }
+    }
   }
   __imp__sub_827D2FE8(ctx, base);
 }
 
 REX_EXTERN(__imp__sub_82898660);
+static std::atomic<int> g_idct_b_calls{0};
 extern "C" REX_FUNC(sub_82898660) {
-  int n = g_vp6_harness ? g_idct_b_n.fetch_add(1) : 1000;
-  if (n < 32) {
-    DumpIdctIo("idctB_82898660", n, ctx, base, __imp__sub_82898660);
-    return;
+  if (IdctEnvOn()) {
+    IdctCallTick("idctB_82898660", g_idct_b_calls);
+    if (g_idct_b_n.load(std::memory_order_relaxed) < 64 &&
+        IdctBlockInteresting(ctx, base)) {
+      int n = g_idct_b_n.fetch_add(1);
+      if (n < 64) {
+        DumpIdctIo("idctB_82898660", n, ctx, base, __imp__sub_82898660);
+        return;
+      }
+    }
   }
   __imp__sub_82898660(ctx, base);
 }
@@ -372,6 +425,226 @@ static const int g_vp6_rgba_sampler = [] {
         std::fwrite(host, 1, kBytes, f);
         std::fclose(f);
       }
+    }
+  }).detach();
+  return 0;
+}();
+
+// --- VP6 block-recon I/O dump (env NHL_VP6_RECON) -----------------------------
+// sub_827C2848 (file 30) is the vectorized (VMX128 float-IDCT) per-block
+// reconstruction - located via the plane write trap below: it stores decoded
+// pixels (vpkshus128 saturating pack) into the decoder's internal plane,
+// which sub_83067DF8 later memcpys into the display ring. Dump r3..r10 and
+// 160B of guest memory around each pointer-like register PRE and POST for the
+// first 24 calls -> vp6_recon_io.txt, to identify the coefficient block and
+// output and diff the math against a host VP3/VP6 reference.
+static std::atomic<int> g_recon_n{0};
+
+REX_EXTERN(__imp__sub_827C2848);
+extern "C" REX_FUNC(sub_827C2848) {
+  static const bool on = std::getenv("NHL_VP6_RECON") != nullptr;
+  if (!on || g_recon_n.load(std::memory_order_relaxed) >= 48) {
+    __imp__sub_827C2848(ctx, base);
+    return;
+  }
+  constexpr size_t kW = 160;
+  const uint32_t regs[8] = {ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32,
+                            ctx.r7.u32, ctx.r8.u32, ctx.r9.u32, ctx.r10.u32};
+  uint8_t pre[8][kW], post[8][kW];
+  size_t got[8]{};
+  for (int i = 0; i < 8; ++i) {
+    if (GuestPtrLike(regs[i]))
+      got[i] = ReadGuestBytes(base, regs[i], pre[i], kW);
+  }
+  // Content gate: only dump calls whose inputs carry real AC energy
+  // (dequantized coefficients, |v| in [300,8191]) - skips boot/cloud-movie
+  // low-AC traffic so the budget lands on the corrupting EA-logo blocks.
+  int big = 0;
+  for (int i = 5; i < 8; ++i) {
+    for (size_t k = 0; k + 1 < got[i]; k += 2) {
+      int v = int16_t((pre[i][k] << 8) | pre[i][k + 1]);
+      int a = v < 0 ? -v : v;
+      if (a >= 300 && a < 8192) ++big;
+    }
+  }
+  int n = big >= 4 ? g_recon_n.fetch_add(1) : 1000;
+  if (n >= 48) {
+    __imp__sub_827C2848(ctx, base);
+    return;
+  }
+  __imp__sub_827C2848(ctx, base);
+  FILE* f = std::fopen("vp6_recon_io.txt", "a");
+  if (!f) return;
+  std::fprintf(f, "=== recon#%d", n);
+  for (int i = 0; i < 8; ++i) std::fprintf(f, " r%d=%08X", i + 3, regs[i]);
+  std::fprintf(f, " tick=%lu\n", (unsigned long)GetTickCount());
+  for (int i = 0; i < 8; ++i) {
+    if (!got[i]) continue;
+    ReadGuestBytes(base, regs[i], post[i], kW);
+    std::fprintf(f, "r%d.pre :", i + 3);
+    for (size_t k = 0; k < got[i]; k += 2)
+      std::fprintf(f, " %04X", (pre[i][k] << 8) | pre[i][k + 1]);
+    std::fprintf(f, "\n");
+    if (std::memcmp(pre[i], post[i], got[i])) {
+      std::fprintf(f, "r%d.POST:", i + 3);
+      for (size_t k = 0; k < got[i]; k += 2)
+        std::fprintf(f, " %04X", (post[i][k] << 8) | post[i][k + 1]);
+      std::fprintf(f, "\n");
+    }
+  }
+  std::fclose(f);
+}
+
+// --- Plane write-origin trap (env NHL_VP6_TRAP=<hex phys addr>) --------------
+// Locates WHICH recompiled function writes the VP6 luma plane ring (the two
+// known VP3-family IDCTs sub_827D2FE8/sub_82898660 do NOT run during the
+// EA-logo movie - verified with NHL_VP6_IDCT counters). Protect one page in
+// the middle of the plane, catch the first-write AV in a vectored handler,
+// log the host RIP exe-relative (resolve against nhllegacy.pdb offline),
+// unprotect and re-arm on a timer -> vp6_trap.txt. Trap runs may show extra
+// visual glitches (we bypass the runtime's own watch invalidation) - fine.
+static uint32_t Vp6TrapAddr() {
+  static uint32_t addr = [] {
+    const char* e = std::getenv("NHL_VP6_TRAP");
+    return e ? uint32_t(std::strtoull(e, nullptr, 16)) : 0u;
+  }();
+  return addr;
+}
+static volatile LONG g_trap_armed = 0;
+static uint8_t* g_trap_pages[8] = {};  // host aliases of the same plane page
+static int g_trap_page_count = 0;
+static std::atomic<int> g_trap_hits{0};
+
+static LONG CALLBACK Vp6TrapHandler(PEXCEPTION_POINTERS xp) {
+  if (xp->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
+    return EXCEPTION_CONTINUE_SEARCH;
+  if (!g_trap_armed) return EXCEPTION_CONTINUE_SEARCH;
+  uint8_t* fault = (uint8_t*)xp->ExceptionRecord->ExceptionInformation[1];
+  int match = -1;
+  for (int i = 0; i < g_trap_page_count; ++i) {
+    if (fault >= g_trap_pages[i] && fault < g_trap_pages[i] + 4096) {
+      match = i;
+      break;
+    }
+  }
+  if (match < 0) return EXCEPTION_CONTINUE_SEARCH;
+  InterlockedExchange(&g_trap_armed, 0);
+  DWORD old;
+  for (int i = 0; i < g_trap_page_count; ++i) {
+    VirtualProtect(g_trap_pages[i], 4096, PAGE_READWRITE, &old);
+  }
+  void* rip = (void*)xp->ContextRecord->Rip;
+  void* mod = nullptr;
+  RtlPcToFileHeader(rip, &mod);
+  // Guest-side context of the faulting thread: lr = guest caller of the
+  // writing routine (memcpy etc), r3/r4/r5 = its dst/src/len-ish args.
+  unsigned long long lr = 0;
+  unsigned r3 = 0, r4 = 0, r5 = 0;
+  if (auto* ts = rex::runtime::ThreadState::Get(); ts && ts->context()) {
+    const PPCContext* c = ts->context();
+    lr = (unsigned long long)c->lr;
+    r3 = c->r3.u32; r4 = c->r4.u32; r5 = c->r5.u32;
+  }
+  FILE* f = std::fopen("vp6_trap.txt", "a");
+  if (f) {
+    std::fprintf(f,
+                 "hit#%d rip=%p rel=+0x%llX view=%d lr=%08llX r3=%08X r4=%08X "
+                 "r5=%08X fault=%p tick=%lu\n",
+                 g_trap_hits.load(), rip,
+                 (unsigned long long)((uint8_t*)rip - (uint8_t*)mod), match, lr,
+                 r3, r4, r5, fault, (unsigned long)GetTickCount());
+    std::fclose(f);
+  }
+  g_trap_hits.fetch_add(1);
+  return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+static const int g_vp6_trap_init = [] {
+  if (!Vp6TrapAddr()) return 0;
+  std::thread([] {
+    std::this_thread::sleep_for(std::chrono::seconds(20));
+    // Install NOW (not at static init): the runtime registers its own
+    // first-position vectored handler (physical write-watch) during memory
+    // init, which would otherwise sit in front of ours and consume the fault
+    // (unprotect + continue) before we ever see it.
+    AddVectoredExceptionHandler(1, Vp6TrapHandler);
+    auto* ks = rex::runtime::current_kernel_state();
+    if (!ks || !ks->memory()) return;
+    auto* mem = ks->memory();
+    // +0x40000 = mid-plane rows, guaranteed image content. The recompiled
+    // code writes through guest-VIRTUAL host views (virtual_membase +
+    // heap offsets), not the physical view - protect every alias we can
+    // find: scan the 64KB-page virtual space for mappings onto the target
+    // physical page, plus the physical view itself as a fallback.
+    const uint32_t phys_target = Vp6TrapAddr() + 0x40000;
+    FILE* f0 = std::fopen("vp6_trap.txt", "a");
+    g_trap_pages[g_trap_page_count++] =
+        mem->TranslatePhysical<uint8_t*>(phys_target);
+    auto add_page = [&](uint8_t* host, const char* what, uint32_t virt) {
+      if (!host || g_trap_page_count >= 8) return;
+      for (int i = 0; i < g_trap_page_count; ++i)
+        if (g_trap_pages[i] == host) return;
+      g_trap_pages[g_trap_page_count++] = host;
+      if (f0) std::fprintf(f0, "alias(%s): virt=%08X host=%p\n", what, virt, host);
+    };
+    // Raw guest-window aliases (recompiled stores compute
+    // virtual_membase + guest_addr directly). The 0xE0000000 window is the
+    // one the movie player's memcpy actually writes through.
+    add_page(mem->virtual_membase() + (0x80000000u | phys_target), "raw80",
+             0x80000000u | phys_target);
+    add_page(mem->virtual_membase() + (0xA0000000u + phys_target), "rawA0",
+             0xA0000000u + phys_target);
+    add_page(mem->virtual_membase() + (0xC0000000u + phys_target), "rawC0",
+             0xC0000000u + phys_target);
+    add_page(mem->virtual_membase() + (0xE0000000u + phys_target), "rawE0",
+             0xE0000000u + phys_target);
+    if (f0) {
+      std::fprintf(f0, "views=%d phys_host=%p\n", g_trap_page_count,
+                   g_trap_pages[0]);
+      std::fclose(f0);
+    }
+    for (int i = 0; i < 2400 && g_trap_hits.load() < 200; ++i) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(25));
+      // Re-protect unconditionally: the runtime's own watch machinery
+      // (invalidate -> upload -> re-arm, every frame on these pages) resets
+      // page protection underneath us, so a one-shot arm goes stale silently.
+      bool ok = false;
+      DWORD old;
+      static int prot_fail_logged = 0;
+      for (int k = 0; k < g_trap_page_count; ++k) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery(g_trap_pages[k], &mbi, sizeof(mbi)) ||
+            mbi.State != MEM_COMMIT) {
+          continue;
+        }
+        if (VirtualProtect(g_trap_pages[k], 4096, PAGE_READONLY, &old)) {
+          ok = true;
+        } else if (prot_fail_logged < 4) {
+          ++prot_fail_logged;
+          FILE* f = std::fopen("vp6_trap.txt", "a");
+          if (f) {
+            std::fprintf(f, "protect FAIL view=%d err=%lu state=%lx prot=%lx\n",
+                         k, GetLastError(), mbi.State, mbi.Protect);
+            std::fclose(f);
+          }
+        }
+      }
+      if (ok) {
+        InterlockedExchange(&g_trap_armed, 1);
+        // One-shot plumbing self-test: write the page from THIS thread; the
+        // handler must fire and log a hit with a diag_hooks RIP.
+        static bool selftested = false;
+        if (!selftested) {
+          selftested = true;
+          volatile uint8_t* p = g_trap_pages[0];
+          *p = *p;
+        }
+      }
+    }
+    InterlockedExchange(&g_trap_armed, 0);
+    DWORD old;
+    for (int k = 0; k < g_trap_page_count; ++k) {
+      VirtualProtect(g_trap_pages[k], 4096, PAGE_READWRITE, &old);
     }
   }).detach();
   return 0;
