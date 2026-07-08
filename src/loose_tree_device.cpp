@@ -3,6 +3,14 @@
 
 #include "loose_tree_device.h"
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
@@ -198,6 +206,13 @@ class LooseTreeEntry final : public fs::Entry {
       static const std::string trace_out =
           (rex::filesystem::GetExecutableFolder() / "texlib_caller_trace.txt").string();
       nhllegacy::CaptureStickCaller(path().c_str(), trace_out.c_str());
+    }
+    // VP6 host-decode bridge: export the HOST path of every .vp6 the guest
+    // opens so the bridge (src/vp6_bridge.cpp) can decode the same movie with
+    // a host decoder. See docs/vp6-fork-investigation.md.
+    if (EndsWithCi(name_, ".vp6")) {
+      SetEnvironmentVariableA("NHL_VP6_LAST_OPEN_HOST",
+                              host_.string().c_str());
     }
     // TEMP diagnostic: log .db opens so we can see which databases the game
     // loads (and when) and confirm a grown DB is served. Remove after testing.

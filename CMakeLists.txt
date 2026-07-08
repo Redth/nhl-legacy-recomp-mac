@@ -16,6 +16,7 @@ set(NHLLEGACY_SOURCES
     src/main.cpp
     src/kernel_stubs.cpp
     src/diag_hooks.cpp
+    src/vp6_bridge.cpp
     # Game-side present_grade_* cvar definitions: the SDK-side color-grade pass
     # was never captured in the title patch, so a from-public-source runtime
     # doesn't define them. Remove when the pass is reimplemented SDK-side.

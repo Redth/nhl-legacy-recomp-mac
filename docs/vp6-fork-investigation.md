@@ -339,6 +339,47 @@ NEXT SESSION (pick one):
 - C: skip the arithmetic hunt: host-decode bridge at sub_83067DF8's caller
   (planar ring + internal plane addresses + strides now all known).
 
+## Session 6 (2026-07-08) — HOST-DECODE BRIDGE SHIPPED (movie corruption fixed)
+
+Path C implemented and VERIFIED (out/vp6_br_46.png / vp6_br_50.png: the EA
+logo close-ups - the worst high-AC content - render pixel-perfect through the
+guest's own presentation pipeline). Design (src/vp6_bridge.cpp, env
+NHL_VP6_BRIDGE=1):
+
+- SEAM: sub_8277CC98 = the movie player's plane publish
+  (r4/r5=src planes, r6=w, r7=h, r8=src stride, r9=ring-slot descriptor:
+  Y/U/V plane ptrs at +16/+20/+24, sizes +32/+36/+40, Y pitch +48 (=w),
+  chroma pitch +52/+56 (768 for 720p), dims +64/+68; 4-slot linked ring).
+  The hook (diag_hooks.cpp) overwrites the just-published planes. Proven
+  first with a gradient test pattern (NHL_VP6_TESTPAT=1) - which also showed
+  the ring renders VERTICALLY FLIPPED, so frames are written bottom-up.
+- INPUT: the frame driver sub_8277ABB8 is a once-per-movie SETUP call (the
+  session-2 chunk-descriptor observation was a different mode); per-frame
+  chunks flow through the async streamer, so in-memory taps were abandoned.
+  Instead the LOOSE-TREE VFS device (src/loose_tree_device.cpp Open) exports
+  the HOST path of every opened .vp6 via env NHL_VP6_LAST_OPEN_HOST (an
+  NtCreateFile fallback in the SDK exports guest paths as NHL_VP6_LAST_OPEN).
+  The bridge starts/switches decoding lazily at publish time whenever the
+  env var names a new movie.
+- DECODE: spawns ffmpeg.exe (PATH or NHL_VP6_FFMPEG) with
+  `-map 0:v:0 -f rawvideo -pix_fmt yuv420p pipe:1`; a reader thread buffers
+  raw frames (64MB cap); publish pops one frame per call (guest-paced, audio
+  untouched); EOF respawns from frame 0 (looping menu movies); pipe underrun
+  gracefully falls back to the guest's own frame for that call.
+
+Limitations / follow-ups:
+- Env-gated (NHL_VP6_BRIDGE=1). Flip to default-on after broader testing and
+  ship ffmpeg presence detection (bridge no-ops gracefully without it).
+- Only the PLANAR movie player (fullscreen movies) is bridged; the packed
+  CrYCbY player (cloud/legal background) uses another publish path - but that
+  content is low-AC and has always decoded clean.
+- Pure-archive installs (movies only inside data0.big, no loose _compiled
+  tree) never fire the loose-tree hook; NtCreateFile fallback also won't see
+  them -> bridge stays off (movies show the guest decoder's striping again).
+  The 0.2.0 builder extracts loose trees, so shipped installs are covered.
+- The underlying VMX128 float-IDCT miscompile is still at large (session 5
+  notes) - the bridge makes it cosmetically irrelevant for movies.
+
 ## Automation note
 
 The boot flow shows a language-select screen when the profile save is absent/

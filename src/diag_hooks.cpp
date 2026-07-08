@@ -17,6 +17,8 @@
 
 #include "generated/default/nhllegacy_init.h"
 
+#include "vp6_bridge.h"
+
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -430,6 +432,126 @@ static const int g_vp6_rgba_sampler = [] {
   return 0;
 }();
 
+// --- VP6 bridge M1: publish-seam recon (env NHL_VP6_PUB) ----------------------
+// sub_83067DF8 is the guest's generic optimized memcpy (r3=dst r4=src r5=len).
+// The movie's internal-plane -> display-ring publish goes through it row by
+// row (internal stride 0x560 vs ring pitch 0x500 forbids one whole-plane
+// copy). Log movie-sized row copies (len 0x500 luma / 0x280 chroma) with the
+// guest lr = the rect-copy loop that is the bridge's injection seam
+// -> vp6_pub.txt.
+static std::atomic<int> g_pub_n{0};
+
+static void PubLog(const char* which, PPCContext& ctx) {
+  static const bool on = std::getenv("NHL_VP6_PUB") != nullptr;
+  if (!on) return;
+  uint32_t len = ctx.r5.u32;
+  if ((len != 0x500 && len != 0x280) ||
+      g_pub_n.load(std::memory_order_relaxed) >= 96) {
+    return;
+  }
+  int n = g_pub_n.fetch_add(1);
+  if (n >= 96) return;
+  FILE* f = std::fopen("vp6_pub.txt", "a");
+  if (f) {
+    std::fprintf(f, "%s#%d lr=%08llX dst=%08X src=%08X len=%X tick=%lu\n",
+                 which, n, (unsigned long long)ctx.lr, ctx.r3.u32, ctx.r4.u32,
+                 len, (unsigned long)GetTickCount());
+    std::fclose(f);
+  }
+}
+
+REX_EXTERN(__imp__sub_83067DF8);
+extern "C" REX_FUNC(sub_83067DF8) {
+  PubLog("df8", ctx);
+  __imp__sub_83067DF8(ctx, base);
+}
+
+REX_EXTERN(__imp__sub_83067EA8);
+extern "C" REX_FUNC(sub_83067EA8) {
+  PubLog("ea8", ctx);
+  __imp__sub_83067EA8(ctx, base);
+}
+
+REX_EXTERN(__imp__sub_83067F58);
+extern "C" REX_FUNC(sub_83067F58) {
+  PubLog("f58", ctx);
+  __imp__sub_83067F58(ctx, base);
+}
+
+// --- VP6 bridge M1b/M2: plane-publish function sub_8277CC98 ------------------
+// The movie player's plane publish (row loop -> sub_83067F58 per row,
+// lr=8277CD80). r6=width r7=height; r9 = output descriptor with plane
+// pointers at +16/+20/+24 (Y/U/V) and dims at +64/+68; YUV420 sizing math
+// (w*h*3/2) at entry. NHL_VP6_PUB2 logs args+descriptor -> vp6_pub2.txt.
+// NHL_VP6_TESTPAT additionally overwrites the published planes with a
+// gradient test pattern AFTER the copy - proving the injection seam (M2).
+static std::atomic<int> g_pub2_n{0};
+
+REX_EXTERN(__imp__sub_8277CC98);
+extern "C" REX_FUNC(sub_8277CC98) {
+  static const bool log_on = std::getenv("NHL_VP6_PUB2") != nullptr;
+  static const bool pat_on = std::getenv("NHL_VP6_TESTPAT") != nullptr;
+  static const bool bridge_on = [] {
+    const char* e = std::getenv("NHL_VP6_BRIDGE");
+    return e && *e && *e != '0';
+  }();
+  if (!log_on && !pat_on && !bridge_on) {
+    __imp__sub_8277CC98(ctx, base);
+    return;
+  }
+  const uint32_t r4 = ctx.r4.u32, r5 = ctx.r5.u32, r6 = ctx.r6.u32,
+                 r7 = ctx.r7.u32, r8 = ctx.r8.u32, r9 = ctx.r9.u32;
+  __imp__sub_8277CC98(ctx, base);
+  int n = g_pub2_n.fetch_add(1);
+  uint32_t desc[24] = {};
+  for (int k = 0; k < 24; ++k) SafeGuestLoadU32(base, r9 + 4 * k, &desc[k]);
+  if (log_on && n < 40) {
+    FILE* f = std::fopen("vp6_pub2.txt", "a");
+    if (f) {
+      std::fprintf(f,
+                   "pub#%d r4=%08X r5=%08X r6=%08X r7=%08X r8=%08X r9=%08X\n",
+                   n, r4, r5, r6, r7, r8, r9);
+      std::fprintf(f, "  desc:");
+      for (int k = 0; k < 24; ++k) std::fprintf(f, " %08X", desc[k]);
+      std::fprintf(f, "\n");
+      std::fclose(f);
+    }
+  }
+  // Host-decode bridge: overwrite the published planes with the next
+  // ffmpeg-decoded frame (no-op unless NHL_VP6_BRIDGE=1).
+  if (r6 >= 320 && r7 >= 180) {
+    uint32_t yp = desc[12] ? desc[12] : r6;      // +48 Y pitch
+    uint32_t cp = desc[13] ? desc[13] : r6 / 2;  // +52 chroma pitch
+    auto host = [&](uint32_t ga) -> uint8_t* {
+      return ga ? base + ga + REX_PHYS_HOST_OFFSET(ga) : nullptr;
+    };
+    Vp6BridgePublish(host(desc[4]), host(desc[5]), host(desc[6]), r6, r7, yp,
+                     cp);
+  }
+  if (pat_on && r6 >= 320 && r7 >= 180) {
+    // Overwrite the published Y plane (desc[4] per +16) with a gradient and
+    // flatten chroma (desc[5]/desc[6]) to neutral - if the movie shows this
+    // pattern, the seam is proven.
+    uint32_t w = r6, h = r7;
+    uint8_t* y = desc[4] ? base + desc[4] + REX_PHYS_HOST_OFFSET(desc[4]) : nullptr;
+    uint8_t* u = desc[5] ? base + desc[5] + REX_PHYS_HOST_OFFSET(desc[5]) : nullptr;
+    uint8_t* v = desc[6] ? base + desc[6] + REX_PHYS_HOST_OFFSET(desc[6]) : nullptr;
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (y && VirtualQuery(y, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT) {
+      for (uint32_t row = 0; row < h; ++row) {
+        std::memset(y + row * w, uint8_t((row * 256) / h), w);
+      }
+    }
+    // Ring chroma pitch is 768 (desc +52/+56), not w/2: cover all rows.
+    if (u && VirtualQuery(u, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT) {
+      std::memset(u, 128, 768 * (h / 2));
+    }
+    if (v && VirtualQuery(v, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT) {
+      std::memset(v, 128, 768 * (h / 2));
+    }
+  }
+}
+
 // --- VP6 block-recon I/O dump (env NHL_VP6_RECON) -----------------------------
 // sub_827C2848 (file 30) is the vectorized (VMX128 float-IDCT) per-block
 // reconstruction - located via the plane write trap below: it stores decoded
@@ -654,9 +776,40 @@ static const int g_vp6_trap_init = [] {
 // pointers inside it (physical-alloc range), and dump a slice of each plane
 // PRE and POST frame decode -> vp6_frame.txt. Plane slices that change every
 // frame with pixel-like bytes = the decoded YUV output (Path A/B pivot data).
+// --- VP6 bridge M3: frame-driver chunk tap (env NHL_VP6_CHUNK) ----------------
+// Counts sub_8277ABB8 calls and dumps the r4 video-chunk descriptor (256B) +
+// r3..r7 per call (cap 12 dumps, all calls counted) -> vp6_chunk.txt. Settles
+// per-frame vs per-movie cadence and pins the compressed-payload location for
+// the host-decode bridge input.
+static std::atomic<int> g_chunk_calls{0}, g_chunk_dumps{0};
+
+static void ChunkTap(PPCContext& ctx, uint8_t* base) {
+  int c = g_chunk_calls.fetch_add(1) + 1;
+  FILE* f = std::fopen("vp6_chunk.txt", "a");
+  if (!f) return;
+  std::fprintf(f, "call#%d r3=%08X r4=%08X r5=%08X r6=%08X r7=%08X tick=%lu\n",
+               c, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32,
+               (unsigned long)GetTickCount());
+  if (g_chunk_dumps.fetch_add(1) < 12 && GuestPtrLike(ctx.r4.u32)) {
+    uint8_t buf[256];
+    size_t got = ReadGuestBytes(base, ctx.r4.u32, buf, sizeof(buf));
+    std::fprintf(f, "  r4:");
+    for (size_t k = 0; k < got; k += 4) {
+      uint32_t w;
+      std::memcpy(&w, buf + k, 4);
+      std::fprintf(f, " %08X", _byteswap_ulong(w));
+    }
+    std::fprintf(f, "\n");
+  }
+  std::fclose(f);
+}
+
 REX_EXTERN(__imp__sub_8277ABB8);
 static std::atomic<int> g_vp6_frame_n{0};
 extern "C" REX_FUNC(sub_8277ABB8) {
+  static const bool chunk_on = std::getenv("NHL_VP6_CHUNK") != nullptr;
+  if (chunk_on) ChunkTap(ctx, base);
+  Vp6BridgeOnMovieSetup();
   if (Vp6RgbaAddr()) {
     int fn = g_vp6_frame_n.fetch_add(1);
     __imp__sub_8277ABB8(ctx, base);
