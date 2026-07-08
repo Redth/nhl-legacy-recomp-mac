@@ -47,9 +47,12 @@
 namespace {
 
 bool BridgeOn() {
+  // Default ON: the recompiled decoder's IDCT bug corrupts every bright
+  // movie frame, and the bridge degrades gracefully (guest frames) when
+  // ffmpeg or the loose movie files are absent. NHL_VP6_BRIDGE=0 opts out.
   static const bool on = [] {
     const char* e = std::getenv("NHL_VP6_BRIDGE");
-    return e && *e && *e != '0';
+    return !e || !*e || *e != '0';
   }();
   return on;
 }
@@ -185,6 +188,9 @@ bool StartMovie(const std::string& host_path) {
   if (!ok) {
     CloseHandle(rd);
     BridgeLog("spawn FAILED err=%lu cmd=%s", GetLastError(), cmd.c_str());
+    // Remember the path so the publish hook doesn't retry the spawn per
+    // frame (e.g. ffmpeg not installed) - the guest's own frames show.
+    s.host_path = host_path;
     return false;
   }
   CloseHandle(pi.hThread);
@@ -260,7 +266,9 @@ static void MaybeStartFromEnv(const char* who) {
     if (!n || n >= sizeof(guest)) return;
     host = MapGuestPath(guest);
   }
-  if (host == S().host_path && S().proc) return;  // already decoding it
+  // Already decoding it - or already tried and failed (don't respawn per
+  // frame; StartMovie records the path on spawn failure).
+  if (host == S().host_path) return;
   DWORD attrs = GetFileAttributesA(host.c_str());
   BridgeLog("%s: host='%s' exists=%d", who, host.c_str(),
             attrs != INVALID_FILE_ATTRIBUTES);

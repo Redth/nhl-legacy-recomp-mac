@@ -493,7 +493,7 @@ extern "C" REX_FUNC(sub_8277CC98) {
   static const bool pat_on = std::getenv("NHL_VP6_TESTPAT") != nullptr;
   static const bool bridge_on = [] {
     const char* e = std::getenv("NHL_VP6_BRIDGE");
-    return e && *e && *e != '0';
+    return !e || !*e || *e != '0';  // default ON (NHL_VP6_BRIDGE=0 opts out)
   }();
   if (!log_on && !pat_on && !bridge_on) {
     __imp__sub_8277CC98(ctx, base);
