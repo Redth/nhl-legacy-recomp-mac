@@ -66,3 +66,6 @@
 # build. (The hand-written RE markdown notes alongside it stay visible.)
 /docs/nhl12-decomp-reference/gpu/
 /docs/nhl12-decomp-reference/gpu.7z
+
+# Vendored ReXGlue SDK (fetched + pinned + patched by scripts/setup_sdk.ps1)
+/third_party/rexglue-sdk/

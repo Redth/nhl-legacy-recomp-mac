@@ -1,8 +1,6 @@
 @echo off
-call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" >nul
-set "VULKAN_SDK=C:\VulkanSDK\1.4.350.0"
-set "PATH=C:\Program Files\LLVM\bin;%VULKAN_SDK%\Bin;%PATH%"
-set "BLD=E:\Tools\rexglue-sdk\src\out\build\win-amd64-ffx"
+call "%~dp0_env.bat" || exit /b 1
+set "BLD=%REXGLUE_SDK_BUILD%"
 :: PERF: SHIP the Release config (-O3 -DNDEBUG, profiling stubbed) -> rexruntime.dll
 :: (no "rd" suffix); package.ps1 maps the vk-pgo/vk-opt presets to Flavor="".
 :: ALSO build/install RelWithDebInfo so the dev build (win-amd64-vk-ffx, which is

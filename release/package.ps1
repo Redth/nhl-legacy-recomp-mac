@@ -22,7 +22,7 @@
 param(
     [string]$Version    = "0.1.0",
     [string]$Preset     = "win-amd64-vk-ffx",
-    [string]$SdkDir     = "E:\Tools\rexglue-sdk\src\out\install\win-amd64-ffx",
+    [string]$SdkDir     = (Join-Path (Split-Path -Parent $PSScriptRoot) "third_party\rexglue-sdk\out\install\win-amd64-ffx"),
     [string]$SdkVersion = "0.8.1",
     [string]$LlvmBin    = "C:\Program Files\LLVM\bin",
     [switch]$RunCodegen,             # re-run rexglue codegen before building
