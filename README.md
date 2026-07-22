@@ -23,9 +23,11 @@ emulated, so it runs as a real PC application with modern rendering on top.
 
 ## Requirements
 
-- Windows 10 / 11, 64-bit
+- Windows 10 / 11, 64-bit (native), or **Linux / Steam Deck via Proton** — see
+  **[docs/linux.md](docs/linux.md)**
 - A **Vulkan-capable GPU**
 - The [Microsoft Visual C++ Redistributable (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe)
+  (Windows native; Proton usually provides this on Linux)
 - ~10 GB free disk space
 - **Your own dumped copy of NHL Legacy** — either a raw `.iso` of your disc, or an
   already-extracted game folder containing `default.xex`
@@ -62,6 +64,12 @@ You must own NHL Legacy and dump your own copy. No game assets are included or
 distributed with this project, and none will be provided. This is a fan
 preservation/portability effort, not affiliated with or endorsed by EA or Microsoft.
 See `THIRD-PARTY-NOTICES.txt` in the release for bundled component licenses.
+
+## Linux and Steam Deck
+
+The Windows build runs on Linux through **Steam + Proton 11.0**. Community-tested
+guides for playing an existing install and assembling one from a release zip + ISO
+are in **[docs/linux.md](docs/linux.md)**.
 
 ## For developers
 
