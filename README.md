@@ -20,6 +20,9 @@ emulated, so it runs as a real PC application with modern rendering on top.
   (fullscreen / borderless, monitor select), toggled with a button on screen.
 - **Loose-file friendly** — the installer unpacks the game's archives into a
   browsable file tree, so the community can inspect and replace assets.
+- **Working in-game movies** — the VP6 intros / FMV are decoded on the host by a
+  bundled `ffmpeg.exe` (the recompiled decoder had an arithmetic bug that garbled
+  them); it ships beside the port and needs no setup.
 
 ## Requirements
 

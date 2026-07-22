@@ -31,7 +31,9 @@ param(
     [string]$StudioDir = "E:\Repositories\nhl-database-studio",  # for the .big/texture extractor
     [switch]$NoExtractor,            # skip bundling the .big extractor (smaller payload)
     [switch]$SkipBuild,              # package a PREBUILT dir (e.g. the Vulkan PGO build) as-is
-    [string]$BuildDirOverride = ""   # use this build dir instead of out\build\<Preset>
+    [string]$BuildDirOverride = "",  # use this build dir instead of out\build\<Preset>
+    [string]$FfmpegExe = (Join-Path $PSScriptRoot "vendor\ffmpeg\ffmpeg.exe"), # VP6 bridge decoder
+    [switch]$NoFfmpeg                # skip bundling ffmpeg (VP6 movies won't decode for users w/o it)
 )
 
 $ErrorActionPreference = 'Stop'
@@ -184,6 +186,22 @@ $PayloadTracy = Join-Path $BuildDir $TracyDll
 if (Test-Path $PayloadTracy) { Copy-Item $PayloadTracy $Payload }
 $FfxDlls | ForEach-Object { Copy-Item $_.FullName $Payload }
 Set-Content -Path (Join-Path $Payload "manifest.toml") -Value $ManifestText -Encoding ascii
+
+# ffmpeg.exe for the VP6 host-decode bridge (src/vp6_bridge.cpp). The bridge spawns
+# "ffmpeg.exe" with a NULL application name, so CreateProcess finds it beside
+# nhllegacy.exe (app-dir is searched before PATH). Without it the guest's own
+# (buggy) VP6 frames show. LGPLv3 static build - fetch with release\fetch_ffmpeg.ps1.
+if (-not $NoFfmpeg) {
+    if (-not (Test-Path $FfmpegExe)) {
+        throw "ffmpeg.exe not found at '$FfmpegExe'. Fetch it with:`n  powershell -File release\fetch_ffmpeg.ps1`nor pass -NoFfmpeg to ship without it (VP6 movies then need a user-supplied ffmpeg on PATH)."
+    }
+    Copy-Item $FfmpegExe $Payload
+    $FfmpegLic = Join-Path (Split-Path -Parent $FfmpegExe) "ffmpeg-LICENSE.txt"
+    if (Test-Path $FfmpegLic) { Copy-Item $FfmpegLic $Payload }
+    Write-Host "Bundled ffmpeg.exe -> payload\ (VP6 movie decoder, LGPLv3)"
+} else {
+    Write-Host "WARNING: -NoFfmpeg set; VP6 movies will not decode unless the user supplies ffmpeg on PATH." -ForegroundColor Yellow
+}
 
 # payload/extractor/: the QuickBMS-based .big unpacker the installer runs after
 # extracting the disc (game/ -> game/_compiled), so end users get the loose-file
