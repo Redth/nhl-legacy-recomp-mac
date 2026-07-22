@@ -7,7 +7,7 @@ legally dumped copy of the game.
 ## Requirements
 
 - Windows 10/11, 64-bit
-- A Direct3D 12 capable GPU
+- A Vulkan 1.1+ capable GPU (recent AMD/NVIDIA/Intel drivers)
 - ~10 GB free disk space for the install
 - Your own NHL Legacy disc dump: either a raw `.iso` of the disc, or an
   already-extracted game folder containing `default.xex`
@@ -48,6 +48,12 @@ nhl-legacy-builder verify --iso "C:\dumps\NHL Legacy.iso"
   dump. Re-rip the disc to a plain `.iso`.
 - **Install interrupted** - just re-run the same install command; it will
   redo the extraction.
+- **In-game movies (intros / FMV) look garbled or are black** - these VP6
+  videos are decoded by the bundled `ffmpeg.exe` that sits next to
+  `nhllegacy.exe`. If you moved or deleted it, movies fall back to the
+  (buggy) built-in decoder. Re-run the installer, or drop any `ffmpeg.exe`
+  beside `nhllegacy.exe` (or point `NHL_VP6_FFMPEG` at one). Set
+  `NHL_VP6_BRIDGE=0` to disable the host decoder entirely.
 
 ## Legal
 

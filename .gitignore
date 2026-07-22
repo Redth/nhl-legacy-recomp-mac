@@ -34,6 +34,10 @@
 /third_party/
 /tools/xenos_recomp/
 
+# Bundled LGPL ffmpeg.exe for the VP6 movie bridge (~109M) — not committed.
+# Reproduce with: powershell -File release\fetch_ffmpeg.ps1
+/release/vendor/
+
 # C-5g note: the plume framebuffer-readback patch lives in third_party/plume/plume_vulkan.cpp,
 # but third_party/plume/ is an EMBEDDED git repo (vendored clone), so the parent repo cannot
 # track files inside it. The change is recorded in docs/plume-readback-patch.md (re-apply after
@@ -66,3 +70,6 @@
 # build. (The hand-written RE markdown notes alongside it stay visible.)
 /docs/nhl12-decomp-reference/gpu/
 /docs/nhl12-decomp-reference/gpu.7z
+
+# Vendored ReXGlue SDK (fetched + pinned + patched by scripts/setup_sdk.ps1)
+/third_party/rexglue-sdk/
