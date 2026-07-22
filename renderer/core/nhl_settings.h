@@ -84,13 +84,17 @@ inline double LoadDouble(const std::string& key, double fallback) {
 
 // --- Named settings ---------------------------------------------------------
 
-// Supersampling scale (internal-resolution multiplier), 1..4.
+// Supersampling scale (internal-resolution multiplier), 1..2.
+// Capped at 2x: at 3x/4x the scaled resolve buffer exceeds 4 GB, past this class
+// of GPU's maxStorageBufferRange, so CPU-reread composites (goalie/player
+// equipment) can't be read back and render black (and reading past 4 GB hard-
+// faults the GPU). 2x keeps the scaled buffer at 2 GB where everything is correct.
 inline int LoadSupersampling(int fallback) {
-  return LoadInt("supersampling", fallback, 1, 4);
+  return LoadInt("supersampling", fallback, 1, 2);
 }
 inline void SaveSupersampling(int v) {
   if (v < 1) v = 1;
-  if (v > 4) v = 4;
+  if (v > 2) v = 2;
   SaveSetting("supersampling", std::to_string(v));
 }
 

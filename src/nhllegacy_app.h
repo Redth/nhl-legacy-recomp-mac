@@ -64,6 +64,11 @@ REXCVAR_DECLARE(bool, protect_zero);
 REXCVAR_DECLARE(bool, scribble_heap);
 REXCVAR_DECLARE(bool, vsync);
 REXCVAR_DECLARE(bool, gpu_allow_invalid_fetch_constants);
+// Audio queue depth (frames buffered before the SDL device callback underruns to
+// silence — the audible pop). Default 8 (~43 ms) is thin when the CP thread stalls
+// on resolution-scaled swap work at high SSAA and starves audio servicing; a deeper
+// queue adds cushion at the cost of a little latency. Clamped 4-64 in the SDK.
+REXCVAR_DECLARE(int32_t, audio_maxqframes);
 // Resolve readback: download EDRAM resolve results back to guest RAM so later
 // texture fetches see the resolved data (e.g. NHL Legacy's runtime-composited,
 // recolorable goalie/player equipment maps) instead of stale garbage. Shared
@@ -213,6 +218,22 @@ class NhllegacyApp : public rex::ReXApp {
                     "size gate {} B)",
                     std::getenv("NHL_VK_READBACK_MAX_LEN"));
       }
+      // Deepen the audio queue on the Vulkan/SSAA path: at >=2x the CP thread
+      // stalls on resolution-scaled swap/fence work and starves the guest audio
+      // refill under the 60Hz vsync interrupt cadence, draining the SDL queue to
+      // silence (pops/crackle). A deeper queue (16 frames, ~85 ms) rides through
+      // those pacing hitches. Read once by AudioSystem at setup; clamp 4-64 lives
+      // in the SDK. NHL_AUDIO_MAXQFRAMES overrides for latency/robustness A/B.
+      {
+        int32_t qframes = 16;
+        if (const char* e = std::getenv("NHL_AUDIO_MAXQFRAMES"); e && *e) {
+          qframes = int32_t(std::strtol(e, nullptr, 10));
+        }
+        REXCVAR_SET(audio_maxqframes, qframes);
+        REXLOG_INFO("[nhl-audio] audio_maxqframes set to {} (deeper queue vs SSAA "
+                    "frame-pacing underruns)",
+                    qframes);
+      }
       // Enable Guide/PS button pass-through so the host can read it
       // (XInputGetStateEx ordinal 100 / SDL mapping) to toggle the enhancements
       // overlay. The guest never reads Guide (the 360 reserved it for the
@@ -285,9 +306,12 @@ class NhllegacyApp : public rex::ReXApp {
     // Enhancement A (docs/vulkan-enhancements-kickoff-prompt.md §3.A): internal-
     // resolution supersampling. The SDK renders the guest 1280x720 internally and
     // downsamples to the window; draw_resolution_scale is an integer multiplier
-    // (2 => 1440p, 3 => 2160p internal). Env-driven so 1x/2x/3x A/B needs no
-    // rebuild. Only meaningful on the Vulkan fsi path; clamp 1..4 (4 = 2880p
-    // internal, VRAM-heavy). Falls back to the default 1 when unset/invalid.
+    // (2 => 1440p internal). Env-driven so 1x/2x A/B needs no rebuild. Only
+    // meaningful on the Vulkan fsi path; clamp 1..2. Capped at 2x because at 3x/4x
+    // the scaled resolve buffer (512 MB * scale_area) exceeds this GPU class's 4 GB
+    // maxStorageBufferRange, so CPU-reread equipment composites can't be read back
+    // (render black) and reading past 4 GB hard-faults the GPU. Falls back to the
+    // default 1 when unset/invalid.
     if (std::getenv("NHL_VK_BACKEND")) {
       // Supersampling scale: the persisted overlay choice (nhl_enhancements.ini)
       // takes effect at launch; NHL_VK_SS env is a dev override. 0 => unset, leave
@@ -297,7 +321,10 @@ class NhllegacyApp : public rex::ReXApp {
         scale = int32_t(std::strtol(ss, nullptr, 10));
       }
       if (scale >= 1) {
-        if (scale > 4) scale = 4;
+        // Hard cap at 2x (see above). NHL_VK_SS_ALLOW_UNSAFE=1 lifts the cap for
+        // developers reproducing the >4 GB scaled-buffer fault; do NOT ship with it.
+        int32_t ss_cap = std::getenv("NHL_VK_SS_ALLOW_UNSAFE") ? 4 : 2;
+        if (scale > ss_cap) scale = ss_cap;
         REXCVAR_SET(draw_resolution_scale_x, scale);
         REXCVAR_SET(draw_resolution_scale_y, scale);
         REXLOG_INFO("[nhl-vk-ss] internal-resolution supersampling {}x "

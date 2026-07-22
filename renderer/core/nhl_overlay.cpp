@@ -225,10 +225,12 @@ void NhlEnhancementsDialog::OnDraw(ImGuiIO& io) {
 
     // --- Rendering ---
     if (ImGui::CollapsingHeader("Rendering", ImGuiTreeNodeFlags_DefaultOpen)) {
+      // Capped at 2x: 3x/4x push the scaled resolve buffer past this GPU class's
+      // 4 GB maxStorageBufferRange, breaking equipment readback (see nhl_settings.h).
       int scale = REXCVAR_GET(draw_resolution_scale_x);
       if (scale < 1) scale = 1;
-      if (scale > 4) scale = 4;
-      if (ImGui::SliderInt("Supersampling", &scale, 1, 4, "%dx")) {
+      if (scale > 2) scale = 2;
+      if (ImGui::SliderInt("Supersampling", &scale, 1, 2, "%dx")) {
         REXCVAR_SET(draw_resolution_scale_x, scale);
         REXCVAR_SET(draw_resolution_scale_y, scale);
         nhl::SaveSupersampling(scale);  // persist so it applies on the next launch
