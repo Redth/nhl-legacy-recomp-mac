@@ -1,0 +1,9 @@
+# Windows batch scripts must keep CRLF line endings — cmd.exe mis-parses caret
+# (^) line-continuations and multi-line blocks in LF-only .bat files, which
+# silently breaks the build scripts. Force CRLF on checkout regardless of
+# core.autocrlf / platform.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# PowerShell tolerates LF, but keep our shipped drivers CRLF for consistency.
+*.ps1 text eol=crlf
