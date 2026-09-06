@@ -1,6 +1,9 @@
 #include "renderer/core/nhl_overlay.h"
 
 #include "src/input_map.h"
+#if defined(__APPLE__)
+#include "src/game_setup.h"
+#endif
 
 #include <imgui.h>
 
@@ -201,6 +204,26 @@ void NhlEnhancementsDialog::OnDraw(ImGuiIO& io) {
     if (ImGui::CollapsingHeader("Controls")) {
       DrawControlsSection(pad);
     }
+
+#if defined(__APPLE__)
+    // --- Game data (macOS: the app unpacks the user's disc itself) ---
+    if (ImGui::CollapsingHeader("Game data")) {
+      const std::string path = nhl::ActiveGameDataPath().string();
+      ImGui::TextWrapped("%s", path.empty() ? "(not set)" : path.c_str());
+      ImGui::Spacing();
+      if (ImGui::Button("Use a different disc or folder...")) {
+        game_data_forgotten_ = nhl::ForgetGameDataPath();
+        game_data_notice_ = true;
+      }
+      if (game_data_notice_) {
+        ImGui::TextWrapped(
+            game_data_forgotten_
+                ? "Cleared. Quit and relaunch to pick a different disc image or folder."
+                : "Nothing to clear - this run was given an explicit path, so relaunch "
+                  "without --game_data_root to pick a different one.");
+      }
+    }
+#endif
 
     // --- Display ---
     if (ImGui::CollapsingHeader("Display", ImGuiTreeNodeFlags_DefaultOpen)) {

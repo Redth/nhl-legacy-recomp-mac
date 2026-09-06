@@ -93,7 +93,9 @@ set(NHLLEGACY_SOURCES
     src/main.cpp
     src/kernel_stubs.cpp
     # User controller remapping (applied in the XamInputGetState override).
+    src/game_setup.cpp
     src/input_map.cpp
+    src/xdvdfs.cpp
     # Scripted SDL virtual gamepad for headless input testing (NHL_VPAD_SCRIPT).
     src/vpad_script.cpp
     # Guest-function hooks; supplies the movie-setup + plane-publish taps that

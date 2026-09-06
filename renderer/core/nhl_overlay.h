@@ -110,6 +110,10 @@ class NhlEnhancementsDialog : public rex::ui::ImGuiDialog {
   // "Engine Tunables" section (live World-B constant editor).
   // Controller remapping UI (see src/input_map.h).
   void DrawControlsSection(const PadState& pad);
+#if defined(__APPLE__)
+  bool game_data_notice_ = false;
+  bool game_data_forgotten_ = false;
+#endif
   // Index into the guest-button list currently awaiting a physical press, or -1.
   int rebind_target_ = -1;
   // Physical buttons held when rebinding started, so the press that opened the

@@ -80,18 +80,27 @@ a title update applied will not pass validation.
 
 ### macOS (Apple Silicon)
 
-The macOS port is built from source (see **[DEV-README.md](DEV-README.md)**) and
-uses a helper to unpack your disc image, because Xbox 360 discs are XDVDFS —
-Finder, `hdiutil` and 7-Zip cannot read them:
+The macOS port is built from source — see **[DEV-README.md](DEV-README.md)**.
+
+**Just run it.** On first launch, if it cannot find game data, the app walks you
+through setup: it explains what it needs, opens a native file picker for your
+disc image, unpacks it with a progress bar, and remembers the location so this
+only happens once. Xbox 360 discs are XDVDFS, so Finder, `hdiutil` and 7-Zip
+cannot read them — the app does it for you. You can also point it at a folder
+you have already unpacked.
+
+To change the location later, open the in-game overlay (Guide button, or F1)
+and use **Game data → Use a different disc or folder**, then relaunch.
+
+There is a command-line equivalent for scripted setups:
 
 ```
 tools/macos/setup_game.py --iso ~/Downloads/"NHL Legacy Edition.iso"
 ```
 
-That verifies the image, checks free space, extracts ~6 GB into `game/`, and
-prints the command to launch. It also accepts a `.7z` straight from a dump, or
-an already-unpacked folder via `--from`. Re-running skips files that are already
-present, so an interrupted run just resumes.
+It takes `--from <folder>` for an already-unpacked dump, resumes if interrupted,
+and prints the launch command when done. `NHL_NO_SETUP_UI=1` disables the
+first-run dialog in the app for headless/CI use.
 
 ## Legal
 

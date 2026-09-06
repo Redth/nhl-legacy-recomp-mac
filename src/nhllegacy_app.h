@@ -76,6 +76,7 @@ inline void SetEnv(const char* name, const char* value) {
 #include "tunable_registry_dump.h"
 #include "tunable_runtime.h"
 #include "union_device.h"
+#include "game_setup.h"
 #include "input_map.h"
 #include "vpad_script.h"
 #include "anim_decode.h"
@@ -549,14 +550,34 @@ class NhllegacyApp : public rex::ReXApp {
   // default only when no --game_data_root was provided (cvar empty) so the
   // dev workflow — explicit flag, tools/drive.ps1 — keeps winning.
   void OnConfigurePaths(rex::PathConfig& paths) override {
+    const std::filesystem::path candidate =
+        rex::filesystem::GetExecutableFolder() / "game";
     if (paths.game_data_root.empty()) {
-      const std::filesystem::path candidate =
-          rex::filesystem::GetExecutableFolder() / "game";
       std::error_code ec;
       if (std::filesystem::is_directory(candidate, ec)) {
         paths.game_data_root = candidate;
       }
     }
+#if defined(__APPLE__)
+    // First run: if there is still no default.xex anywhere we would look, walk
+    // the user through picking their disc image and unpack it, rather than
+    // failing with a log line they will never see. No-op once data exists.
+    // NHL_NO_SETUP_UI=1 restores the plain "missing data" failure for scripts.
+    std::error_code xec;
+    const bool have =
+        !paths.game_data_root.empty() &&
+        std::filesystem::is_regular_file(paths.game_data_root / "default.xex", xec);
+    if (!have && !std::getenv("NHL_NO_SETUP_UI")) {
+      const std::filesystem::path chosen = nhl::EnsureGameData(
+          paths.game_data_root.empty() ? candidate : paths.game_data_root);
+      if (chosen.empty()) {
+        REXLOG_INFO("[nhl-setup] no game data selected; exiting");
+        nhl::compat::HardExit(0);
+      }
+      paths.game_data_root = chosen;
+    }
+    nhl::SetActiveGameDataPath(paths.game_data_root);
+#endif
   }
 
   // NHL Legacy probes cache:\ during boot; rexruntime 0.8.0 only mounts
