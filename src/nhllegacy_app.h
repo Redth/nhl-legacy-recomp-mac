@@ -262,7 +262,16 @@ class NhllegacyApp : public rex::ReXApp {
       // (readback_resolve=full + the backend enable) on Vulkan. NHL_VK_NO_READBACK
       // disables it for A/B.
       if (!std::getenv("NHL_VK_NO_READBACK")) {
-        REXCVAR_SET(readback_resolve, std::string("full"));
+        // NHL_VK_READBACK_MODE=full|fast|some selects the sync strategy.
+        // kFull calls AwaitAllQueueOperationsCompletion() on EVERY readback
+        // resolve - a full GPU drain - so the CPU memcpy sees current pixels.
+        // kFast/kSome instead double-buffer and read the PREVIOUS frame's copy,
+        // which removes the drain entirely but makes the data one frame stale.
+        // The drain is the dominant cost in high-draw scenes: menus run 10-14 fps
+        // with it and 16-26 fps without.
+        const char* rb_mode_env = std::getenv("NHL_VK_READBACK_MODE");
+        const std::string rb_mode = rb_mode_env && *rb_mode_env ? rb_mode_env : "full";
+        REXCVAR_SET(readback_resolve, rb_mode);
         REXCVAR_SET(vulkan_readback_resolve, true);
         // Size-gated readback (the SDK honors NHL_VK_READBACK_MAX_LEN in the Vulkan
         // resolve path): kFull does a full GPU drain per resolve so the CPU memcpy
@@ -277,9 +286,9 @@ class NhllegacyApp : public rex::ReXApp {
         if (!std::getenv("NHL_VK_READBACK_MAX_LEN")) {
           nhl::compat::SetEnv("NHL_VK_READBACK_MAX_LEN", "3000000");
         }
-        REXLOG_INFO("[nhl-vk] resolve readback enabled (readback_resolve=full, "
+        REXLOG_INFO("[nhl-vk] resolve readback enabled (readback_resolve={}, "
                     "size gate {} B)",
-                    std::getenv("NHL_VK_READBACK_MAX_LEN"));
+                    rb_mode, std::getenv("NHL_VK_READBACK_MAX_LEN"));
       }
       // Deepen the audio queue on the Vulkan/SSAA path: at >=2x the CP thread
       // stalls on resolution-scaled swap/fence work and starves the guest audio
