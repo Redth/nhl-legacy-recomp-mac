@@ -15,6 +15,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <string>
 
@@ -80,6 +81,22 @@ class NhlVkCommandProcessor : public rex::graphics::vulkan::VulkanCommandProcess
   // Cached env (resolved once): category skips + targeted overrides.
   bool exp_resolved_ = false;
   bool diag_active_ = false;  // any diagnostic/experiment on -> run the texture loop
+  // NHL_VK_RTLOG: render-surface geometry logging (see .cpp).
+  const bool rtlog_on_ = std::getenv("NHL_VK_RTLOG") != nullptr;
+  uint32_t last_rt_key_ = 0xFFFFFFFFu;
+  // NHL_VK_SKIP_TILE=A|B (see .cpp): drop one predicated-tiling pass.
+  const char skip_tile_ = []() -> char {
+    const char* e = std::getenv("NHL_VK_SKIP_TILE");
+    return (e && *e) ? *e : 0;
+  }();
+  // NHL_VK_RTLOG: log each EDRAM resolve (source tile -> guest dest rect).
+  bool IssueCopy() override;
+  uint32_t last_copy_key_ = 0xFFFFFFFFu;
+  const bool seqlog_on_ = std::getenv("NHL_VK_SEQLOG") != nullptr;
+  uint32_t last_seq_tile_ = 0xFFFFFFFFu;
+  const bool skip_unfold_ = std::getenv("NHL_VK_SKIP_UNFOLD") != nullptr;
+  uint32_t last_draw_pitch_ = 0;
+  const bool copy_barrier_on_ = std::getenv("NHL_VK_COPY_BARRIER") != nullptr;
   bool exp_skip_dxt3_ = false, exp_skip_alphatest_ = false, exp_skip_blend_ = false;
   uint32_t exp_skip_addr_ = 0;   // NHL_VK_SKIP_ADDR (hex), 0 = off
   bool exp_ref_on_ = false; float exp_ref_ = 0.0f;     // NHL_VK_NET_REF

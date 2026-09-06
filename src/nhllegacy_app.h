@@ -16,6 +16,9 @@
 #include <system_error>
 #include <thread>
 #include <vector>
+#ifndef _WIN32
+#include <unistd.h>  // _exit, for nhl::compat::HardExit
+#endif
 
 #include <rex/cvar.h>
 #include <rex/filesystem.h>
@@ -28,8 +31,28 @@
 #include <rex/rex_app.h>
 #include <rex/ui/flags.h>
 #include <rex/ui/presenter.h>
+#include <rex/graphics/pipeline/texture/util.h>
 
+// The D3D12 graphics system is Windows-only: off-Windows the SDK builds with
+// REXGLUE_USE_D3D12=OFF and rex/graphics/d3d12/* pulls in windows.h. Vulkan is
+// the only backend there, so NHL_HAVE_VULKAN_BACKEND is always defined and the
+// D3D12 fallback below is unreachable.
+#ifdef _WIN32
+#define NHL_HAVE_D3D12_BACKEND 1
 #include "renderer/core/nhl_graphics_system.h"
+#endif
+
+namespace nhl::compat {
+// _putenv_s is MSVC-only; setenv is the POSIX spelling. Same semantics here
+// (overwrite an existing value), so the call sites stay one-liners.
+inline void SetEnv(const char* name, const char* value) {
+#ifdef _WIN32
+  _putenv_s(name, value);
+#else
+  ::setenv(name, value, /*overwrite=*/1);
+#endif
+}
+}  // namespace nhl::compat
 // SPIKE (docs/vulkan-rov-backend-spike-prompt.md): the SDK's Vulkan ROV backend
 // is a COMPILE-TIME option (REXGLUE_USE_VULKAN, OFF in the stock win-amd64 zips).
 // The header always installs; the implementation only links against an SDK built
@@ -53,6 +76,8 @@
 #include "tunable_registry_dump.h"
 #include "tunable_runtime.h"
 #include "union_device.h"
+#include "input_map.h"
+#include "vpad_script.h"
 #include "anim_decode.h"
 
 // Runtime cvar (defined in rexruntime): when true, guest page 0 is
@@ -125,8 +150,25 @@ REXCVAR_DECLARE(int32_t, shadow_softness);
 
 // Win32 process-exit primitives (declared directly to avoid pulling <windows.h>
 // into this widely-included header). Used only by the replay-mode fast-exit.
+#ifdef _WIN32
 extern "C" __declspec(dllimport) void* __stdcall GetCurrentProcess();
 extern "C" __declspec(dllimport) int __stdcall TerminateProcess(void* handle, unsigned int code);
+#endif
+
+namespace nhl::compat {
+// Hard process exit that skips destructors and atexit handlers. The diagnostic
+// and replay paths use this deliberately: the guest is mid-flight on other
+// threads, so an orderly shutdown would deadlock or crash. _exit(2) is the
+// POSIX equivalent of TerminateProcess(GetCurrentProcess(), code).
+[[noreturn]] inline void HardExit(unsigned int code) {
+#ifdef _WIN32
+  ::TerminateProcess(::GetCurrentProcess(), code);
+  __builtin_unreachable();
+#else
+  ::_exit(static_cast<int>(code));
+#endif
+}
+}  // namespace nhl::compat
 
 #ifdef NHL_PGO_INSTRUMENT
 // PGO instrumentation profile writer (compiler-rt profile runtime, auto-linked by
@@ -167,7 +209,7 @@ class NhllegacyApp : public rex::ReXApp {
     // env vars. NHL_VK_BACKEND_OFF=1 forces the legacy D3D12 path as a fallback for
     // GPUs lacking fragment-shader-interlock (the fsi path the in-game 3D needs).
     if (!std::getenv("NHL_VK_BACKEND") && !std::getenv("NHL_VK_BACKEND_OFF")) {
-      _putenv_s("NHL_VK_BACKEND", "1");
+      nhl::compat::SetEnv("NHL_VK_BACKEND", "1");
     }
 #endif
 #ifdef NHL_HAVE_VULKAN_BACKEND
@@ -212,7 +254,7 @@ class NhllegacyApp : public rex::ReXApp {
         // ~1 MB). Default the threshold to 3 MB (keeps every composite, skips only
         // the framebuffers). Override via the env (set to 0 to disable the gate).
         if (!std::getenv("NHL_VK_READBACK_MAX_LEN")) {
-          _putenv_s("NHL_VK_READBACK_MAX_LEN", "3000000");
+          nhl::compat::SetEnv("NHL_VK_READBACK_MAX_LEN", "3000000");
         }
         REXLOG_INFO("[nhl-vk] resolve readback enabled (readback_resolve=full, "
                     "size gate {} B)",
@@ -243,7 +285,17 @@ class NhllegacyApp : public rex::ReXApp {
                   vk_rt ? vk_rt : "fsi");
     } else
 #endif
-    config.graphics = std::make_unique<nhl::graphics::NhlD3D12GraphicsSystem>();
+    {
+#ifdef NHL_HAVE_D3D12_BACKEND
+      config.graphics = std::make_unique<nhl::graphics::NhlD3D12GraphicsSystem>();
+#else
+      // No D3D12 off-Windows. SetupPresentation() already installed the SDK's
+      // stock (Vulkan) graphics system, so leave it in place — this is the
+      // NHL_VK_BACKEND_OFF path, which loses only our CP subclass's fps tap.
+      REXLOG_INFO("[nhl] D3D12 unavailable on this platform; using the SDK's "
+                  "stock Vulkan graphics system.");
+#endif
+    }
     REXCVAR_SET(protect_zero, false);  // see comment at REXCVAR_DECLARE above
     // NHL Legacy reads heap fields it never wrote (sub_82705510 record walk);
     // it relies on allocations being zero-filled like Xenia/Windows provide.
@@ -396,7 +448,9 @@ class NhllegacyApp : public rex::ReXApp {
     // provider creates the device. Used to get the exact device-removal reason
     // while debugging the beta owned-draw path.
     if (std::getenv("NHL_BETA_D3D12_DEBUG")) {
+#ifdef NHL_HAVE_D3D12_BACKEND
       REXCVAR_SET(d3d12_debug, true);
+#endif
       REXLOG_INFO("[nhl-beta] D3D12 debug layer enabled via NHL_BETA_D3D12_DEBUG");
     }
     // Opt-in verbose SDK logging (NHL_LOG_LEVEL=debug|trace): surfaces the texture
@@ -418,7 +472,9 @@ class NhllegacyApp : public rex::ReXApp {
     // makes the base CP, our PipelineCache, and our hand-written binding code
     // agree. Gated on beta so default gameplay keeps the faster bindless path.
     if (const char* be = std::getenv("NHL_BACKEND"); be && std::strcmp(be, "beta") == 0) {
+#ifdef NHL_HAVE_D3D12_BACKEND
       REXCVAR_SET(d3d12_bindless, false);
+#endif
       REXLOG_INFO("[nhl-beta] forcing bindful descriptor path (d3d12_bindless=false) for beta");
       // Synchronous pipeline creation (0 creation threads) for beta: the owned-draw
       // takeover otherwise hit an async PSO-creation race (device-removal crash, and
@@ -429,14 +485,18 @@ class NhllegacyApp : public rex::ReXApp {
       if (const char* v = std::getenv("NHL_BETA_PSO_SYNC")) {
         pso_threads = int32_t(std::strtol(v, nullptr, 10));
       }
+#ifdef NHL_HAVE_D3D12_BACKEND
       REXCVAR_SET(d3d12_pipeline_creation_threads, pso_threads);
+#endif
       REXLOG_INFO("[nhl-beta] d3d12_pipeline_creation_threads = {}", pso_threads);
       // Disable sparse/tiled shared memory for beta (full 512 MB buffer). Under
       // RenderDoc (which forces this off) the textured root sig was built correctly
       // (8 params) and the id=708 race disappeared — the sparse-buffer path appears
       // to perturb the shader binding-population timing. NHL_BETA_TILED=1 to re-enable.
       if (!std::getenv("NHL_BETA_TILED")) {
+#ifdef NHL_HAVE_D3D12_BACKEND
         REXCVAR_SET(d3d12_tiled_shared_memory, false);
+#endif
         REXLOG_INFO("[nhl-beta] d3d12_tiled_shared_memory = false (full buffer)");
       }
     }
@@ -589,7 +649,7 @@ class NhllegacyApp : public rex::ReXApp {
       __llvm_profile_write_file();  // capture the PGO profile before hard-exit
 #endif
       rex::ShutdownLogging();
-      ::TerminateProcess(::GetCurrentProcess(), 0u);
+      nhl::compat::HardExit(0u);
     };
     // Live engine-tunable store (World B). Built lazily on a worker thread when
     // the overlay's "Engine Tunables" section is first opened (the scan is only
@@ -654,6 +714,37 @@ class NhllegacyApp : public rex::ReXApp {
   // processor, so the resolves + scaler complete — unlike the headless tool,
   // where IssueSwap had no presenter to flush into (black output).
   void LaunchModule() override {
+    // Controller remapping, applied in the XamInputGetState override.
+    nhllegacy::LoadInputMap();
+    // Scripted virtual gamepad (NHL_VPAD_SCRIPT); no-op when unset.
+    nhllegacy::StartVpadScript();
+    // NHL_SHOT_AFTER_SEC=<n>[,<n>...]: play normally, then capture the presented
+    // guest frame to shot_<n>s.png at each listed time. Headless-friendly proof
+    // that the renderer is producing real output (macOS screencapture needs
+    // Screen Recording permission, which a terminal usually lacks).
+    if (const char* s = std::getenv("NHL_SHOT_AFTER_SEC"); s && *s) {
+      std::vector<unsigned> at;
+      for (const char* p = s; *p;) {
+        char* end = nullptr;
+        const unsigned v = static_cast<unsigned>(std::strtoul(p, &end, 10));
+        if (end == p) break;
+        at.push_back(v);
+        p = (*end == ',') ? end + 1 : end;
+      }
+      std::thread([this, at]() {
+        unsigned elapsed = 0;
+        for (unsigned t : at) {
+          if (t > elapsed) {
+            std::this_thread::sleep_for(std::chrono::seconds(t - elapsed));
+            elapsed = t;
+          }
+          char name[64];
+          std::snprintf(name, sizeof(name), "shot_%us.png", t);
+          CaptureFrameToPng(name);
+          DumpResolveTargets();
+        }
+      }).detach();
+    }
 #ifdef NHL_PGO_INSTRUMENT
     // PGO capture helper: with NHL_PGO_DUMP_AFTER=<seconds>, play normally, then
     // auto-flush the profile and hard-exit after that long — makes profile capture
@@ -666,7 +757,7 @@ class NhllegacyApp : public rex::ReXApp {
         std::fprintf(stderr, "[nhl-pgo] auto-dumping profile after %u s\n", secs);
         __llvm_profile_write_file();
         rex::ShutdownLogging();
-        ::TerminateProcess(::GetCurrentProcess(), 0u);
+        nhl::compat::HardExit(0u);
       }).detach();
     }
 #endif
@@ -698,7 +789,7 @@ class NhllegacyApp : public rex::ReXApp {
           ::Sleep(delay_ms);
           nhllegacy::DumpOverallWeightsRuntime(vbase, out.c_str());
           rex::ShutdownLogging();
-          ::TerminateProcess(::GetCurrentProcess(), 0u);
+          nhl::compat::HardExit(0u);
         }).detach();
       } else {
         std::fprintf(stderr, "[ovr-rt] no memory base; cannot scan\n");
@@ -743,7 +834,7 @@ class NhllegacyApp : public rex::ReXApp {
                          loaded ? "anim data detected" : "TIMEOUT (scanning anyway)");
             nhllegacy::RunAnimScan(vbase, out.c_str());
             rex::ShutdownLogging();
-            ::TerminateProcess(::GetCurrentProcess(), 0u);
+            nhl::compat::HardExit(0u);
           }).detach();
         } else {
           std::fprintf(stderr, "[anim-scan] no membase; cannot scan\n");
@@ -753,7 +844,7 @@ class NhllegacyApp : public rex::ReXApp {
       }
       const bool ok = nhllegacy::RunAnimDecode(runtime()->memory(), ad);
       rex::ShutdownLogging();
-      ::TerminateProcess(::GetCurrentProcess(), ok ? 0u : 1u);
+      nhl::compat::HardExit(ok ? 0u : 1u);
     }
 
     // NHL_DUMP_IMAGE: write the decompressed guest image (.rodata/.data/.text,
@@ -783,7 +874,7 @@ class NhllegacyApp : public rex::ReXApp {
         std::fprintf(stderr, "[img-dump] no graphics/memory system available\n");
       }
       rex::ShutdownLogging();
-      ::TerminateProcess(::GetCurrentProcess(), 0u);
+      nhl::compat::HardExit(0u);
     }
 
     if (const char* dump = std::getenv("NHL_DUMP_OVERALL_WEIGHTS"); dump && *dump) {
@@ -801,7 +892,7 @@ class NhllegacyApp : public rex::ReXApp {
         std::fprintf(stderr, "[ovr-dump] no graphics/memory system available\n");
       }
       rex::ShutdownLogging();
-      ::TerminateProcess(::GetCurrentProcess(), 0u);
+      nhl::compat::HardExit(0u);
     }
 
     // NHL_DUMP_TUNABLES: enumerate the engine tweak-registration pool(s) from
@@ -827,7 +918,7 @@ class NhllegacyApp : public rex::ReXApp {
         std::fprintf(stderr, "[tunables] no graphics/memory system available\n");
       }
       rex::ShutdownLogging();
-      ::TerminateProcess(::GetCurrentProcess(), 0u);
+      nhl::compat::HardExit(0u);
     }
 
     // NHL_DUMP_TUNABLES_RUNTIME: let the guest boot so its tweak registration
@@ -855,7 +946,7 @@ class NhllegacyApp : public rex::ReXApp {
           nhllegacy::DumpTunableValuesRuntime(vbase, txt.c_str(), json.c_str(),
                                               catalog.c_str());
           rex::ShutdownLogging();
-          ::TerminateProcess(::GetCurrentProcess(), 0u);
+          nhl::compat::HardExit(0u);
         }).detach();
       } else {
         std::fprintf(stderr, "[tunables-rt] no memory base; cannot scan\n");
@@ -894,7 +985,7 @@ class NhllegacyApp : public rex::ReXApp {
         // (Normal game runs are unaffected: this branch is only taken under
         // NHL_REPLAY_XTR.)
         rex::ShutdownLogging();
-        ::TerminateProcess(::GetCurrentProcess(), ok ? 0u : 1u);
+        nhl::compat::HardExit(ok ? 0u : 1u);
       });
     });
   }
@@ -984,6 +1075,101 @@ class NhllegacyApp : public rex::ReXApp {
     }
     REXLOG_ERROR("[nhl-replay] failed to write {}", out);
     return false;
+  }
+
+  // NHL_DUMP_RESOLVE=<hex addr>[,<hex addr>]  NHL_DUMP_RESOLVE_AT=<seconds>
+  // Dumps a resolve DESTINATION straight out of guest memory as a PNG,
+  // un-tiling it with the SDK's Xenos 2D tiled-address function. This is the
+  // ground truth the macOS EDRAM-fold investigation was missing: it shows what
+  // each individual resolve actually produced, separating the two per-pass
+  // resolves from the final 1280x720 "un-fold" resolve.
+  void DumpResolveTargets() {
+    const char* list = std::getenv("NHL_DUMP_RESOLVE");
+    if (!list || !*list) return;
+    auto* gs = static_cast<rex::graphics::GraphicsSystem*>(runtime()->graphics_system());
+    if (!gs || !gs->memory()) {
+      REXLOG_ERROR("[nhl-dumpres] no memory system");
+      return;
+    }
+    constexpr uint32_t kW = 1280, kH = 720;
+    std::vector<uint8_t> rgba(size_t(kW) * kH * 4);
+    for (const char* p = list; *p;) {
+      char* end = nullptr;
+      const uint32_t addr = uint32_t(std::strtoul(p, &end, 16));
+      if (end == p) break;
+      p = (*end == ',') ? end + 1 : end;
+      const uint8_t* base = gs->memory()->TranslatePhysical<const uint8_t*>(addr);
+      if (!base) {
+        REXLOG_ERROR("[nhl-dumpres] cannot translate 0x{:08X}", addr);
+        continue;
+      }
+      uint64_t sum = 0;
+      for (uint32_t y = 0; y < kH; ++y) {
+        for (uint32_t x = 0; x < kW; ++x) {
+          const int32_t off = rex::graphics::texture_util::GetTiledOffset2D(
+              int32_t(x), int32_t(y), kW, /*bytes_per_block_log2=*/2);
+          const uint8_t* src = base + off;
+          uint8_t* dst = rgba.data() + (size_t(y) * kW + x) * 4;
+          // Guest surfaces are big-endian 8888; take BGRA->RGBA.
+          dst[0] = src[2];
+          dst[1] = src[1];
+          dst[2] = src[0];
+          dst[3] = 255;
+          sum += (unsigned(src[0]) + src[1] + src[2]) / 3u;
+        }
+      }
+      char name[64];
+      std::snprintf(name, sizeof(name), "resolve_%08X.png", addr);
+      const std::string out = (rex::filesystem::GetExecutableFolder() / name).string();
+      if (nhl::replay::WritePng(out, kW, kH, rgba.data())) {
+        REXLOG_INFO("[nhl-dumpres] wrote {} luma_mean={:.1f}", out,
+                    double(sum) / (double(kW) * kH));
+      }
+    }
+  }
+
+  // Captures the currently presented guest frame to <exe dir>/<filename>.
+  // Same RawImage -> tight RGBA repack as the replay screenshot path.
+  bool CaptureFrameToPng(const char* filename) {
+    auto* gs = static_cast<rex::graphics::GraphicsSystem*>(runtime()->graphics_system());
+    auto* presenter = gs ? gs->presenter() : nullptr;
+    if (!presenter) {
+      REXLOG_ERROR("[nhl-shot] no presenter available");
+      return false;
+    }
+    rex::ui::RawImage img;
+    if (!presenter->CaptureGuestOutput(img) || img.width == 0 || img.height == 0) {
+      REXLOG_ERROR("[nhl-shot] CaptureGuestOutput failed/empty ({}x{})", img.width, img.height);
+      return false;
+    }
+    std::vector<uint8_t> rgba(static_cast<size_t>(img.width) * img.height * 4);
+    // Also compute a coarse "is this actually a picture?" signal, so the log
+    // alone distinguishes a real frame from an all-black or uniform buffer.
+    uint64_t sum = 0;
+    uint8_t lo = 255, hi = 0;
+    for (uint32_t y = 0; y < img.height; ++y) {
+      for (uint32_t x = 0; x < img.width; ++x) {
+        const uint8_t* s = img.data.data() + static_cast<size_t>(y) * img.stride + x * 4;
+        uint8_t* d = rgba.data() + (static_cast<size_t>(y) * img.width + x) * 4;
+        d[0] = s[0];
+        d[1] = s[1];
+        d[2] = s[2];
+        d[3] = 255;
+        const uint8_t lum = static_cast<uint8_t>((s[0] + s[1] + s[2]) / 3);
+        sum += lum;
+        lo = std::min(lo, lum);
+        hi = std::max(hi, lum);
+      }
+    }
+    const double mean = double(sum) / (double(img.width) * img.height);
+    const std::string out = (rex::filesystem::GetExecutableFolder() / filename).string();
+    if (!nhl::replay::WritePng(out, img.width, img.height, rgba.data())) {
+      REXLOG_ERROR("[nhl-shot] failed to write {}", out);
+      return false;
+    }
+    REXLOG_INFO("[nhl-shot] wrote {} ({}x{}) luma mean={:.1f} min={} max={}", out, img.width,
+                img.height, mean, lo, hi);
+    return true;
   }
 
   std::thread replay_thread_;

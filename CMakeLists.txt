@@ -12,6 +12,14 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 include(generated/rexglue.cmake)
 
 # Sources
+#
+# macOS/Linux build a reduced set. The Windows list below is unchanged; the
+# non-Windows list is defined separately in the else() branch rather than by
+# subtracting from this one, so the Windows build cannot regress. Cut on mac:
+# the D3D12 command processor + plume presenter (Windows RHI), the glslang
+# SPIR-V translator port (high-cut path C, reference-only), the .lib-linked
+# replay tools, and the Win32 hooks. See docs/macos-port.md.
+if(WIN32)
 set(NHLLEGACY_SOURCES
     src/main.cpp
     src/kernel_stubs.cpp
@@ -78,6 +86,42 @@ set(NHLLEGACY_SOURCES
     tools/replay/src/xtr_player.cpp
     tools/replay/src/image_dump.cpp
 )
+else()
+# Minimal non-Windows target: the recompiled guest + the SDK's Vulkan backend.
+# Everything here is either portable already or ported in this branch.
+set(NHLLEGACY_SOURCES
+    src/main.cpp
+    src/kernel_stubs.cpp
+    # User controller remapping (applied in the XamInputGetState override).
+    src/input_map.cpp
+    # Scripted SDL virtual gamepad for headless input testing (NHL_VPAD_SCRIPT).
+    src/vpad_script.cpp
+    # Guest-function hooks; supplies the movie-setup + plane-publish taps that
+    # drive the VP6 bridge below (sub_8277ABB8 / sub_8277CC98).
+    src/diag_hooks.cpp
+    # VP6 movie bridge: decodes the intro movies with host ffmpeg because the
+    # recompiled decoder's IDCT is wrong. Ported to posix_spawn in this branch.
+    src/vp6_bridge.cpp
+    src/present_grade_compat.cpp
+    # Same pattern as present_grade_compat: SDK cvars a stock 0.10.x build does
+    # not define (title-patch additions + D3D12-only cvars).
+    src/sdk_cvar_compat.cpp
+    src/union_device.cpp
+    src/loose_tree_device.cpp
+    src/injection_registry.cpp
+    # RunAnimScan / RunAnimDecode / WaitForAnimData, called unconditionally from
+    # NhllegacyApp::LaunchModule.
+    src/anim_decode.cpp
+    # Compiles to an empty rex_pin_pcores_if_hybrid() off-Windows, which keeps
+    # the unconditional call in nhllegacy_app.h::OnPreSetup link-clean.
+    src/cpu_affinity.cpp
+    # image_dump is portable. xtr_player is NOT: it parses traces with the SDK's
+    # rex/graphics/trace_protocol.h, which 0.10.x removed — so link the stub that
+    # reports NHL_REPLAY_XTR as unavailable until the parser is rebased.
+    tools/replay/src/xtr_player_unsupported.cpp
+    tools/replay/src/image_dump.cpp
+)
+endif()
 
 if(WIN32)
     add_executable(nhllegacy WIN32 ${NHLLEGACY_SOURCES})
@@ -91,7 +135,13 @@ rexglue_setup_target(nhllegacy)
 # a COMPILE-TIME option (REXGLUE_USE_VULKAN, OFF in the stock win-amd64 zips). When
 # CMAKE_PREFIX_PATH points at an SDK built with it ON, enable this to compile the
 # NHL_VK_BACKEND env gate (src/nhllegacy_app.h) and link the Vulkan graphics system.
-option(NHLLEGACY_VULKAN_BACKEND "Link the SDK's Vulkan ROV backend (needs an SDK built with REXGLUE_USE_VULKAN=ON)" OFF)
+# On non-Windows the SDK forces D3D12 off and Vulkan on, so the Vulkan backend is
+# not optional there — it is the only backend. Default it ON off-Windows.
+if(WIN32)
+    option(NHLLEGACY_VULKAN_BACKEND "Link the SDK's Vulkan ROV backend (needs an SDK built with REXGLUE_USE_VULKAN=ON)" OFF)
+else()
+    option(NHLLEGACY_VULKAN_BACKEND "Link the SDK's Vulkan ROV backend (needs an SDK built with REXGLUE_USE_VULKAN=ON)" ON)
+endif()
 if(NHLLEGACY_VULKAN_BACKEND)
     target_compile_definitions(nhllegacy PRIVATE NHL_HAVE_VULKAN_BACKEND=1)
     # Compiled ONLY in the Vulkan build dir — links the SDK's Vulkan backend symbols
@@ -113,6 +163,7 @@ endif()
 # nhllegacy so gpu/hooks/plume_present.cpp can drive an in-process plume swapchain
 # from the intercepted guest Present. Same add_subdirectory pattern proven by the
 # standalone gpu/smoke build.
+if(WIN32)
 add_subdirectory(third_party/plume ${CMAKE_BINARY_DIR}/plume_build)
 target_link_libraries(nhllegacy PRIVATE plume d3d12 dxgi dxguid)
 
@@ -195,6 +246,32 @@ target_link_libraries(nhllegacy PRIVATE
 # it so the beta backend's programmatic RenderDoc capture (NHL_BETA_RENDERDOC) can
 # bracket the takeover frame.
 target_include_directories(nhllegacy PRIVATE "${_rexsdk_lib}/../include/renderdoc")
+else()
+# Off-Windows the SDK is consumed from its source tree (REXSDK_DIR). Two of its
+# public headers include vendored third-party headers by bare name without
+# exporting the search path: rex/ui/style.h -> <imgui.h>, and
+# rex/graphics/pipeline/shader/spirv_builder.h -> <SPIRV/SpvBuilder.h>. Add the
+# SDK's own vendored copies so those resolve. (The Windows build gets glslang
+# from the FetchContent above instead.)
+target_include_directories(nhllegacy PRIVATE
+    "${REXSDK_DIR}/thirdparty/imgui"
+    "${REXSDK_DIR}/thirdparty/glslang"
+    "${REXSDK_DIR}/thirdparty/xxHash"
+    "${REXSDK_DIR}/thirdparty/sdl3/include")
+
+# snappy, for .xtr trace decompression in tools/replay. The Windows build links
+# the SDK's prebuilt snappy*.lib, but SDK 0.10.x no longer ships snappy at all,
+# so take it from the system package (brew install snappy).
+find_path(SNAPPY_INCLUDE_DIR snappy.h REQUIRED)
+find_library(SNAPPY_LIBRARY NAMES snappy REQUIRED)
+target_include_directories(nhllegacy PRIVATE "${SNAPPY_INCLUDE_DIR}")
+target_link_libraries(nhllegacy PRIVATE "${SNAPPY_LIBRARY}")
+
+# rexglue_setup_target() links only rex::runtime, but the graphics cvars
+# (vsync, draw_resolution_scale_*, readback_resolve, ...) and the Vulkan backend
+# classes we subclass live in rex::gpu-xenos, so link it directly.
+target_link_libraries(nhllegacy PRIVATE rex::gpu-xenos)
+endif()  # WIN32: plume RHI + plume shaders + glslang/SPIRV + snappy + renderdoc
 
 # Runtime .dds -> .rx2 texture conversion: link the Rust static lib built from
 # nhl-database-studio/crates/tdb-rx2-ffi (reuses the proven tdb-rx2 format code
@@ -207,7 +284,7 @@ if(WIN32 AND EXISTS "${RX2FFI_LIB}")
     # Rust staticlib pulls in these Windows system libs.
     target_link_libraries(nhllegacy PRIVATE "${RX2FFI_LIB}"
         ntdll userenv ws2_32 dbghelp bcrypt advapi32)
-else()
+elseif(WIN32)
     message(WARNING "tdb-rx2-ffi not found at ${RX2FFI_LIB}; loose .dds texture "
                     "override disabled (build it: cargo build -p tdb-rx2-ffi --release)")
 endif()

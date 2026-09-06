@@ -3,9 +3,14 @@
 
 #include "anim_decode.h"
 
+// Uses only VirtualQuery + Sleep, both provided off-Windows by the shim.
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#else
+#include "win32_mem_compat.h"
+#endif
 
 #include <algorithm>
 #include <cstdarg>

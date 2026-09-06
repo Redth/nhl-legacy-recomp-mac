@@ -3,6 +3,9 @@
 
 #include "loose_tree_device.h"
 
+// The file itself uses only <filesystem>/<fstream>; the windows.h include is a
+// leftover, so it stays Windows-only rather than needing a POSIX equivalent.
+#ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -10,10 +13,12 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#endif
 
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <cstdlib>  // getenv, setenv
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -192,7 +197,9 @@ class LooseTreeEntry final : public fs::Entry {
         EndsWithCi(name_, ".big") && path().find("sticks") != std::string::npos) {
       static const std::string trace_out =
           (rex::filesystem::GetExecutableFolder() / "stick_caller_trace.txt").string();
+#ifdef _WIN32
       nhllegacy::CaptureStickCaller(path().c_str(), trace_out.c_str());
+#endif
     }
     // NHL_TRACE_TEXLIB_OPEN: capture the guest call chain when a player-stick
     // RENDER texture (rendering\playerstick\texlib_<N>.rx2) is opened. The
@@ -205,14 +212,20 @@ class LooseTreeEntry final : public fs::Entry {
         path().find("playerstick") != std::string::npos) {
       static const std::string trace_out =
           (rex::filesystem::GetExecutableFolder() / "texlib_caller_trace.txt").string();
+#ifdef _WIN32
       nhllegacy::CaptureStickCaller(path().c_str(), trace_out.c_str());
+#endif
     }
     // VP6 host-decode bridge: export the HOST path of every .vp6 the guest
     // opens so the bridge (src/vp6_bridge.cpp) can decode the same movie with
     // a host decoder. See docs/vp6-fork-investigation.md.
     if (EndsWithCi(name_, ".vp6")) {
+#ifdef _WIN32
       SetEnvironmentVariableA("NHL_VP6_LAST_OPEN_HOST",
                               host_.string().c_str());
+#else
+      ::setenv("NHL_VP6_LAST_OPEN_HOST", host_.string().c_str(), 1);
+#endif
     }
     // TEMP diagnostic: log .db opens so we can see which databases the game
     // loads (and when) and confirm a grown DB is served. Remove after testing.

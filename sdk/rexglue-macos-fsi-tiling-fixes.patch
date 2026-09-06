@@ -1,0 +1,1143 @@
+# ReXGlue SDK patch: macOS/MoltenVK fixes for the NHL Legacy predicated-tiling
+# 3D scene, plus an InputSystem data race that also affects Windows.
+# Base revision: rexglue-sdk main @ c94f5eb (v0.10.0).
+# Apply with:  git -C third_party/rexglue-sdk-main apply ../../sdk/rexglue-macos-fsi-tiling-fixes.patch
+#
+# Contents:
+#  - InputSystem: add a recursive mutex around device access. Without it any
+#    connected controller crashes (proven with ASan: free on a non-malloc'd
+#    address, freed by RefreshDevices). NOT macOS-specific.
+#  - gpu-xenos: default symbol visibility so consumers can subclass
+#    VulkanCommandProcessor off-Windows (145 symbols present, 0 exported).
+#  - REXGLUE_ROOT as a CACHE INTERNAL var so add_subdirectory consumers resolve
+#    the MoltenVK ICD path.
+#  - FSI 2x MSAA: write both guest samples from a single invocation. MoltenVK
+#    never delivers coverage for the second sample, so guest sample 1 was never
+#    written and the resolve averaged every pixel with stale EDRAM.
+#  - Signed viewport origin: the second tiling pass needs viewport x=-640 w=1280
+#    (a translation). Clamping to 0 gave w=640 ndc_scale=2, squashing the whole
+#    1280-wide scene into the 640-wide surface.
+#  - Suppress the FIRST tiling pass's colour clear only. MoltenVK will not order
+#    that compute clear before the next pass's fragment writes by any available
+#    means, so it lands on top of pass B's geometry.
+#  - Diagnostics behind env vars (REX_VP_LOG, REX_VP_INPUT_LOG,
+#    REX_CLEAR_DEBUG_COLOR, REX_RESOLVE_SAMPLE, ...) - all no-ops when unset.
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 9b3cdf5..abfeb3d 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -53,7 +53,12 @@ if (REXGLUE_ENABLE_FIDELITYFX AND
+ endif()
+ 
+ # Root of the SDK source tree
+-set(REXGLUE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
++# CACHE INTERNAL so it survives into the parent scope: consumers that pull the
++# SDK in with add_subdirectory() (the REXSDK_DIR path) call
++# _rexglue_stage_macos_vulkan_runtime() from their own directory scope, where a
++# plain set() is not visible — the macOS ICD staging then resolves to
++# "/cmake/MoltenVK_icd.json" and the POST_BUILD copy fails.
++set(REXGLUE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}" CACHE INTERNAL "ReXGlue SDK source root")
+ 
+ # SDK install support
+ include(GNUInstallDirs)
+diff --git a/include/rex/graphics/util/draw.h b/include/rex/graphics/util/draw.h
+index 3da182d..bc04a6a 100644
+--- a/include/rex/graphics/util/draw.h
++++ b/include/rex/graphics/util/draw.h
+@@ -10,6 +10,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <cstdlib>
+ #include <cmath>
+ #include <cstdint>
+ #include <utility>
+@@ -258,7 +259,13 @@ struct ViewportInfo {
+   // always bigger than maxViewportDimensions. All fractional offsetting,
+   // including the half-pixel offset, and cropping are handled via ndc_scale and
+   // ndc_offset.
+-  uint32_t xy_offset[2];
++  // Signed so the viewport origin can be negative (REX_SIGNED_VIEWPORT). Xenos
++  // predicated tiling gives the second tile pass a viewport starting at -640;
++  // clamping that to 0 forces an NDC squish (ndc_scale=2) instead of a plain
++  // translation, and on Metal that squished path renders incorrectly while the
++  // untranslated first pass is pixel-perfect. Vulkan permits a negative
++  // viewport origin within viewportBoundsRange.
++  int32_t xy_offset[2];
+   // Extent can be zero for an empty viewport - host APIs not supporting empty
+   // viewports need to use an empty scissor rectangle.
+   uint32_t xy_extent[2];
+@@ -511,6 +518,14 @@ struct ResolveInfo {
+   uint32_t rb_depth_clear;
+   uint32_t rb_color_clear;
+   uint32_t rb_color_clear_lo;
++  // True when this resolve belongs to the first predicated-tiling pass (the one
++  // with a zero PA_SC_WINDOW_OFFSET). Set in GetResolveInfo.
++  bool first_tile_pass = false;
++  // True only while a genuine TWO-pass tiling sequence is in flight (a
++  // window-offset second pass was seen recently). Without this, single-pass
++  // uses of a narrow surface - cutscenes - would also lose their clear and
++  // accumulate. Set in GetResolveInfo.
++  bool in_tiled_sequence = false;
+ 
+   bool IsCopyingDepth() const {
+     return rb_copy_control.copy_src_select >= xenos::kMaxColorRenderTargets;
+@@ -531,9 +546,108 @@ struct ResolveInfo {
+                                        uint32_t& group_count_x_out,
+                                        uint32_t& group_count_y_out) const;
+ 
+-  bool IsClearingDepth() const { return rb_copy_control.depth_clear_enable != 0; }
++  // REX_CLEAR_DEPTH_WITH_COLOR: NHL's predicated-tiling scene renders two
++  // 640-pitch halves that share BOTH the colour EDRAM (base 0) and the depth
++  // EDRAM (base tile 736). The colour resolve clears colour after each half,
++  // but nothing clears depth, so the second half depth-tests against the first
++  // half's depth for unrelated screen pixels; fragments that wrongly fail leave
++  // the freshly-cleared colour behind. This forces depth to be cleared whenever
++  // colour is, to confirm that mechanism.
++  bool IsClearingDepth() const {
++    if (rb_copy_control.depth_clear_enable != 0) {
++      return true;
++    }
++    // REX_CLEAR_TILE_DEPTH: the two predicated-tiling passes share one depth
++    // EDRAM range (base tile 736) and NOTHING ever clears it, so the second
++    // pass depth-tests against the first pass's depth for unrelated screen
++    // pixels and its fragments are wrongly rejected - leaving the first pass's
++    // colour visible as ghosting. Clearing depth on the tile colour resolve is
++    // safe: depth was already copied out by its own earlier resolve, so this
++    // cannot clobber a pending depth copy the way the colour clear does.
++    static const bool clear_tile_depth = std::getenv("REX_CLEAR_TILE_DEPTH") != nullptr;
++    if (clear_tile_depth && !IsCopyingDepth() &&
++        rb_copy_control.color_clear_enable != 0 && color_edram_info.pitch_tiles < 16) {
++      return true;
++    }
++    static const bool clear_depth_with_color =
++        std::getenv("REX_CLEAR_DEPTH_WITH_COLOR") != nullptr;
++    return clear_depth_with_color && !IsCopyingDepth() &&
++           rb_copy_control.color_clear_enable != 0;
++  }
+ 
+   bool IsClearingColor() const {
++    // REX_NO_RESOLVE_CLEAR: a resolve copies EDRAM out and then clears it. If
++    // the clear is not ordered after the copy, the copy returns the clear
++    // colour - which is exactly the flat-cyan half seen on macOS. Suppressing
++    // the clear tests that ordering (it is not a shippable fix: the next tile
++    // pass then inherits the previous pass's colour).
++    static const bool no_resolve_clear = std::getenv("REX_NO_RESOLVE_CLEAR") != nullptr;
++    if (no_resolve_clear) {
++      return false;
++    }
++    // REX_NO_TILE_RESOLVE_CLEAR: same idea, but ONLY for the narrow folded
++    // surfaces used by predicated tiling (pitch < a full 1280px row = 16 tiles
++    // of 80 samples). Suppressing every clear over-brightens the whole frame
++    // because full-screen targets stop being cleared too; restricting it to the
++    // tile passes keeps those correct while letting each tile's copy survive
++    // its own clear. The next tile pass then draws over the previous tile's
++    // colour, which the scene geometry covers.
++    static const bool no_tile_resolve_clear =
++        std::getenv("REX_NO_TILE_RESOLVE_CLEAR") != nullptr;
++    if (no_tile_resolve_clear && !IsCopyingDepth() && color_edram_info.pitch_tiles < 16) {
++      return false;
++    }
++    // REX_NO_FIRST_TILE_CLEAR: suppress ONLY the FIRST tile pass's colour clear
++    // (the one with no window offset). That clear is the one whose presence
++    // correlates with the striping, while the second pass's clear runs at the
++    // end of the frame and merely resets EDRAM for the next frame - keeping it
++    // avoids the cross-frame accumulation that suppressing both caused.
++    // ON by default. Only the FIRST pass's clear is harmful: it is the one that
++    // must land before the second pass's draws, and MoltenVK will not order it
++    // (proven with REX_CLEAR_DEBUG_COLOR - pass A's clear colour lands on top of
++    // pass B's geometry - and unfixable via REX_RESOLVE_SPLIT_SUBMIT,
++    // REX_STRONG_EDRAM_BARRIER, REX_FILL_ENCODER_SPLIT or REX_FILL_CLEAR).
++    // The SECOND pass's clear is kept: nothing reads EDRAM again until the next
++    // frame's first pass, so it cannot race, and it gives pass A a properly
++    // cleared surface. Suppressing both (REX_NO_TILE8_CLEAR) instead leaves
++    // BOTH passes compositing over stale colour, which washes the whole frame.
++    // Opt out with REX_KEEP_FIRST_TILE_CLEAR=1.
++    static const bool no_first_tile_clear =
++        std::getenv("REX_KEEP_FIRST_TILE_CLEAR") == nullptr;
++    // Scope: pitch_tiles == 8 is the 640px predicated-tiling scene surface.
++    // Shadow maps (4 and 10 tiles) and full-screen targets (16) are untouched,
++    // so only the tiling sequence loses its first-pass clear.
++    if (no_first_tile_clear && !IsCopyingDepth() && color_edram_info.pitch_tiles == 8 &&
++        first_tile_pass) {
++      return false;
++    }
++    // Suppress BOTH predicated-tiling passes' colour clears, scoped to the
++    // 640px scene surface. Forcing the clear to magenta showed the corrupt half
++    // IS the clear colour bleeding into the resolved image, and because the
++    // resolve averages the two MSAA samples a partial clear tints rather than
++    // replaces. Suppressing only pass A left pass B's clear to corrupt the next
++    // frame - the residual seam. The scene fills the screen, so carrying colour
++    // over between passes is largely invisible, and shadow maps (4/10 tiles) and
++    // full-screen targets (16) keep their clears.
++    // Set REX_KEEP_TILE8_CLEAR=1 to restore the (corrupting) clear.
++    // REX_NO_SECOND_TILE_CLEAR: suppress ONLY the second tiling pass's colour
++    // clear (the one with the window offset). Paired with
++    // REX_NO_FIRST_TILE_CLEAR this isolates WHICH clear corrupts pass B:
++    //  - pass A's clear landing late, after pass B's draws, or
++    //  - pass B's own clear landing early, before its own resolve copy.
++    static const bool no_second_tile_clear =
++        std::getenv("REX_NO_SECOND_TILE_CLEAR") != nullptr;
++    if (no_second_tile_clear && !IsCopyingDepth() && color_edram_info.pitch_tiles == 8 &&
++        !first_tile_pass) {
++      return false;
++    }
++    // Suppress BOTH tile passes' clears. Superseded by no_first_tile_clear
++    // above, which keeps pass B's clear and so avoids washing out pass A.
++    // Now opt-IN via REX_NO_TILE8_CLEAR=1.
++    static const bool no_tile8_clear = std::getenv("REX_NO_TILE8_CLEAR") != nullptr;
++    if (no_tile8_clear && !IsCopyingDepth() && color_edram_info.pitch_tiles == 8) {
++      return false;
++    }
+     return !IsCopyingDepth() && rb_copy_control.color_clear_enable != 0;
+   }
+ 
+@@ -551,8 +665,21 @@ struct ResolveInfo {
+     // k_16_16_16_16 blending emulation when using host render targets as it
+     // would be inconsistent with the usual way of clearing with a depth quad.
+     // TODO(Triang3l): Check which 32-bit portion is in which register.
+-    constants_out.rt_specific.clear_value[0] = rb_color_clear;
+-    constants_out.rt_specific.clear_value[1] = rb_color_clear_lo;
++    // REX_CLEAR_DEBUG_COLOR: force the tile clear to a distinctive magenta so it
++    // is obvious whether the streaks in the corrupted half ARE the clear colour
++    // showing through where pass B's geometry never covered.
++    // Set REX_CLEAR_DEBUG_COLOR=all to tint every colour clear, not just the
++    // 640px tiled scene surface.
++    static const char* clear_debug_env = std::getenv("REX_CLEAR_DEBUG_COLOR");
++    static const bool clear_debug_color = clear_debug_env != nullptr;
++    static const bool clear_debug_all = clear_debug_env && clear_debug_env[0] == 'a';
++    if (clear_debug_color && (clear_debug_all || color_edram_info.pitch_tiles == 8)) {
++      constants_out.rt_specific.clear_value[0] = 0xFFFF00FFu;
++      constants_out.rt_specific.clear_value[1] = 0xFFFF00FFu;
++    } else {
++      constants_out.rt_specific.clear_value[0] = rb_color_clear;
++      constants_out.rt_specific.clear_value[1] = rb_color_clear_lo;
++    }
+     constants_out.rt_specific.edram_info = color_edram_info;
+     constants_out.coordinate_info = coordinate_info;
+   }
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index 696ff48..7663865 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -204,6 +204,11 @@ class VulkanCommandProcessor : public CommandProcessor {
+   // scope. Submission must be open.
+   void EndRenderPass();
+ 
++  // Closes the current submission so that subsequent work lands in a separate
++  // command buffer. Used to enforce a hazard that a pipeline barrier alone does
++  // not enforce on some drivers (see the resolve copy/clear split).
++  void SplitSubmissionForHazard();
++
+   VkDescriptorSetLayout GetSingleTransientDescriptorLayout(
+       SingleTransientDescriptorLayout transient_descriptor_layout) const {
+     return descriptor_set_layouts_single_transient_[size_t(transient_descriptor_layout)];
+diff --git a/include/rex/graphics/vulkan/deferred_command_buffer.h b/include/rex/graphics/vulkan/deferred_command_buffer.h
+index 9d2a848..6ad2b5f 100644
+--- a/include/rex/graphics/vulkan/deferred_command_buffer.h
++++ b/include/rex/graphics/vulkan/deferred_command_buffer.h
+@@ -175,6 +175,18 @@ class DeferredCommandBuffer {
+     args.region_count = region_count;
+     return reinterpret_cast<VkBufferCopy*>(args_ptr + header_size);
+   }
++  // Transfer-stage buffer fill. Used for the EDRAM resolve clear on drivers
++  // where a compute-shader clear is not reliably ordered after the compute
++  // resolve copy that reads the same range (MoltenVK/Metal).
++  void CmdVkFillBuffer(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size, uint32_t data) {
++    auto& args = *reinterpret_cast<ArgsVkFillBuffer*>(
++        WriteCommand(Command::kVkFillBuffer, sizeof(ArgsVkFillBuffer)));
++    args.buffer = buffer;
++    args.offset = offset;
++    args.size = size;
++    args.data = data;
++  }
++
+   void CmdVkCopyBuffer(VkBuffer src_buffer, VkBuffer dst_buffer, uint32_t region_count,
+                        const VkBufferCopy* regions) {
+     std::memcpy(CmdCopyBufferEmplace(src_buffer, dst_buffer, region_count), regions,
+@@ -362,6 +374,7 @@ class DeferredCommandBuffer {
+     kVkClearAttachments,
+     kVkClearColorImage,
+     kVkCopyBuffer,
++    kVkFillBuffer,
+     kVkCopyBufferToImage,
+     kVkCopyQueryPoolResults,
+     kVkDispatch,
+@@ -467,6 +480,13 @@ class DeferredCommandBuffer {
+     static_assert(alignof(VkImageSubresourceRange) <= alignof(uintmax_t));
+   };
+ 
++  struct ArgsVkFillBuffer {
++    VkBuffer buffer;
++    VkDeviceSize offset;
++    VkDeviceSize size;
++    uint32_t data;
++  };
++
+   struct ArgsVkCopyBuffer {
+     VkBuffer src_buffer;
+     VkBuffer dst_buffer;
+diff --git a/include/rex/graphics/vulkan/render_target_cache.h b/include/rex/graphics/vulkan/render_target_cache.h
+index 34f7033..1924acf 100644
+--- a/include/rex/graphics/vulkan/render_target_cache.h
++++ b/include/rex/graphics/vulkan/render_target_cache.h
+@@ -19,6 +19,7 @@
+ 
+ #include <rex/graphics/flags.h>
+ #include <rex/graphics/pipeline/render_target/cache.h>
++#include <rex/graphics/util/draw.h>  // draw_util::ResolveClearShaderConstants
+ #include <rex/graphics/vulkan/shared_memory.h>
+ #include <rex/graphics/vulkan/texture_cache.h>
+ #include <rex/graphics/xenos.h>
+@@ -876,6 +877,28 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
+   VkRenderPass fsi_render_pass_ = VK_NULL_HANDLE;
+   Framebuffer fsi_framebuffer_;
+ 
++  // REX_DEFER_TILE_CLEAR: a resolve copies EDRAM out and then clears it. On
++  // MoltenVK the clear lands on top of its own copy no matter what barrier is
++  // used. The clear only has to happen before the NEXT tile pass draws, so it
++  // is recorded here and flushed from the draw path instead (see
++  // FlushPendingFsiClear).
++  struct PendingFsiClear {
++    bool valid = false;
++    bool clear_depth = false;
++    bool clear_color = false;
++    bool color_is_64bpp = false;
++    draw_util::ResolveClearShaderConstants depth_constants;
++    draw_util::ResolveClearShaderConstants color_constants;
++    std::pair<uint32_t, uint32_t> group_count{0, 0};
++  };
++  PendingFsiClear pending_fsi_clear_;
++
++ public:
++  // Performs a deferred resolve clear, if one is pending. Called from the draw
++  // path so the clear is separated from the copy it must not disturb.
++  void FlushPendingFsiClear();
++
++ private:
+   VkPipelineLayout resolve_fsi_clear_pipeline_layout_ = VK_NULL_HANDLE;
+   VkPipeline resolve_fsi_clear_32bpp_pipeline_ = VK_NULL_HANDLE;
+   VkPipeline resolve_fsi_clear_64bpp_pipeline_ = VK_NULL_HANDLE;
+diff --git a/include/rex/input/input_system.h b/include/rex/input/input_system.h
+index 1cb3faa..5527d5d 100644
+--- a/include/rex/input/input_system.h
++++ b/include/rex/input/input_system.h
+@@ -11,6 +11,7 @@
+  */
+ 
+ #include <memory>
++#include <mutex>
+ #include <vector>
+ 
+ #include <rex/input/device_assignment.h>
+@@ -65,6 +66,15 @@ class InputSystem : public system::IInputSystem {
+   // does not renumber pad two.
+   std::vector<DeviceInfo> devices_;
+   std::vector<InputDriver*> device_owners_;
++
++  // GetState/GetCapabilities/SetState/GetKeystroke each call RefreshDevices(),
++  // which rebuilds devices_/device_owners_. Guests poll from their own threads
++  // while a host UI (overlay, settings dialog) polls from the UI thread, so
++  // these run concurrently: without this lock the two racing RefreshDevices()
++  // calls reallocate the vectors under one another and corrupt the heap.
++  // Recursive because the public entry points lock and then call helpers that
++  // are also reachable directly.
++  mutable std::recursive_mutex devices_mutex_;
+ };
+ 
+ /// Create a default InputSystem with SDL + NOP drivers.
+diff --git a/include/rex/ui/vulkan/functions/device_1_0.inc b/include/rex/ui/vulkan/functions/device_1_0.inc
+index aa55a4a..42a1a98 100644
+--- a/include/rex/ui/vulkan/functions/device_1_0.inc
++++ b/include/rex/ui/vulkan/functions/device_1_0.inc
+@@ -14,6 +14,7 @@ XE_UI_VULKAN_FUNCTION(vkCmdClearAttachments)
+ XE_UI_VULKAN_FUNCTION(vkCmdClearColorImage)
+ XE_UI_VULKAN_FUNCTION(vkCmdCopyBuffer)
+ XE_UI_VULKAN_FUNCTION(vkCmdCopyBufferToImage)
++XE_UI_VULKAN_FUNCTION(vkCmdFillBuffer)
+ XE_UI_VULKAN_FUNCTION(vkCmdCopyImageToBuffer)
+ XE_UI_VULKAN_FUNCTION(vkCmdCopyQueryPoolResults)
+ XE_UI_VULKAN_FUNCTION(vkCmdDispatch)
+diff --git a/src/graphics/CMakeLists.txt b/src/graphics/CMakeLists.txt
+index 0d8f8af..6dc19af 100644
+--- a/src/graphics/CMakeLists.txt
++++ b/src/graphics/CMakeLists.txt
+@@ -101,8 +101,16 @@ add_library(rex::gpu-xenos ALIAS rexgpu-xenos)
+ 
+ set_target_properties(rexgpu-xenos PROPERTIES
+     EXPORT_NAME gpu-xenos
+-    CXX_VISIBILITY_PRESET hidden
+-    VISIBILITY_INLINES_HIDDEN ON
++    # nhl-legacy-recomp macOS port: hidden visibility makes the backend classes
++    # (VulkanCommandProcessor / VulkanGraphicsSystem) unlinkable off-Windows —
++    # their symbols are compiled into the dylib but not exported, so a consumer
++    # that subclasses them, as this title does, fails to link. There are no
++    # export annotations on those classes to opt them back in, and no
++    # WINDOWS_EXPORT_ALL_SYMBOLS equivalent applies here, so default visibility
++    # is the minimal fix. Upstream should annotate the public backend API
++    # instead and restore hidden visibility.
++    CXX_VISIBILITY_PRESET default
++    VISIBILITY_INLINES_HIDDEN OFF
+ )
+ 
+ target_include_directories(rexgpu-xenos PRIVATE
+diff --git a/src/graphics/pipeline/shader/spirv_translator.cpp b/src/graphics/pipeline/shader/spirv_translator.cpp
+index 1774f97..bf047c1 100644
+--- a/src/graphics/pipeline/shader/spirv_translator.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator.cpp
+@@ -9,6 +9,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <cstdlib>
+ #include <algorithm>
+ #include <cstddef>
+ #include <cstdint>
+@@ -57,7 +58,17 @@ SpirvShaderTranslator::Features::Features(const ui::vulkan::VulkanDevice* const
+           vulkan_device->properties().shaderSignedZeroInfNanPreserveFloat32),
+       denorm_flush_to_zero_float32(vulkan_device->properties().shaderDenormFlushToZeroFloat32),
+       rounding_mode_rte_float32(vulkan_device->properties().shaderRoundingModeRTEFloat32),
+-      fragment_shader_sample_interlock(vulkan_device->properties().fragmentShaderSampleInterlock),
++      // REX_NO_SAMPLE_INTERLOCK: with MSAA the FSI EDRAM read-modify-write
++      // relies on PER-SAMPLE raster ordering. MoltenVK maps fragment shader
++      // interlock onto Metal raster order groups, where per-sample ordering is
++      // far more exotic than per-pixel; on macOS the MSAA'd 3D scene is corrupt
++      // while non-MSAA surfaces are pixel-perfect, which fits sample interlock
++      // being the broken piece. Forcing this false makes the translator emit
++      // pixel interlock instead.
++      fragment_shader_sample_interlock(
++          std::getenv("REX_NO_SAMPLE_INTERLOCK")
++              ? false
++              : vulkan_device->properties().fragmentShaderSampleInterlock),
+       demote_to_helper_invocation(vulkan_device->properties().shaderDemoteToHelperInvocation),
+       sample_rate_shading(vulkan_device->properties().sampleRateShading) {
+   const uint32_t vulkan_api_version = vulkan_device->properties().apiVersion;
+diff --git a/src/graphics/pipeline/shader/spirv_translator_rb.cpp b/src/graphics/pipeline/shader/spirv_translator_rb.cpp
+index 765c141..16c1497 100644
+--- a/src/graphics/pipeline/shader/spirv_translator_rb.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator_rb.cpp
+@@ -1488,13 +1488,66 @@ void SpirvShaderTranslator::FSI_LoadSampleMask(spv::Id msaa_samples) {
+         builder_->createUnaryOp(spv::OpBitReverse, type_uint_, input_sample_mask_value),
+         builder_->makeUintConstant(32 - 2));
+   } else {
+-    // 0 and 3 to 0 and 1.
++    // 0 and 2 to 0 and 1 (Vulkan standard 4x order is TL, TR, BL, BR, so the
++    // top/bottom pair the Xenos 2x layout needs is host samples 0 and 2).
++    // REX_FSI_2X_BIT3=1 uses host sample 3 instead. Other places in this
++    // codebase (the pipeline sample mask 0b1001, the memexport "preferred
++    // sample", the alpha-to-coverage remap) name 3 as the pair for the 4x
++    // fallback, so this looked like an inconsistency - but it is NOT: testing
++    // bit 3 produces total garbage, while bit 2 is correct here. Kept only so
++    // the negative result is reproducible.
++    static const bool use_bit3 = std::getenv("REX_FSI_2X_BIT3") != nullptr;
+     sample_mask_2x = builder_->createQuadOp(
+         spv::OpBitFieldInsert, type_uint_, input_sample_mask_value,
+         builder_->createTriOp(spv::OpBitFieldUExtract, type_uint_, input_sample_mask_value,
+-                              const_uint_2, const_uint_1),
++                              use_bit3 ? builder_->makeUintConstant(3) : const_uint_2,
++                              const_uint_1),
+         const_uint_1, builder_->makeUintConstant(32 - 1));
+   }
++  // REX_FSI_2X_BOTH_SAMPLES: ignore the host coverage bits entirely and write
++  // BOTH guest samples wherever the pixel is covered at all.
++  //
++  // On MoltenVK the guest's second sample comes out never written (proven by
++  // resolving each guest sample alone: sample 1 is byte-identical stale EDRAM
++  // across frames), so the resolve averages every scene pixel with garbage.
++  // The 2x-as-4x scheme depends on gl_SampleMaskIn reporting host sample 2's
++  // coverage in a sample-rate invocation, which Metal does not deliver.
++  // Neither host sample 3 (REX_FSI_2X_BIT3) nor real 2x MSAA
++  // (REX_FSI_NATIVE_2X) fixes it - both render garbage - so instead stop
++  // depending on the per-sample coverage at all.
++  //
++  // Cost: both guest samples get the same value, so guest 2x MSAA is
++  // effectively 1x. The resolve averages two identical samples, which is
++  // exactly the un-antialiased image, and no stale EDRAM can leak in.
++  // ON by default. Set REX_FSI_2X_HOST_COVERAGE=1 to trust the host coverage
++  // bits again (correct on desktop Vulkan, broken under MoltenVK).
++  static const bool both_samples =
++      std::getenv("REX_FSI_2X_HOST_COVERAGE") == nullptr;
++  if (both_samples) {
++    spv::Id write_this_invocation =
++        builder_->createBinOp(spv::OpINotEqual, type_bool_,
++                              builder_->createBinOp(spv::OpBitwiseAnd, type_uint_,
++                                                    input_sample_mask_value,
++                                                    builder_->makeUintConstant(0xF)),
++                              builder_->makeUintConstant(0));
++    // This shader runs at SAMPLE rate (4 invocations per pixel in the 2x-as-4x
++    // scheme), and the EDRAM write is a read-modify-write that BLENDS. If every
++    // invocation wrote both guest samples, an alpha-blended fragment would be
++    // blended in four times instead of once, over-brightening the whole scene.
++    // Restrict the write to the first invocation.
++    if (input_sample_id_ != spv::NoResult) {
++      write_this_invocation = builder_->createBinOp(
++          spv::OpLogicalAnd, type_bool_, write_this_invocation,
++          builder_->createBinOp(
++              spv::OpIEqual, type_bool_,
++              builder_->createUnaryOp(spv::OpBitcast, type_uint_,
++                                      builder_->createLoad(input_sample_id_, spv::NoPrecision)),
++              builder_->makeUintConstant(0)));
++    }
++    sample_mask_2x = builder_->createTriOp(spv::OpSelect, type_uint_, write_this_invocation,
++                                           builder_->makeUintConstant(0b11),
++                                           builder_->makeUintConstant(0));
++  }
+   builder_->createBranch(&block_msaa_merge);
+ 
+   // 4x MSAA.
+diff --git a/src/graphics/util/draw.cpp b/src/graphics/util/draw.cpp
+index 305380e..d02257f 100644
+--- a/src/graphics/util/draw.cpp
++++ b/src/graphics/util/draw.cpp
+@@ -9,6 +9,8 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <atomic>
++#include <cstdlib>
+ #include <algorithm>
+ #include <cmath>
+ 
+@@ -161,6 +163,20 @@ bool IsPixelShaderNeededWithRasterization(const Shader& shader, const RegisterFi
+   return false;
+ }
+ 
++// REX_FSI_FOLD: NHL's 3D scene uses a 640-pitch EDRAM surface for a 1280-wide
++// image (the Xenos "fold"). The two halves are drawn INTERLEAVED many times per
++// frame into the same EDRAM base, which can only work if they land on different
++// EDRAM addresses: with pitch_tiles=8, a fragment at screen x in [640,1280) has
++// tile_x in [8,16), and tile_y*8 + tile_x lands in the FOLLOWING tile row.
++// That fold requires UN-OFFSET fragment coordinates - applying
++// PA_SC_WINDOW_OFFSET to the vertices collapses both halves onto x in [0,640)
++// so they overwrite each other. Skip the window offset (and the surface-pitch
++// scissor clamp) so the fold happens naturally.
++static bool RexFsiFoldEnabled() {
++  static const bool enabled = std::getenv("REX_FSI_FOLD") != nullptr;
++  return enabled;
++}
++
+ void GetHostViewportInfo(const RegisterFile& regs, uint32_t draw_resolution_scale_x,
+                          uint32_t draw_resolution_scale_y, bool origin_bottom_left, uint32_t x_max,
+                          uint32_t y_max, bool allow_reverse_z,
+@@ -317,7 +333,7 @@ void GetHostViewportInfo(const RegisterFile& regs, uint32_t draw_resolution_scal
+   // precision, separately so it can be used in other integer calculations
+   // without double rounding if needed.
+   float offset_add_xy[2] = {};
+-  if (pa_su_sc_mode_cntl.vtx_window_offset_enable) {
++  if (pa_su_sc_mode_cntl.vtx_window_offset_enable && !RexFsiFoldEnabled()) {
+     auto pa_sc_window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+     offset_add_xy[0] += float(pa_sc_window_offset.window_x_offset);
+     offset_add_xy[1] += float(pa_sc_window_offset.window_y_offset);
+@@ -378,12 +394,45 @@ void GetHostViewportInfo(const RegisterFile& regs, uint32_t draw_resolution_scal
+       float scale_axis = scale_xy[i];
+       float scale_axis_abs = std::abs(scale_xy[i]);
+       float axis_max_unscaled_float = float(xy_max_unscaled[i]);
+-      uint32_t axis_0_int =
+-          uint32_t(rex::clamp_float(offset_axis - scale_axis_abs, 0.0f, axis_max_unscaled_float));
+-      uint32_t axis_1_int =
+-          uint32_t(rex::clamp_float(offset_axis + scale_axis_abs, 0.0f, axis_max_unscaled_float));
+-      uint32_t axis_extent_int = axis_1_int - axis_0_int;
+-      viewport_info_out.xy_offset[i] = axis_0_int * axis_resolution_scale;
++      // Allow a negative viewport origin instead of clamping it to 0. Clamping
++      // is what turns the second predicated-tiling pass into an NDC squish
++      // (scale=2) rather than a translation; see the ViewportInfo::xy_offset
++      // comment. ON by default - verified with REX_VP_INPUT_LOG/REX_VP_LOG:
++      // the guest sets vtx_window_offset_enable=1 with window_x_offset=-640, so
++      // pass B wants viewport x=-640 w=1280 ndc_scale=1 (a pure translation).
++      // Clamping the origin to 0 instead yields x=0 w=640 ndc_scale=2, which
++      // horizontally SQUASHES the whole 1280-wide scene into the 640-wide
++      // surface. Set REX_NO_SIGNED_VIEWPORT=1 to restore the old clamping.
++      static const bool signed_viewport =
++          std::getenv("REX_NO_SIGNED_VIEWPORT") == nullptr;
++      const float axis_min_unscaled_float = signed_viewport ? -axis_max_unscaled_float : 0.0f;
++      int32_t axis_0_int = int32_t(
++          rex::clamp_float(offset_axis - scale_axis_abs, axis_min_unscaled_float,
++                           axis_max_unscaled_float));
++      int32_t axis_1_int = int32_t(
++          rex::clamp_float(offset_axis + scale_axis_abs, axis_min_unscaled_float,
++                           axis_max_unscaled_float));
++      uint32_t axis_extent_int = uint32_t(axis_1_int - axis_0_int);
++      // REX_VP_INPUT_LOG: the inputs that decide whether the second
++      // predicated-tiling pass translates or squishes.
++      static const bool vp_input_log = std::getenv("REX_VP_INPUT_LOG") != nullptr;
++      if (vp_input_log && i == 0) {
++        auto wo_dbg = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
++        if (int32_t(wo_dbg.window_x_offset) != 0) {
++          static int32_t last_logged = INT32_MIN;
++          if (axis_0_int != last_logged) {
++            last_logged = axis_0_int;
++            REXGPU_INFO(
++                "[rex-vpin] win_x={} vtx_window_offset_enable={} offset_base={} "
++                "offset_add={} scale={} -> axis_0={} axis_1={} max={} signed={}",
++                int32_t(wo_dbg.window_x_offset),
++                uint32_t(pa_su_sc_mode_cntl.vtx_window_offset_enable), offset_base_xy[0],
++                offset_add_xy[0], scale_xy[0], axis_0_int, axis_1_int,
++                axis_max_unscaled_float, signed_viewport ? 1 : 0);
++          }
++        }
++      }
++      viewport_info_out.xy_offset[i] = axis_0_int * int32_t(axis_resolution_scale);
+       viewport_info_out.xy_extent[i] = axis_extent_int * axis_resolution_scale;
+       float ndc_scale_axis;
+       float ndc_offset_axis;
+@@ -407,6 +456,23 @@ void GetHostViewportInfo(const RegisterFile& regs, uint32_t draw_resolution_scal
+       }
+       ndc_scale[i] = ndc_scale_axis;
+       ndc_offset[i] = ndc_offset_axis;
++      // REX_VP_NDC_SHIFT: express a negative viewport origin as an NDC
++      // translation instead, leaving the host viewport origin at 0.
++      //
++      // The second predicated-tiling pass legitimately wants origin -640 (see
++      // the signed-viewport comment above). A negative VkViewport.x is valid
++      // Vulkan, but Metal's MTLViewport originX is not normally negative, so
++      // MoltenVK may not carry it through to rasterization the way it does to
++      // the vertex transform. Since
++      //     pixel = origin + (ndc * 0.5 + 0.5) * extent,
++      // setting origin to 0 and adding 2*origin/extent to the NDC offset is
++      // exactly equivalent, and keeps the host viewport in the positive
++      // quarter-plane. The scissor still selects the surface region.
++      static const bool vp_ndc_shift = std::getenv("REX_VP_NDC_SHIFT") != nullptr;
++      if (vp_ndc_shift && axis_0_int < 0 && axis_extent_int) {
++        ndc_offset[i] += 2.0f * float(axis_0_int) / float(axis_extent_int);
++        viewport_info_out.xy_offset[i] = 0;
++      }
+     }
+ 
+     // Z.
+@@ -537,7 +603,7 @@ void GetScissor(const RegisterFile& regs, Scissor& scissor_out, bool clamp_to_su
+   auto pa_sc_window_scissor_br = regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
+   int32_t br_x = int32_t(pa_sc_window_scissor_br.br_x);
+   int32_t br_y = int32_t(pa_sc_window_scissor_br.br_y);
+-  if (!pa_sc_window_scissor_tl.window_offset_disable) {
++  if (!pa_sc_window_scissor_tl.window_offset_disable && !RexFsiFoldEnabled()) {
+     auto pa_sc_window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+     tl_x += pa_sc_window_offset.window_x_offset;
+     tl_y += pa_sc_window_offset.window_y_offset;
+@@ -552,7 +618,7 @@ void GetScissor(const RegisterFile& regs, Scissor& scissor_out, bool clamp_to_su
+   auto pa_sc_screen_scissor_br = regs.Get<reg::PA_SC_SCREEN_SCISSOR_BR>();
+   br_x = std::min(br_x, int32_t(pa_sc_screen_scissor_br.br_x));
+   br_y = std::min(br_y, int32_t(pa_sc_screen_scissor_br.br_y));
+-  if (clamp_to_surface_pitch) {
++  if (clamp_to_surface_pitch && !RexFsiFoldEnabled()) {
+     // Clamp the horizontal scissor to surface_pitch for safety, in case that's
+     // not done by the guest for some reason (it's not when doing draws without
+     // clipping in Direct3D 9, for instance), to prevent overflow - this is
+@@ -819,7 +885,7 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
+   auto pa_sc_window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+ 
+   // Apply the window offset to the vertices.
+-  if (regs.Get<reg::PA_SU_SC_MODE_CNTL>().vtx_window_offset_enable) {
++  if (regs.Get<reg::PA_SU_SC_MODE_CNTL>().vtx_window_offset_enable && !RexFsiFoldEnabled()) {
+     x0 += pa_sc_window_offset.window_x_offset;
+     y0 += pa_sc_window_offset.window_y_offset;
+     x1 += pa_sc_window_offset.window_x_offset;
+@@ -909,6 +975,24 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
+         static_cast<uint32_t>(rb_copy_control.copy_sample_select),
+         static_cast<uint32_t>(sample_select));
+   }
++  // REX_RESOLVE_SAMPLE0: take MSAA sample 0 instead of averaging 0 and 1 for
++  // colour resolves. Diagnostic for the tiled-scene washout: uniformly darkened
++  // interiors plus a thin outline on every geometry edge is the signature of a
++  // 2X resolve averaging a written sample with an unwritten one. If sample 0
++  // alone comes out correct, only one sample is actually being written.
++  // REX_RESOLVE_SAMPLE=0|1 picks that single guest sample instead.
++  static const char* resolve_sample_env = std::getenv("REX_RESOLVE_SAMPLE");
++  static const bool resolve_sample0 =
++      std::getenv("REX_RESOLVE_SAMPLE0") != nullptr ||
++      (resolve_sample_env && resolve_sample_env[0] == '0');
++  static const bool resolve_sample1 = resolve_sample_env && resolve_sample_env[0] == '1';
++  if (!is_depth) {
++    if (resolve_sample0) {
++      sample_select = xenos::CopySampleSelect::k0;
++    } else if (resolve_sample1) {
++      sample_select = xenos::CopySampleSelect::k1;
++    }
++  }
+   info_out.copy_dest_coordinate_info.copy_sample_select = sample_select;
+   // Get the format to pass to the shader in a unified way - for depth (for
+   // which Direct3D 9 specifies the k_8_8_8_8 uint destination format), make
+@@ -943,6 +1027,7 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
+   }
+ 
+   // Calculate the destination memory extent.
++  info_out.first_tile_pass = (pa_sc_window_offset.window_x_offset == 0);
+   uint32_t rb_copy_dest_base = regs[XE_GPU_REG_RB_COPY_DEST_BASE];
+   uint32_t copy_dest_base_adjusted = rb_copy_dest_base;
+   uint32_t copy_dest_extent_start, copy_dest_extent_end;
+@@ -963,12 +1048,27 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
+     uint32_t dest_base_relative_y_mask = (UINT32_C(1) << xenos::GetTextureTiledYBaseGranularityLog2(
+                                               bool(rb_copy_dest_info.copy_dest_array), bpp_log2)) -
+                                          1;
++    // In REX_FSI_FOLD mode the rect is deliberately left in UN-OFFSET screen
++    // space so the EDRAM source address folds past the surface pitch. The
++    // DESTINATION must not inherit that: the guest already encodes the tile's
++    // destination offset in RB_COPY_DEST_BASE (0x1AF1D000 == 0x1AF09000 +
++    // 640px), so using the un-offset x0 here would apply it twice. Re-apply the
++    // window offset for destination addressing only.
++    int32_t dest_x0 = x0;
++    int32_t dest_y0 = y0;
++    if (RexFsiFoldEnabled() &&
++        regs.Get<reg::PA_SU_SC_MODE_CNTL>().vtx_window_offset_enable) {
++      dest_x0 += pa_sc_window_offset.window_x_offset;
++      dest_y0 += pa_sc_window_offset.window_y_offset;
++      dest_x0 = std::max(dest_x0, 0);
++      dest_y0 = std::max(dest_y0, 0);
++    }
+     info_out.copy_dest_coordinate_info.offset_x_div_8 =
+-        (uint32_t(x0) & dest_base_relative_x_mask) >> xenos::kResolveAlignmentPixelsLog2;
++        (uint32_t(dest_x0) & dest_base_relative_x_mask) >> xenos::kResolveAlignmentPixelsLog2;
+     info_out.copy_dest_coordinate_info.offset_y_div_8 =
+-        (uint32_t(y0) & dest_base_relative_y_mask) >> xenos::kResolveAlignmentPixelsLog2;
+-    uint32_t dest_base_x = uint32_t(x0) & ~dest_base_relative_x_mask;
+-    uint32_t dest_base_y = uint32_t(y0) & ~dest_base_relative_y_mask;
++        (uint32_t(dest_y0) & dest_base_relative_y_mask) >> xenos::kResolveAlignmentPixelsLog2;
++    uint32_t dest_base_x = uint32_t(dest_x0) & ~dest_base_relative_x_mask;
++    uint32_t dest_base_y = uint32_t(dest_y0) & ~dest_base_relative_y_mask;
+     if (rb_copy_dest_info.copy_dest_array) {
+       // The base pointer is already adjusted to the Z / 8 (copy_dest_slice is
+       // 3-bit).
+@@ -1097,6 +1197,32 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
+   info_out.rb_color_clear = regs[XE_GPU_REG_RB_COLOR_CLEAR];
+   info_out.rb_color_clear_lo = regs[XE_GPU_REG_RB_COLOR_CLEAR_LO];
+ 
++  // Track whether a genuine two-pass tiling sequence is in flight. A resolve of
++  // a NARROW surface WITH a window offset is the second tiling pass; seeing one
++  // arms the flag for the next first-pass resolve (the next frame's pass A) and
++  // it decays, so single-pass uses of a narrow surface (cutscenes) keep their
++  // clear. Placed here because color_edram_info is only populated above.
++  {
++    // Keyed on the SURFACE PITCH, because other narrow surfaces in the frame
++    // (shadow maps at 4 and 10 tiles) also resolve with no window offset and
++    // would otherwise consume the credits before the scene's pass-A resolve.
++    static std::atomic<uint32_t> armed_pitch{0};
++    static std::atomic<int> credits{0};
++    const uint32_t pitch_t = info_out.color_edram_info.pitch_tiles;
++    const bool narrow = pitch_t != 0 && pitch_t < 16;
++    if (narrow && pa_sc_window_offset.window_x_offset != 0) {
++      armed_pitch.store(pitch_t, std::memory_order_relaxed);
++      credits.store(3, std::memory_order_relaxed);
++    }
++    const bool same_surface = narrow && pitch_t == armed_pitch.load(std::memory_order_relaxed);
++    info_out.in_tiled_sequence =
++        same_surface && credits.load(std::memory_order_relaxed) > 0;
++    if (same_surface && pa_sc_window_offset.window_x_offset == 0 &&
++        info_out.in_tiled_sequence) {
++      credits.fetch_sub(1, std::memory_order_relaxed);
++    }
++  }
++
+   REXGPU_TRACE(
+       "Resolve: {},{} <= x,y < {},{}, {} -> {} at 0x{:08X} (potentially "
+       "modified memory range 0x{:08X} to 0x{:08X})",
+@@ -1119,8 +1245,15 @@ ResolveCopyShaderIndex ResolveInfo::GetCopyShader(uint32_t draw_resolution_scale
+   bool is_depth = IsCopyingDepth();
+   ResolveEdramInfo edram_info = is_depth ? depth_edram_info : color_edram_info;
+   bool source_is_64bpp = !is_depth && color_edram_info.format_is_64bpp != 0;
++  // REX_FORCE_FULL_RESOLVE: the "fast" resolve shaders do a bitwise single-sample
++  // copy walking EDRAM tiles directly. On MoltenVK the predicated-tiling scene
++  // (two 640-pitch halves folded into one EDRAM surface) comes out with per-tile
++  // block garbage; this routes colour resolves through the general "full"
++  // shaders instead to isolate the fast path. Depth still uses fast, since the
++  // full shaders are keyed on the colour destination format.
++  static const bool force_full_resolve = std::getenv("REX_FORCE_FULL_RESOLVE") != nullptr;
+   if (is_depth ||
+-      (!copy_dest_info.copy_dest_exp_bias &&
++      (!force_full_resolve && !copy_dest_info.copy_dest_exp_bias &&
+        xenos::IsSingleCopySampleSelected(copy_dest_coordinate_info.copy_sample_select) &&
+        xenos::IsColorResolveFormatBitwiseEquivalent(
+            xenos::ColorRenderTargetFormat(color_edram_info.format),
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 001f36b..b3b177c 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -3253,6 +3253,8 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+   in_render_pass_ = true;
+ }
+ 
++void VulkanCommandProcessor::SplitSubmissionForHazard() { EndSubmission(false); }
++
+ void VulkanCommandProcessor::EndRenderPass() {
+   assert_true(submission_open_);
+   if (!in_render_pass_) {
+@@ -3707,6 +3709,11 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+       return draw_fail("begin_submission");
+     }
+ 
++    // REX_DEFER_TILE_CLEAR: run any resolve clear deferred out of the resolve
++    // itself. Must be AFTER BeginSubmission - FlushPendingFsiClear ends the
++    // render pass, and EndRenderPass asserts an open submission.
++    render_target_cache_->FlushPendingFsiClear();
++
+     // Process primitives.
+     if (!primitive_processor_->Process(primitive_processing_result)) {
+       return draw_fail("primitive_processing");
+@@ -4393,11 +4400,48 @@ bool VulkanCommandProcessor::IssueCopy() {
+   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
+   if (readback_mode == ReadbackResolveMode::kDisabled) {
+     uint32_t written_address, written_length;
+-    return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
+-                                         written_address, written_length);
++    bool ok = render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
++                                            written_address, written_length);
++    // REX_WRITTEN_LOG: the range reported as GPU-written is what invalidates
++    // textures. NHL resolves two predicated-tiling halves into ONE destination
++    // texture, so if the second half's range is wrong the texture keeps a stale
++    // half - which is what the macOS corruption looks like.
++    static const bool written_log = std::getenv("REX_WRITTEN_LOG") != nullptr;
++    if (written_log) {
++      static uint64_t last_written_key = ~uint64_t(0);
++      const uint64_t k = (uint64_t(written_address) << 32) ^ written_length;
++      if (k != last_written_key) {
++        last_written_key = k;
++        REXGPU_INFO("[rex-written] ok={} address=0x{:08X} length=0x{:08X} (end=0x{:08X})", ok,
++                    written_address, written_length, written_address + written_length);
++      }
++    }
++    // REX_RESOLVE_SPLIT_SUBMIT: NHL's 3D scene renders two predicated-tiling
++    // halves into the SAME EDRAM range within one frame, so the second half's
++    // fragment writes must not begin until the first half's resolve has
++    // finished READING that range (a WAR hazard). Vulkan buffer barriers
++    // express this, but on MoltenVK/Metal one half always comes out corrupt.
++    // Closing the submission here puts the resolve and the next pass's draws in
++    // separate Metal command buffers, which execute in order on the queue.
++    static const bool split_submit = std::getenv("REX_RESOLVE_SPLIT_SUBMIT") != nullptr;
++    if (split_submit) {
++      EndSubmission(false);
++    }
++    return ok;
+   }
+ 
+-  return IssueCopy_ReadbackResolvePath();
++  // The readback path is the one this port actually takes (readback resolve is
++  // enabled), so the split above was dead code here. Pass A's colour clear is a
++  // compute dispatch into EDRAM that must complete before pass B's fragment
++  // draws touch the same range; proven necessary by REX_CLEAR_DEBUG_COLOR,
++  // which shows pass A's clear colour landing on top of pass B's geometry.
++  // Closing the submission puts them in separate Metal command buffers.
++  bool readback_ok = IssueCopy_ReadbackResolvePath();
++  static const bool split_submit_readback = std::getenv("REX_RESOLVE_SPLIT_SUBMIT") != nullptr;
++  if (split_submit_readback) {
++    EndSubmission(false);
++  }
++  return readback_ok;
+ }
+ 
+ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
+@@ -5703,6 +5747,30 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
+   scissor_rect.extent.height = scissor.extent[1];
+   SetScissor(scissor_rect);
+ 
++  // REX_VP_LOG: dump the host viewport + scissor + the NDC correction actually
++  // used, keyed on change. Needed to see where the second predicated-tiling
++  // pass's fragments land: the FSI path derives EDRAM addresses from
++  // gl_FragCoord, so if pass B is not translated into the 640-wide surface its
++  // addresses run past the pitch and wrap into the following tile rows.
++  static const bool vp_log = std::getenv("REX_VP_LOG") != nullptr;
++  if (vp_log) {
++    static uint64_t last_vp_key = ~uint64_t(0);
++    const uint64_t vp_key =
++        (uint64_t(uint32_t(viewport.x)) << 40) ^ (uint64_t(uint32_t(viewport.width)) << 20) ^
++        (uint64_t(uint32_t(scissor_rect.offset.x)) << 8) ^ uint64_t(scissor_rect.extent.width) ^
++        (uint64_t(std::bit_cast<uint32_t>(viewport_info.ndc_scale[0])) << 12) ^
++        (uint64_t(uint32_t(int32_t(pa_sc_window_offset.window_x_offset)) & 0xFFFF) << 44);
++    if (vp_key != last_vp_key) {
++      last_vp_key = vp_key;
++      REXGPU_INFO(
++          "[rex-vp] viewport x={} w={} | xy_offset={} | scissor x={} w={} | "
++          "ndc_scale.x={} ndc_offset.x={} | pa_sc_window_offset.x={}",
++          viewport.x, viewport.width, viewport_info.xy_offset[0], scissor_rect.offset.x,
++          scissor_rect.extent.width, viewport_info.ndc_scale[0], viewport_info.ndc_offset[0],
++          int32_t(pa_sc_window_offset.window_x_offset));
++    }
++  }
++
+   if (render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
+     // Depth bias.
+     float depth_bias_constant_factor, depth_bias_slope_factor;
+diff --git a/src/graphics/vulkan/deferred_command_buffer.cpp b/src/graphics/vulkan/deferred_command_buffer.cpp
+index b49e033..60d4e72 100644
+--- a/src/graphics/vulkan/deferred_command_buffer.cpp
++++ b/src/graphics/vulkan/deferred_command_buffer.cpp
+@@ -146,6 +146,11 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
+                                 rex::align(sizeof(ArgsVkCopyBuffer), alignof(VkBufferCopy))));
+       } break;
+ 
++      case Command::kVkFillBuffer: {
++        auto& args = *reinterpret_cast<const ArgsVkFillBuffer*>(stream);
++        dfn.vkCmdFillBuffer(command_buffer, args.buffer, args.offset, args.size, args.data);
++      } break;
++
+       case Command::kVkCopyBufferToImage: {
+         auto& args = *reinterpret_cast<const ArgsVkCopyBufferToImage*>(stream);
+         dfn.vkCmdCopyBufferToImage(
+diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
+index 0298f06..caf232c 100644
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -824,8 +824,19 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
+     // Pixel (fragment) shader interlock.
+ 
+     // Keep parity with D3D12 ROV, which uses 2x-as-4x in this path.
++    // REX_FSI_NATIVE_2X: use the device's real 2x MSAA instead. The 2x-as-4x
++    // fallback rasterizes 4 samples and relies on gl_SampleMaskIn coverage bits
++    // to pick out the two that stand in for the guest's samples; on MoltenVK
++    // guest sample 1 comes out never written, so the resolve averages the scene
++    // with stale EDRAM. Native 2x needs no coverage remapping at all, and this
++    // device reports framebufferNoAttachmentsSampleCounts { 1 | 2 | 4 }.
++    // Both the pipeline sample count and the shader's remap read this same
++    // flag, so they stay consistent.
++    static const bool fsi_native_2x = std::getenv("REX_FSI_NATIVE_2X") != nullptr;
+     msaa_2x_attachments_supported_ = false;
+-    msaa_2x_no_attachments_supported_ = false;
++    msaa_2x_no_attachments_supported_ =
++        fsi_native_2x &&
++        (device_properties.framebufferNoAttachmentsSampleCounts & VK_SAMPLE_COUNT_2_BIT) != 0;
+ 
+     // Blending is done in linear space directly in shaders.
+     gamma_render_target_as_unorm16_ = false;
+@@ -1302,6 +1313,31 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+   bool cleared = false;
+   bool clear_depth = resolve_info.IsClearingDepth();
+   bool clear_color = resolve_info.IsClearingColor();
++  // REX_SPLIT_RESOLVE_CLEAR: a resolve copies EDRAM out and then clears it.
++  // Both are compute dispatches on the same buffer with a pipeline barrier
++  // between them, but on MoltenVK/Metal the clear still lands on top of the
++  // copy - the resolved half comes back as the flat clear colour. Closing the
++  // submission here puts the copy and the clear in separate Metal command
++  // buffers, which the queue executes in order.
++  // REX_FILL_ENCODER_SPLIT: the resolve's clear (compute) must not land before
++  // its copy (compute) has read the same EDRAM range. Pipeline barriers do not
++  // enforce that on MoltenVK. A vkCmdFillBuffer is a TRANSFER op, which
++  // MoltenVK services with a blit encoder - forcing the compute encoder to end
++  // and a new one to begin, which IS a hard ordering boundary on Metal. Target
++  // the unused tail of the EDRAM buffer so the fill itself is harmless (the
++  // game uses ~7.45 MB of the 10 MB EDRAM).
++  static const bool fill_encoder_split =
++      std::getenv("REX_FILL_ENCODER_SPLIT") != nullptr;
++  if (fill_encoder_split && copied &&
++      (resolve_info.IsClearingColor() || resolve_info.IsClearingDepth())) {
++    command_processor_.SubmitBarriers(true);
++    VkBufferCopy tail_copy;
++    tail_copy.srcOffset = xenos::kEdramSizeBytes - 2 * sizeof(uint32_t);
++    tail_copy.dstOffset = xenos::kEdramSizeBytes - sizeof(uint32_t);
++    tail_copy.size = sizeof(uint32_t);
++    command_buffer.CmdVkCopyBuffer(edram_buffer_, edram_buffer_, 1, &tail_copy);
++    command_processor_.SubmitBarriers(true);
++  }
+   if (clear_depth || clear_color) {
+     switch (GetPath()) {
+       case Path::kHostRenderTargets: {
+@@ -1322,6 +1358,58 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+         cleared = true;
+       } break;
+       case Path::kPixelShaderInterlock: {
++        // REX_DEFER_TILE_CLEAR: record the clear and run it from the draw path
++        // instead (see FlushPendingFsiClear). The clear only needs to land
++        // before the next tile pass draws, and dispatching it here lets it
++        // clobber its own copy on MoltenVK.
++        static const bool defer_tile_clear = std::getenv("REX_DEFER_TILE_CLEAR") != nullptr;
++        if (defer_tile_clear && clear_color) {
++          // Defer ONLY the colour clear: it is the one that clobbers the colour
++          // copy. The depth clear cannot hurt the colour copy, and deferring it
++          // leaves the next pass depth-testing against stale depth, so let it
++          // run inline below.
++          FlushPendingFsiClear();  // never let two pile up
++          pending_fsi_clear_.valid = true;
++          pending_fsi_clear_.clear_depth = false;
++          pending_fsi_clear_.clear_color = true;
++          pending_fsi_clear_.color_is_64bpp =
++              resolve_info.color_edram_info.format_is_64bpp != 0;
++          if (clear_depth) {
++            resolve_info.GetDepthClearShaderConstants(pending_fsi_clear_.depth_constants);
++          }
++          if (clear_color) {
++            resolve_info.GetColorClearShaderConstants(pending_fsi_clear_.color_constants);
++          }
++          pending_fsi_clear_.group_count = resolve_info.GetClearShaderGroupCount(
++              draw_resolution_scale_x(), draw_resolution_scale_y());
++          {
++            // Log the clear extent against the surface it belongs to. For the
++            // 640-wide folded tile surface the clear must cover 640 px
++            // (groups.x == 10), NOT the unfolded 1280 (groups.x == 20) - a
++            // 1280-wide clear would run past the 8-tile pitch and wrap into the
++            // following tile rows, which is where the depth EDRAM lives.
++            static uint32_t last_key = 0xFFFFFFFFu;
++            const uint32_t pitch_t = uint32_t(resolve_info.color_edram_info.pitch_tiles);
++            const uint32_t key = (pitch_t << 16) ^
++                                 (pending_fsi_clear_.group_count.first << 8) ^
++                                 pending_fsi_clear_.group_count.second;
++            if (key != last_key) {
++              last_key = key;
++              REXGPU_INFO(
++                  "[rex-clearextent] pitch_tiles={} (px={}) width_div_8={} groups={}x{} "
++                  "base_tiles={} msaa={}",
++                  pitch_t, pitch_t * 80, uint32_t(resolve_info.coordinate_info.width_div_8),
++                  pending_fsi_clear_.group_count.first, pending_fsi_clear_.group_count.second,
++                  uint32_t(resolve_info.color_edram_info.base_tiles),
++                  uint32_t(resolve_info.color_edram_info.msaa_samples));
++            }
++          }
++          clear_color = false;  // handled later; depth (if any) still runs inline
++          if (!clear_depth) {
++            cleared = true;
++            break;
++          }
++        }
+         UseEdramBuffer(EdramBufferUsage::kComputeWrite);
+         // Should be safe to only commit once (if was accessed as unordered or
+         // with fragment shader interlock previously - if there was nothing to
+@@ -1344,6 +1432,33 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+           command_processor_.SubmitBarriers(true);
+           command_buffer.CmdVkDispatch(clear_group_count.first, clear_group_count.second, 1);
+         }
++        // REX_FILL_CLEAR: do the colour clear as a TRANSFER-stage buffer fill
++        // instead of a compute dispatch. A 32bpp solid clear writes the same
++        // dword to every sample, so a fill is exactly equivalent - and on
++        // MoltenVK a blit-encoder write is ordered against the compute resolve
++        // copy that reads the same range, which a compute-vs-compute barrier
++        // apparently is not.
++        static const bool fill_clear = std::getenv("REX_FILL_CLEAR") != nullptr;
++        if (clear_color && fill_clear && !resolve_info.color_edram_info.format_is_64bpp) {
++          // The enclosing case already declared kComputeWrite usage; a fill is a
++          // TRANSFER write, so re-declare it to get the right barrier.
++          UseEdramBuffer(EdramBufferUsage::kTransferWrite);
++          command_processor_.SubmitBarriers(true);
++          uint32_t span_base, span_row_len, span_rows, span_pitch;
++          resolve_info.GetCopyEdramTileSpan(span_base, span_row_len, span_rows, span_pitch);
++          constexpr uint32_t kTileBytes =
++              xenos::kEdramTileWidthSamples * xenos::kEdramTileHeightSamples * sizeof(uint32_t);
++          const uint32_t scale = draw_resolution_scale_x() * draw_resolution_scale_y();
++          for (uint32_t row = 0; row < span_rows; ++row) {
++            const uint64_t first_tile = uint64_t(span_base) + uint64_t(row) * span_pitch;
++            command_buffer.CmdVkFillBuffer(
++                edram_buffer_, first_tile * kTileBytes * scale,
++                uint64_t(span_row_len) * kTileBytes * scale, resolve_info.rb_color_clear);
++          }
++          MarkEdramBufferModified();
++          cleared = true;
++          break;
++        }
+         if (clear_color) {
+           command_processor_.BindExternalComputePipeline(
+               resolve_info.color_edram_info.format_is_64bpp ? resolve_fsi_clear_64bpp_pipeline_
+@@ -2131,6 +2246,51 @@ void VulkanRenderTargetCache::GetEdramBufferUsageMasks(EdramBufferUsage usage,
+   }
+ }
+ 
++void VulkanRenderTargetCache::FlushPendingFsiClear() {
++  if (!pending_fsi_clear_.valid) {
++    return;
++  }
++  PendingFsiClear pending = pending_fsi_clear_;
++  pending_fsi_clear_ = PendingFsiClear();
++  static uint32_t flush_count = 0;
++  if ((flush_count++ & 0x3FF) == 0) {
++    REXGPU_INFO("[rex-deferclear] flush #{} depth={} color={} groups={}x{}", flush_count,
++                pending.clear_depth, pending.clear_color, pending.group_count.first,
++                pending.group_count.second);
++  }
++  if (!pending.clear_depth && !pending.clear_color) {
++    return;
++  }
++  DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
++  // A compute dispatch cannot be recorded inside a render pass, and this runs
++  // from the draw path where one may already be open.
++  command_processor_.EndRenderPass();
++  UseEdramBuffer(EdramBufferUsage::kComputeWrite);
++  CommitEdramBufferShaderWrites();
++  command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
++                                         resolve_fsi_clear_pipeline_layout_, 0, 1,
++                                         &edram_storage_buffer_descriptor_set_, 0, nullptr);
++  if (pending.clear_depth) {
++    command_processor_.BindExternalComputePipeline(resolve_fsi_clear_32bpp_pipeline_);
++    command_buffer.CmdVkPushConstants(resolve_fsi_clear_pipeline_layout_,
++                                      VK_SHADER_STAGE_COMPUTE_BIT, 0,
++                                      sizeof(pending.depth_constants), &pending.depth_constants);
++    command_processor_.SubmitBarriers(true);
++    command_buffer.CmdVkDispatch(pending.group_count.first, pending.group_count.second, 1);
++  }
++  if (pending.clear_color) {
++    command_processor_.BindExternalComputePipeline(pending.color_is_64bpp
++                                                       ? resolve_fsi_clear_64bpp_pipeline_
++                                                       : resolve_fsi_clear_32bpp_pipeline_);
++    command_buffer.CmdVkPushConstants(resolve_fsi_clear_pipeline_layout_,
++                                      VK_SHADER_STAGE_COMPUTE_BIT, 0,
++                                      sizeof(pending.color_constants), &pending.color_constants);
++    command_processor_.SubmitBarriers(true);
++    command_buffer.CmdVkDispatch(pending.group_count.first, pending.group_count.second, 1);
++  }
++  MarkEdramBufferModified();
++}
++
+ void VulkanRenderTargetCache::UseEdramBuffer(EdramBufferUsage new_usage) {
+   if (edram_buffer_usage_ == new_usage) {
+     return;
+@@ -2139,6 +2299,23 @@ void VulkanRenderTargetCache::UseEdramBuffer(EdramBufferUsage new_usage) {
+   VkAccessFlags src_access_mask, dst_access_mask;
+   GetEdramBufferUsageMasks(edram_buffer_usage_, src_stage_mask, src_access_mask);
+   GetEdramBufferUsageMasks(new_usage, dst_stage_mask, dst_access_mask);
++  // REX_STRONG_EDRAM_BARRIER: a resolve reads EDRAM (copy) and then writes it
++  // (clear), which is a read->write (WAR) hazard. Metal's memory barriers are
++  // oriented around write->read, and MoltenVK appears not to enforce the WAR
++  // case - the clear lands on top of the copy and the resolved tile comes back
++  // as the flat clear colour. Advertising a write in the source access mask
++  // turns this into a write->write barrier, which Metal does honour.
++  static const bool strong_edram_barrier =
++      std::getenv("REX_STRONG_EDRAM_BARRIER") != nullptr;
++  if (strong_edram_barrier) {
++    // Heaviest barrier expressible: all-commands execution dependency with full
++    // memory read/write visibility. If MoltenVK honours any buffer barrier for
++    // the resolve copy -> resolve clear (read -> write) hazard, it honours this.
++    src_stage_mask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
++    dst_stage_mask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
++    src_access_mask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
++    dst_access_mask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
++  }
+   if (command_processor_.PushBufferMemoryBarrier(edram_buffer_, 0, VK_WHOLE_SIZE, src_stage_mask,
+                                                  dst_stage_mask, src_access_mask,
+                                                  dst_access_mask)) {
+diff --git a/src/input/input_system.cpp b/src/input/input_system.cpp
+index 813bb1c..55bf85a 100644
+--- a/src/input/input_system.cpp
++++ b/src/input/input_system.cpp
+@@ -79,6 +79,7 @@ void InputSystem::SetDeviceAssignment(std::unique_ptr<DeviceAssignment> assignme
+ }
+ 
+ void InputSystem::RefreshDevices() {
++  std::lock_guard<std::recursive_mutex> devices_guard(devices_mutex_);
+   std::vector<DeviceInfo> seen;
+   std::vector<InputDriver*> owners;
+   std::vector<DeviceInfo> enumerated;
+@@ -186,6 +187,7 @@ const DeviceInfo* InputSystem::DeviceInfoFor(DeviceId id) const {
+ 
+ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
+                                       X_INPUT_CAPABILITIES* out_caps) {
++  std::lock_guard<std::recursive_mutex> devices_guard(devices_mutex_);
+   SCOPE_profile_cpu_f("hid");
+   if (!out_caps || !assignment_) {
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+@@ -213,6 +215,7 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
+ }
+ 
+ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
++  std::lock_guard<std::recursive_mutex> devices_guard(devices_mutex_);
+   SCOPE_profile_cpu_f("hid");
+   if (!assignment_) {
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+@@ -252,6 +255,7 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+ }
+ 
+ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) {
++  std::lock_guard<std::recursive_mutex> devices_guard(devices_mutex_);
+   SCOPE_profile_cpu_f("hid");
+   if (!assignment_) {
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+@@ -294,6 +298,7 @@ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration
+ 
+ X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
+                                    X_INPUT_KEYSTROKE* out_keystroke) {
++  std::lock_guard<std::recursive_mutex> devices_guard(devices_mutex_);
+   SCOPE_profile_cpu_f("hid");
+   if (!assignment_) {
+     return X_ERROR_DEVICE_NOT_CONNECTED;

@@ -94,7 +94,12 @@ bool WritePng(const std::string& path, uint32_t width, uint32_t height, const ui
   WriteChunk(out, "IEND", {});
 
   FILE* f = nullptr;
+#ifdef _WIN32
   if (fopen_s(&f, path.c_str(), "wb") != 0 || !f) return false;
+#else
+  f = std::fopen(path.c_str(), "wb");
+  if (!f) return false;
+#endif
   const bool ok = fwrite(out.data(), 1, out.size(), f) == out.size();
   fclose(f);
   return ok;

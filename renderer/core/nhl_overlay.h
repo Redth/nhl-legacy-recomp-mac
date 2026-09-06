@@ -108,6 +108,14 @@ class NhlEnhancementsDialog : public rex::ui::ImGuiDialog {
   void FeedGamepadNav(ImGuiIO& io, const PadState& pad);
 
   // "Engine Tunables" section (live World-B constant editor).
+  // Controller remapping UI (see src/input_map.h).
+  void DrawControlsSection(const PadState& pad);
+  // Index into the guest-button list currently awaiting a physical press, or -1.
+  int rebind_target_ = -1;
+  // Physical buttons held when rebinding started, so the press that opened the
+  // capture is not itself captured.
+  uint16_t rebind_ignore_mask_ = 0;
+
   void DrawTunables();
   // Recompute filtered_ from the current search text + group selection.
   void RefreshTunableFilter();

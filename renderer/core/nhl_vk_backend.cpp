@@ -1,5 +1,6 @@
 #include "renderer/core/nhl_vk_backend.h"
 
+#include <atomic>
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
@@ -13,12 +14,16 @@
 #include <rex/logging.h>
 
 // Win32 keyboard poll for the F9 hotkey capture (declared directly to keep
-// <windows.h> out of this TU, mirroring the D3D12 path).
+// <windows.h> out of this TU, mirroring the D3D12 path). No off-Windows
+// equivalent is wired up yet, so the hotkey is simply never down there.
+#ifdef _WIN32
 extern "C" __declspec(dllimport) short __stdcall GetAsyncKeyState(int v_key);
+#endif
 
 namespace nhl::graphics {
 
 namespace {
+std::atomic<uint32_t> g_seq{0};
 std::mutex g_perf_mutex;
 NhlVkPerfSnapshot g_perf;
 }  // namespace
@@ -78,6 +83,88 @@ bool NhlVkCommandProcessor::IssueDraw(
                    exp_skip_blend_ || exp_skip_netlike_ || exp_noblend_ || exp_ref_on_ ||
                    exp_force_at_on_ || exp_skip_addr_ != 0;
     exp_resolved_ = true;
+  }
+
+  // NHL_VK_RTLOG: log the guest's render-surface geometry once per distinct
+  // configuration. The macOS port shows a hard corruption boundary at half the
+  // framebuffer width in the 3D scene, so we need to know the surface pitch,
+  // MSAA mode and scissor the guest actually programs.
+  if (rtlog_on_) {
+    const auto si = register_file_->Get<reg::RB_SURFACE_INFO>();
+    const auto tl = register_file_->Get<reg::PA_SC_WINDOW_SCISSOR_TL>();
+    const auto br = register_file_->Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
+    const auto wo = register_file_->Get<reg::PA_SC_WINDOW_OFFSET>();
+    const auto ci = register_file_->Get<reg::RB_COLOR_INFO>();
+    const uint32_t base_tiles =
+        uint32_t(ci.color_base) | (uint32_t(ci.color_base_bit_11) << 11);
+    const auto sc_key = register_file_->Get<reg::PA_SU_SC_MODE_CNTL>();
+    // NHL_VK_SEQLOG: ground truth on ordering - emit a sequence-numbered event
+    // whenever the tile pass changes, so it can be interleaved with the resolve
+    // events below and the real draw/resolve order can be read off directly.
+    if (seqlog_on_ && uint32_t(si.surface_pitch) == 640 &&
+        uint32_t(si.msaa_samples) == 1u) {
+      const auto ci_seq = register_file_->Get<reg::RB_COLOR_INFO>();
+      const auto di_seq = register_file_->Get<reg::RB_DEPTH_INFO>();
+      const uint32_t cbase = uint32_t(ci_seq.color_base) |
+                             (uint32_t(ci_seq.color_base_bit_11) << 11);
+      const uint32_t tl_x = uint32_t(tl.tl_x);
+      // Include the window offset: that is what actually distinguishes the two
+      // predicated-tiling passes, so keying without it merges them.
+      const uint32_t seq_key = tl_x ^ (cbase << 12) ^ (uint32_t(br.br_y) << 20) ^
+                               (uint32_t(int32_t(wo.window_x_offset) & 0xFFF) << 4);
+      if (seq_key != last_seq_tile_) {
+        last_seq_tile_ = seq_key;
+        REXLOG_INFO(
+            "[nhl-seq] {} DRAWS scissor=({},{})-({},{}) win_off=({},{}) cbase={} dbase={}",
+            ++g_seq, uint32_t(tl.tl_x), uint32_t(tl.tl_y), uint32_t(br.br_x),
+            uint32_t(br.br_y), int32_t(wo.window_x_offset), int32_t(wo.window_y_offset),
+            cbase, uint32_t(di_seq.depth_base));
+      }
+    }
+    const uint32_t key = (uint32_t(sc_key.vtx_window_offset_enable) << 30) ^
+                         (uint32_t(tl.window_offset_disable) << 29) ^
+                         (uint32_t(si.surface_pitch) << 8) ^
+                         (uint32_t(si.msaa_samples) << 4) ^
+                         (uint32_t(br.br_x) << 20) ^ uint32_t(br.br_y) ^
+                         (base_tiles << 3) ^ (uint32_t(wo.window_x_offset) << 12);
+    if (key != last_rt_key_) {
+      last_rt_key_ = key;
+      const auto sc = register_file_->Get<reg::PA_SU_SC_MODE_CNTL>();
+      REXLOG_INFO(
+          "[nhl-vk-rt] pitch={} msaa={} scissor=({},{})-({},{}) win_off=({},{}) "
+          "color_base_tiles={} depth_base_tiles={} depth_en={} depth_write={} "
+          "vtx_win_off_en={} scissor_win_off_dis={} msaa_en={}",
+          uint32_t(si.surface_pitch), uint32_t(si.msaa_samples), uint32_t(tl.tl_x),
+          uint32_t(tl.tl_y), uint32_t(br.br_x), uint32_t(br.br_y),
+          int32_t(wo.window_x_offset), int32_t(wo.window_y_offset), base_tiles,
+          uint32_t(register_file_->Get<reg::RB_DEPTH_INFO>().depth_base),
+          uint32_t(register_file_->Get<reg::RB_DEPTHCONTROL>().z_enable),
+          uint32_t(register_file_->Get<reg::RB_DEPTHCONTROL>().z_write_enable),
+          uint32_t(sc.vtx_window_offset_enable),
+          uint32_t(tl.window_offset_disable), uint32_t(sc.msaa_enable));
+    }
+  }
+
+  // NHL_VK_SKIP_TILE=A|B: the 3D scene renders as two 640-pitch predicated-
+  // tiling passes (tl_x 0 and 640) that are identical to the host. Rendering
+  // only one of them separates "this pass is intrinsically broken" from "the
+  // two passes interfere via the shared EDRAM".
+  if (skip_tile_ != 0) {
+    const auto si_t = register_file_->Get<reg::RB_SURFACE_INFO>();
+    if (uint32_t(si_t.surface_pitch) == 640 &&
+        uint32_t(si_t.msaa_samples) == 1u  /* MsaaSamples::k2X */) {
+      const auto tl_t = register_file_->Get<reg::PA_SC_WINDOW_SCISSOR_TL>();
+      const uint32_t tl_x = uint32_t(tl_t.tl_x);
+      if ((skip_tile_ == 'A' && tl_x == 0) || (skip_tile_ == 'B' && tl_x == 640)) {
+        ++skipped_draws_;
+        return true;
+      }
+    }
+  }
+
+  {
+    const auto si_d = register_file_->Get<reg::RB_SURFACE_INFO>();
+    last_draw_pitch_ = uint32_t(si_d.surface_pitch);
   }
 
   const auto cc = register_file_->Get<reg::RB_COLORCONTROL>();
@@ -172,6 +259,88 @@ bool NhlVkCommandProcessor::IssueDraw(
       primitive_type, index_count, index_buffer_info, major_mode_explicit);
 }
 
+// Resolve tap: NHL's 3D scene renders in two 640x720 EDRAM tiles that are
+// identical from the host's point of view (same base/pitch after the window
+// offset), so any left/right asymmetry in the final image has to come from the
+// resolve destination, not the rendering. Log the copy rect + dest to see it.
+bool NhlVkCommandProcessor::IssueCopy() {
+  if (rtlog_on_ && register_file_) {
+    const auto cc = register_file_->Get<rex::graphics::reg::RB_COPY_CONTROL>();
+    const uint32_t dest_base =
+        (*register_file_)[rex::graphics::XE_GPU_REG_RB_COPY_DEST_BASE];
+    const auto dest_pitch = register_file_->Get<rex::graphics::reg::RB_COPY_DEST_PITCH>();
+    const auto di = register_file_->Get<rex::graphics::reg::RB_COPY_DEST_INFO>();
+    const auto tl = register_file_->Get<rex::graphics::reg::PA_SC_WINDOW_SCISSOR_TL>();
+    const auto br = register_file_->Get<rex::graphics::reg::PA_SC_WINDOW_SCISSOR_BR>();
+    const auto wo = register_file_->Get<rex::graphics::reg::PA_SC_WINDOW_OFFSET>();
+    const auto si_pre = register_file_->Get<rex::graphics::reg::RB_SURFACE_INFO>();
+    // Log every resolve off the 640-pitch scene surface rather than a hardcoded
+    // set of destination addresses, which go stale as soon as the game moves
+    // its buffers.
+    if (seqlog_on_ && uint32_t(si_pre.surface_pitch) == 640) {
+      const auto si_c = si_pre;
+      REXLOG_INFO(
+          "[nhl-seq] {} RESOLVE dest=0x{:08X} src_sel={} sample_sel={} msaa={} "
+          "scissor=({},{})-({},{}) win_off={} clr_c={} clr_d={} depth_base={} src_pitch={}",
+          ++g_seq, dest_base, uint32_t(cc.copy_src_select),
+          uint32_t(cc.copy_sample_select), uint32_t(si_c.msaa_samples), uint32_t(tl.tl_x),
+          uint32_t(tl.tl_y), uint32_t(br.br_x), uint32_t(br.br_y),
+          int32_t(wo.window_x_offset), uint32_t(cc.color_clear_enable),
+          uint32_t(cc.depth_clear_enable),
+          uint32_t(register_file_->Get<rex::graphics::reg::RB_DEPTH_INFO>().depth_base),
+          uint32_t(si_c.surface_pitch));
+    }
+    const uint32_t key = dest_base ^ (uint32_t(tl.tl_x) << 3) ^
+                         (uint32_t(br.br_x) << 15) ^
+                         (uint32_t(dest_pitch.copy_dest_pitch) << 1);
+    if (key != last_copy_key_) {
+      last_copy_key_ = key;
+      REXLOG_INFO(
+          "[nhl-vk-copy] src_sel={} color_clear={} depth_clear={} cmd={} "
+          "dest_base=0x{:08X} dest_pitch={} dest_height={} "
+          "endian={} scissor=({},{})-({},{}) win_off=({},{})",
+          uint32_t(cc.copy_src_select), uint32_t(cc.color_clear_enable),
+          uint32_t(cc.depth_clear_enable), uint32_t(cc.copy_command), dest_base,
+          uint32_t(dest_pitch.copy_dest_pitch), uint32_t(dest_pitch.copy_dest_height),
+          uint32_t(di.copy_dest_endian), uint32_t(tl.tl_x), uint32_t(tl.tl_y),
+          uint32_t(br.br_x), uint32_t(br.br_y), int32_t(wo.window_x_offset),
+          int32_t(wo.window_y_offset));
+    }
+  }
+  // NHL_VK_COPY_BARRIER: the 3D scene renders as two 640x720 EDRAM tiles that
+  // share EDRAM base 0, so tile 1's draws overwrite exactly what tile 0's
+  // resolve must read. That needs a real read->write (WAR) barrier between
+  // them, and a write->read (RAW) barrier before each resolve. On MoltenVK one
+  // of the two tiles always comes out corrupt, and *which* one flips with
+  // render-pass handling, so force the render pass closed and flush pending
+  // barriers on both sides of the resolve.
+  if (copy_barrier_on_) {
+    EndRenderPass();
+    SubmitBarriers(/*force_end_render_pass=*/true);
+    const bool ok = VulkanCommandProcessor::IssueCopy();
+    EndRenderPass();
+    SubmitBarriers(/*force_end_render_pass=*/true);
+    return ok;
+  }
+  // NHL_VK_SKIP_UNFOLD: NHL's 3D scene renders in two 640-pitch EDRAM passes
+  // whose per-pass resolves already land in the two halves of the SAME
+  // destination texture (0x1AF1D000 == 0x1AF09000 + 0x14000 == +640px), so
+  // together they compose the finished frame. The guest then issues a THIRD
+  // resolve that re-reads the same EDRAM at pitch 1280 (the Xenos "un-fold")
+  // and overwrites the whole texture. On MoltenVK that un-fold produces the
+  // striped right half. Skipping it keeps the already-correct composition.
+  // Only fires when the preceding draws used the narrow folded surface, so the
+  // identical-looking full-screen resolve in menus is untouched.
+  if (skip_unfold_ && register_file_) {
+    const auto si_u = register_file_->Get<rex::graphics::reg::RB_SURFACE_INFO>();
+    if (uint32_t(si_u.surface_pitch) == 1280u && last_draw_pitch_ == 640u) {
+      last_draw_pitch_ = 0;  // one-shot per fold sequence
+      return true;
+    }
+  }
+  return VulkanCommandProcessor::IssueCopy();
+}
+
 void NhlVkCommandProcessor::PollHotkeyCapture() {
   if (!hotkey_checked_) {
     hotkey_checked_ = true;
@@ -203,7 +372,11 @@ void NhlVkCommandProcessor::PollHotkeyCapture() {
   if (!hotkey_enabled_) return;
 
   constexpr int kVkF9 = 0x78;
+#ifdef _WIN32
   const bool down = (GetAsyncKeyState(kVkF9) & 0x8000) != 0;
+#else
+  const bool down = false;
+#endif
   const bool rising = down && !hotkey_prev_down_;
   hotkey_prev_down_ = down;
   if (!rising) return;
@@ -214,12 +387,16 @@ void NhlVkCommandProcessor::PollHotkeyCapture() {
     const std::filesystem::path path = std::filesystem::path("gpu_trace") / dir;
     std::error_code ec;
     std::filesystem::create_directories(path, ec);
+#ifdef NHL_HAVE_SDK_TRACING
     BeginTracing(path);  // streaming starts on the next primary-buffer execute
+#endif
     hotkey_capturing_ = true;
     REXLOG_INFO("[nhl-cap] F9 capture BEGIN -> {}/ (frame {})", path.string(),
                 frames_total_);
   } else {
+#ifdef NHL_HAVE_SDK_TRACING
     EndTracing();
+#endif
     hotkey_capturing_ = false;
     REXLOG_INFO("[nhl-cap] F9 capture END (frame {}) -> gpu_trace/scene_{:02}/",
                 frames_total_, hotkey_capture_index_);

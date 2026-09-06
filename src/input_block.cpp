@@ -23,6 +23,7 @@
 #include <rex/system/kernel_state.h>  // REX_KERNEL_STATE
 
 #include "renderer/core/nhl_input_gate.h"
+#include "input_map.h"
 
 namespace {
 
@@ -53,7 +54,15 @@ u32 NhlXamInputGetState(u32 user_index, u32 flags,
 
   auto* is = static_cast<rex::input::InputSystem*>(
       REX_KERNEL_STATE()->emulator()->input_system());
-  return is->GetState(actual_user_index, input_state);
+  const uint32_t result = is->GetState(actual_user_index, input_state);
+  // User remapping is applied here rather than in the SDK so the host overlay's
+  // own controller navigation (which calls InputSystem::GetState directly) is
+  // unaffected by it.
+  if (result == kXErrorSuccess && input_state) {
+    rex::input::X_INPUT_STATE* st = input_state;
+    nhllegacy::ApplyInputMap(*st);
+  }
+  return result;
 }
 
 }  // namespace

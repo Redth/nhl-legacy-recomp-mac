@@ -1,5 +1,7 @@
 #include "renderer/core/nhl_overlay.h"
 
+#include "src/input_map.h"
+
 #include <imgui.h>
 
 #include <algorithm>
@@ -193,6 +195,11 @@ void NhlEnhancementsDialog::OnDraw(ImGuiIO& io) {
       } else {
         ImGui::TextDisabled("waiting for first 1s window...");
       }
+    }
+
+    // --- Controls (guest button remapping) ---
+    if (ImGui::CollapsingHeader("Controls")) {
+      DrawControlsSection(pad);
     }
 
     // --- Display ---
@@ -486,6 +493,99 @@ void NhlEnhancementsDialog::EnsureTunableIndex() {
 int NhlEnhancementsDialog::FindTunable(const char* name) const {
   auto it = tun_by_name_.find(name);
   return it == tun_by_name_.end() ? -1 : it->second;
+}
+
+// Controller remapping. The guest only understands an Xbox 360 pad, so each row
+// is "guest button <- physical button". Click Rebind, then press the physical
+// button you want to drive it.
+void NhlEnhancementsDialog::DrawControlsSection(const PadState& pad) {
+  using nhllegacy::CurrentInputMap;
+  using nhllegacy::GuestButton;
+  using nhllegacy::GuestButtonMask;
+  using nhllegacy::GuestButtonName;
+  using nhllegacy::kGuestButtonCount;
+
+  auto& map = CurrentInputMap();
+
+  ImGui::TextDisabled(pad.connected ? "Controller: connected"
+                                    : "Controller: none detected");
+  ImGui::TextDisabled(
+      "Rows read \"guest button <- physical button\". Press Rebind, then the "
+      "physical button to assign.");
+  ImGui::Separator();
+
+  // Capture: take the first managed physical button that went down after the
+  // rebind started (rebind_ignore_mask_ holds whatever was already down).
+  if (rebind_target_ >= 0) {
+    const uint16_t now = pad.buttons;
+    const uint16_t fresh = static_cast<uint16_t>(now & ~rebind_ignore_mask_);
+    rebind_ignore_mask_ = static_cast<uint16_t>(rebind_ignore_mask_ & now);
+    if (fresh) {
+      for (size_t i = 0; i < kGuestButtonCount; ++i) {
+        const uint16_t m = GuestButtonMask(static_cast<GuestButton>(i));
+        if (fresh & m) {
+          map.source[static_cast<size_t>(rebind_target_)] = m;
+          rebind_target_ = -1;
+          nhllegacy::SaveInputMap();
+          break;
+        }
+      }
+    }
+  }
+
+  if (ImGui::BeginTable("controls", 3, ImGuiTableFlags_SizingStretchProp)) {
+    for (size_t i = 0; i < kGuestButtonCount; ++i) {
+      const auto gb = static_cast<GuestButton>(i);
+      ImGui::TableNextRow();
+      ImGui::TableSetColumnIndex(0);
+      ImGui::Text("%s", GuestButtonName(gb));
+
+      ImGui::TableSetColumnIndex(1);
+      const uint16_t src = map.source[i];
+      const char* src_name = "(unbound)";
+      for (size_t j = 0; j < kGuestButtonCount; ++j) {
+        if (src == GuestButtonMask(static_cast<GuestButton>(j))) {
+          src_name = GuestButtonName(static_cast<GuestButton>(j));
+          break;
+        }
+      }
+      const bool held = src && (pad.buttons & src);
+      if (held) {
+        ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%s", src_name);
+      } else {
+        ImGui::Text("%s", src_name);
+      }
+
+      ImGui::TableSetColumnIndex(2);
+      ImGui::PushID(static_cast<int>(i));
+      if (rebind_target_ == static_cast<int>(i)) {
+        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "press a button...");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Cancel")) rebind_target_ = -1;
+      } else if (ImGui::SmallButton("Rebind")) {
+        rebind_target_ = static_cast<int>(i);
+        rebind_ignore_mask_ = pad.buttons;  // ignore what is already held
+      }
+      ImGui::PopID();
+    }
+    ImGui::EndTable();
+  }
+
+  ImGui::Separator();
+  bool dirty = false;
+  dirty |= ImGui::Checkbox("Swap sticks (southpaw)", &map.swap_sticks);
+  dirty |= ImGui::Checkbox("Invert left stick Y", &map.invert_left_y);
+  dirty |= ImGui::Checkbox("Invert right stick Y (camera)", &map.invert_right_y);
+  dirty |= ImGui::Checkbox("Swap triggers (LT/RT)", &map.swap_triggers);
+  if (dirty) nhllegacy::SaveInputMap();
+
+  if (ImGui::Button("Reset to defaults")) {
+    map.ResetToDefaults();
+    rebind_target_ = -1;
+    nhllegacy::SaveInputMap();
+  }
+  ImGui::SameLine();
+  ImGui::TextDisabled("saved to nhl_input_map.ini");
 }
 
 void NhlEnhancementsDialog::DrawTunables() {

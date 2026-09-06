@@ -21,7 +21,7 @@
 #include <cstring>
 #include <vector>
 
-#if defined(_WIN32)
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -29,11 +29,15 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+// These scanners need only VirtualQuery + Sleep, both provided off-Windows by
+// the shim, so the runtime-scan sections below are no longer Windows-only.
+#include "win32_mem_compat.h"
 #endif
 
 namespace nhllegacy {
 
-#if defined(_WIN32)
+// (runtime scanners: portable via win32_mem_compat.h off-Windows)
 
 // The 23 stick model IDs the picker currently shows (capture nhllegacy_055.log,
 // user-confirmed count). Any other selectable-list would still be dense in this
@@ -147,6 +151,6 @@ inline void ScanStickList(const uint8_t* vbase, const char* out_path) {
   if (out != stderr) std::fclose(out);
 }
 
-#endif  // _WIN32
+
 
 }  // namespace nhllegacy

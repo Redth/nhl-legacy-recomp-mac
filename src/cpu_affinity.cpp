@@ -15,6 +15,14 @@
 // Windows headers are confined to this TU (the widely-included nhllegacy_app.h
 // deliberately avoids <windows.h>); the app calls the plain extern below.
 
+// macOS/Linux: no equivalent of SetProcessDefaultCpuSets. Apple Silicon exposes
+// P/E cores through QoS classes rather than an affinity mask, and the recomp's
+// threads are created by the SDK, so there is nothing to pin here — the whole
+// TU compiles down to a no-op off-Windows and the app-side call is unchanged.
+#ifndef _WIN32
+void rex_pin_pcores_if_hybrid() {}
+#else
+
 #include <windows.h>
 
 #include <cstdio>
@@ -106,3 +114,5 @@ void rex_pin_pcores_if_hybrid() {
                  GetLastError());
   }
 }
+
+#endif  // !_WIN32

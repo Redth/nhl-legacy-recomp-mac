@@ -73,3 +73,7 @@
 
 # Vendored ReXGlue SDK (fetched + pinned + patched by scripts/setup_sdk.ps1)
 /third_party/rexglue-sdk/
+
+# macOS port: local build tree and extracted disc content (never commit game data)
+/build/
+/game/

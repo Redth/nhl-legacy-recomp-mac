@@ -35,7 +35,7 @@
 #include <vector>
 #include <string>
 
-#if defined(_WIN32)
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -43,6 +43,10 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+// These scanners need only VirtualQuery + Sleep, both provided off-Windows by
+// the shim, so the runtime-scan sections below are no longer Windows-only.
+#include "win32_mem_compat.h"
 #endif
 
 namespace nhllegacy {
@@ -257,7 +261,7 @@ done:
 // VA `a` -> host `vbase + a`; host `h` -> guest VA `(uint32_t)(h - vbase)`.
 // ---------------------------------------------------------------------------
 
-#if defined(_WIN32)
+// (runtime scanners: portable via win32_mem_compat.h off-Windows)
 // True if [vbase+gva, +len) is committed and readable.
 inline bool rt_readable(const uint8_t* vbase, uint32_t gva, size_t len) {
   const uint8_t* p = vbase + gva;
@@ -398,6 +402,6 @@ after_scan:
        total_hits, double(scanned_bytes) / (1024.0 * 1024.0));
   if (out != stderr) std::fclose(out);
 }
-#endif  // _WIN32
+
 
 }  // namespace nhllegacy

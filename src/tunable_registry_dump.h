@@ -440,7 +440,7 @@ inline void DumpTunableRegistry(const uint8_t* img, uint32_t base_va,
   }
 }
 
-#if defined(_WIN32)
+// (runtime scanners: portable via win32_mem_compat.h off-Windows)
 // ---------------------------------------------------------------------------
 // Runtime value resolution.
 //
@@ -643,6 +643,6 @@ inline void DumpTunableValuesRuntime(const uint8_t* vbase, const char* txt_path,
     }
   }
 }
-#endif  // _WIN32
+
 
 }  // namespace nhllegacy
