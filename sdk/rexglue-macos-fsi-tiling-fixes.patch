@@ -42,7 +42,7 @@ index 9b3cdf5..abfeb3d 100644
  # SDK install support
  include(GNUInstallDirs)
 diff --git a/include/rex/graphics/util/draw.h b/include/rex/graphics/util/draw.h
-index 3da182d..93b99e5 100644
+index 3da182d..5d71ae1 100644
 --- a/include/rex/graphics/util/draw.h
 +++ b/include/rex/graphics/util/draw.h
 @@ -10,6 +10,7 @@
@@ -83,7 +83,7 @@ index 3da182d..93b99e5 100644
  
    bool IsCopyingDepth() const {
      return rb_copy_control.copy_src_select >= xenos::kMaxColorRenderTargets;
-@@ -531,9 +546,125 @@ struct ResolveInfo {
+@@ -531,16 +546,150 @@ struct ResolveInfo {
                                         uint32_t& group_count_x_out,
                                         uint32_t& group_count_y_out) const;
  
@@ -171,8 +171,15 @@ index 3da182d..93b99e5 100644
 +    // cleared surface. Suppressing both (REX_NO_TILE8_CLEAR) instead leaves
 +    // BOTH passes compositing over stale colour, which washes the whole frame.
 +    // Opt out with REX_KEEP_FIRST_TILE_CLEAR=1.
++    // OFF by default now. This was a workaround for the second tiling pass
++    // failing to cover its surface, which let the first pass's clear colour
++    // show through. The real cause was the shared tile depth never being
++    // cleared (see IsClearingDepth); with that fixed the second pass covers
++    // 100% of its surface (measured 0.00% uncovered via REX_CLEAR_DEBUG_COLOR),
++    // so the clear can no longer bleed and suppressing it only cost correct
++    // blending. Re-enable with REX_NO_FIRST_TILE_CLEAR=1.
 +    static const bool no_first_tile_clear =
-+        std::getenv("REX_KEEP_FIRST_TILE_CLEAR") == nullptr;
++        std::getenv("REX_NO_FIRST_TILE_CLEAR") != nullptr;
 +    // Scope: pitch_tiles == 8 is the 640px predicated-tiling scene surface.
 +    // Shadow maps (4 and 10 tiles) and full-screen targets (16) are untouched,
 +    // so only the tiling sequence loses its first-pass clear.
@@ -210,7 +217,27 @@ index 3da182d..93b99e5 100644
      return !IsCopyingDepth() && rb_copy_control.color_clear_enable != 0;
    }
  
-@@ -551,8 +682,21 @@ struct ResolveInfo {
+   void GetDepthClearShaderConstants(ResolveClearShaderConstants& constants_out) const {
+     assert_true(IsClearingDepth());
+-    constants_out.rt_specific.clear_value[0] = rb_depth_clear;
+-    constants_out.rt_specific.clear_value[1] = rb_depth_clear;
++    uint32_t depth_clear_value = rb_depth_clear;
++    // REX_TILE_DEPTH_CLEAR=<hex>: override the value used for the synthetic
++    // tile depth clear. The guest never clears depth through a resolve, so
++    // RB_DEPTH_CLEAR holds whatever was last left there rather than a value
++    // chosen for this purpose; if it is not the far plane, the second tiling
++    // pass's distant geometry is still depth-rejected. For kD24S8 the EDRAM
++    // word is (depth24 << 8) | stencil, so far is 0xFFFFFF00.
++    static const char* depth_clear_env = std::getenv("REX_TILE_DEPTH_CLEAR");
++    if (depth_clear_env && rb_copy_control.depth_clear_enable == 0) {
++      depth_clear_value = uint32_t(std::strtoul(depth_clear_env, nullptr, 16));
++    }
++    constants_out.rt_specific.clear_value[0] = depth_clear_value;
++    constants_out.rt_specific.clear_value[1] = depth_clear_value;
+     constants_out.rt_specific.edram_info = depth_edram_info;
+     constants_out.coordinate_info = coordinate_info;
+   }
+@@ -551,8 +700,21 @@ struct ResolveInfo {
      // k_16_16_16_16 blending emulation when using host render targets as it
      // would be inconsistent with the usual way of clearing with a depth quad.
      // TODO(Triang3l): Check which 32-bit portion is in which register.
@@ -504,7 +531,7 @@ index 765c141..16c1497 100644
  
    // 4x MSAA.
 diff --git a/src/graphics/util/draw.cpp b/src/graphics/util/draw.cpp
-index 305380e..d02257f 100644
+index 305380e..152ef1f 100644
 --- a/src/graphics/util/draw.cpp
 +++ b/src/graphics/util/draw.cpp
 @@ -9,6 +9,8 @@
@@ -546,7 +573,7 @@ index 305380e..d02257f 100644
      auto pa_sc_window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
      offset_add_xy[0] += float(pa_sc_window_offset.window_x_offset);
      offset_add_xy[1] += float(pa_sc_window_offset.window_y_offset);
-@@ -378,12 +394,45 @@ void GetHostViewportInfo(const RegisterFile& regs, uint32_t draw_resolution_scal
+@@ -378,12 +394,56 @@ void GetHostViewportInfo(const RegisterFile& regs, uint32_t draw_resolution_scal
        float scale_axis = scale_xy[i];
        float scale_axis_abs = std::abs(scale_xy[i]);
        float axis_max_unscaled_float = float(xy_max_unscaled[i]);
@@ -568,12 +595,23 @@ index 305380e..d02257f 100644
 +      static const bool signed_viewport =
 +          std::getenv("REX_NO_SIGNED_VIEWPORT") == nullptr;
 +      const float axis_min_unscaled_float = signed_viewport ? -axis_max_unscaled_float : 0.0f;
-+      int32_t axis_0_int = int32_t(
++      // FLOOR, not truncate. int32_t() rounds toward zero, which the original
++      // code could rely on only because the result was clamped to >= 0 (see the
++      // "maxing with 0 is done anyway" comment above). Once a negative origin is
++      // allowed that invariant is gone: with the half-pixel offset the second
++      // tiling pass gets offset_axis = 0.5, so
++      //     axis_0 = 0.5 - 640 = -639.5  ->  -639 truncated, -640 floored
++      //     axis_1 = 0.5 + 640 =  640.5  ->   640
++      // giving a viewport 1279 wide at x=-639 instead of 1280 at -640. That
++      // half-pixel shift plus the 1280/1279 scale error puts pass B on a
++      // different rasterisation grid from pass A, which drops scattered single
++      // pixels across its half. Flooring keeps both passes on the same grid.
++      int32_t axis_0_int = int32_t(std::floor(
 +          rex::clamp_float(offset_axis - scale_axis_abs, axis_min_unscaled_float,
-+                           axis_max_unscaled_float));
-+      int32_t axis_1_int = int32_t(
++                           axis_max_unscaled_float)));
++      int32_t axis_1_int = int32_t(std::floor(
 +          rex::clamp_float(offset_axis + scale_axis_abs, axis_min_unscaled_float,
-+                           axis_max_unscaled_float));
++                           axis_max_unscaled_float)));
 +      uint32_t axis_extent_int = uint32_t(axis_1_int - axis_0_int);
 +      // REX_VP_INPUT_LOG: the inputs that decide whether the second
 +      // predicated-tiling pass translates or squishes.
@@ -598,7 +636,7 @@ index 305380e..d02257f 100644
        viewport_info_out.xy_extent[i] = axis_extent_int * axis_resolution_scale;
        float ndc_scale_axis;
        float ndc_offset_axis;
-@@ -407,6 +456,23 @@ void GetHostViewportInfo(const RegisterFile& regs, uint32_t draw_resolution_scal
+@@ -407,6 +467,23 @@ void GetHostViewportInfo(const RegisterFile& regs, uint32_t draw_resolution_scal
        }
        ndc_scale[i] = ndc_scale_axis;
        ndc_offset[i] = ndc_offset_axis;
@@ -622,7 +660,7 @@ index 305380e..d02257f 100644
      }
  
      // Z.
-@@ -537,7 +603,7 @@ void GetScissor(const RegisterFile& regs, Scissor& scissor_out, bool clamp_to_su
+@@ -537,7 +614,7 @@ void GetScissor(const RegisterFile& regs, Scissor& scissor_out, bool clamp_to_su
    auto pa_sc_window_scissor_br = regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
    int32_t br_x = int32_t(pa_sc_window_scissor_br.br_x);
    int32_t br_y = int32_t(pa_sc_window_scissor_br.br_y);
@@ -631,7 +669,7 @@ index 305380e..d02257f 100644
      auto pa_sc_window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
      tl_x += pa_sc_window_offset.window_x_offset;
      tl_y += pa_sc_window_offset.window_y_offset;
-@@ -552,7 +618,7 @@ void GetScissor(const RegisterFile& regs, Scissor& scissor_out, bool clamp_to_su
+@@ -552,7 +629,7 @@ void GetScissor(const RegisterFile& regs, Scissor& scissor_out, bool clamp_to_su
    auto pa_sc_screen_scissor_br = regs.Get<reg::PA_SC_SCREEN_SCISSOR_BR>();
    br_x = std::min(br_x, int32_t(pa_sc_screen_scissor_br.br_x));
    br_y = std::min(br_y, int32_t(pa_sc_screen_scissor_br.br_y));
@@ -640,7 +678,7 @@ index 305380e..d02257f 100644
      // Clamp the horizontal scissor to surface_pitch for safety, in case that's
      // not done by the guest for some reason (it's not when doing draws without
      // clipping in Direct3D 9, for instance), to prevent overflow - this is
-@@ -819,7 +885,7 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
+@@ -819,7 +896,7 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
    auto pa_sc_window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
  
    // Apply the window offset to the vertices.
@@ -649,7 +687,7 @@ index 305380e..d02257f 100644
      x0 += pa_sc_window_offset.window_x_offset;
      y0 += pa_sc_window_offset.window_y_offset;
      x1 += pa_sc_window_offset.window_x_offset;
-@@ -909,6 +975,24 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
+@@ -909,6 +986,24 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
          static_cast<uint32_t>(rb_copy_control.copy_sample_select),
          static_cast<uint32_t>(sample_select));
    }
@@ -674,7 +712,7 @@ index 305380e..d02257f 100644
    info_out.copy_dest_coordinate_info.copy_sample_select = sample_select;
    // Get the format to pass to the shader in a unified way - for depth (for
    // which Direct3D 9 specifies the k_8_8_8_8 uint destination format), make
-@@ -943,6 +1027,7 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
+@@ -943,6 +1038,7 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
    }
  
    // Calculate the destination memory extent.
@@ -682,7 +720,7 @@ index 305380e..d02257f 100644
    uint32_t rb_copy_dest_base = regs[XE_GPU_REG_RB_COPY_DEST_BASE];
    uint32_t copy_dest_base_adjusted = rb_copy_dest_base;
    uint32_t copy_dest_extent_start, copy_dest_extent_end;
-@@ -963,12 +1048,27 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
+@@ -963,12 +1059,27 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
      uint32_t dest_base_relative_y_mask = (UINT32_C(1) << xenos::GetTextureTiledYBaseGranularityLog2(
                                                bool(rb_copy_dest_info.copy_dest_array), bpp_log2)) -
                                           1;
@@ -714,7 +752,26 @@ index 305380e..d02257f 100644
      if (rb_copy_dest_info.copy_dest_array) {
        // The base pointer is already adjusted to the Z / 8 (copy_dest_slice is
        // 3-bit).
-@@ -1097,6 +1197,32 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
+@@ -1034,7 +1145,17 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
+   int32_t exp_bias = is_depth ? 0 : rb_copy_dest_info.copy_dest_exp_bias;
+   ResolveEdramInfo depth_edram_info;
+   depth_edram_info.packed = 0;
+-  if (is_depth || rb_copy_control.depth_clear_enable) {
++  // The synthetic tile depth clear (see ResolveInfo::IsClearingDepth) runs on a
++  // COLOUR resolve with the guest's depth_clear_enable unset, so this struct
++  // would otherwise stay zero - base tile 0, pitch 0 - and the clear would land
++  // on EDRAM tile 0, which is the COLOUR surface. That showed up as a saturated
++  // cyan strip across exactly the first tile row (rows 0-7 at 2x MSAA) of the
++  // second tiling pass. Populate it for that case too.
++  static const bool clear_tile_depth_info = std::getenv("REX_KEEP_TILE_DEPTH") == nullptr;
++  const bool synthetic_tile_depth_clear = clear_tile_depth_info && !is_depth &&
++                                          rb_copy_control.color_clear_enable != 0 &&
++                                          surface_pitch_tiles == 8;
++  if (is_depth || rb_copy_control.depth_clear_enable || synthetic_tile_depth_clear) {
+     depth_edram_info.pitch_tiles = surface_pitch_tiles;
+     depth_edram_info.msaa_samples = rb_surface_info.msaa_samples;
+     depth_edram_info.is_depth = 1;
+@@ -1097,6 +1218,32 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
    info_out.rb_color_clear = regs[XE_GPU_REG_RB_COLOR_CLEAR];
    info_out.rb_color_clear_lo = regs[XE_GPU_REG_RB_COLOR_CLEAR_LO];
  
@@ -747,7 +804,7 @@ index 305380e..d02257f 100644
    REXGPU_TRACE(
        "Resolve: {},{} <= x,y < {},{}, {} -> {} at 0x{:08X} (potentially "
        "modified memory range 0x{:08X} to 0x{:08X})",
-@@ -1119,8 +1245,15 @@ ResolveCopyShaderIndex ResolveInfo::GetCopyShader(uint32_t draw_resolution_scale
+@@ -1119,8 +1266,15 @@ ResolveCopyShaderIndex ResolveInfo::GetCopyShader(uint32_t draw_resolution_scale
    bool is_depth = IsCopyingDepth();
    ResolveEdramInfo edram_info = is_depth ? depth_edram_info : color_edram_info;
    bool source_is_64bpp = !is_depth && color_edram_info.format_is_64bpp != 0;
