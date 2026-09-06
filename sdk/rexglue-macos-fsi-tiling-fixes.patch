@@ -42,7 +42,7 @@ index 9b3cdf5..abfeb3d 100644
  # SDK install support
  include(GNUInstallDirs)
 diff --git a/include/rex/graphics/util/draw.h b/include/rex/graphics/util/draw.h
-index 3da182d..bc04a6a 100644
+index 3da182d..93b99e5 100644
 --- a/include/rex/graphics/util/draw.h
 +++ b/include/rex/graphics/util/draw.h
 @@ -10,6 +10,7 @@
@@ -83,7 +83,7 @@ index 3da182d..bc04a6a 100644
  
    bool IsCopyingDepth() const {
      return rb_copy_control.copy_src_select >= xenos::kMaxColorRenderTargets;
-@@ -531,9 +546,108 @@ struct ResolveInfo {
+@@ -531,9 +546,125 @@ struct ResolveInfo {
                                         uint32_t& group_count_x_out,
                                         uint32_t& group_count_y_out) const;
  
@@ -106,9 +106,26 @@ index 3da182d..bc04a6a 100644
 +    // colour visible as ghosting. Clearing depth on the tile colour resolve is
 +    // safe: depth was already copied out by its own earlier resolve, so this
 +    // cannot clobber a pending depth copy the way the colour clear does.
-+    static const bool clear_tile_depth = std::getenv("REX_CLEAR_TILE_DEPTH") != nullptr;
++    // ON by default. The two predicated-tiling passes share one depth EDRAM
++    // range (base tile 736) and NOTHING ever clears it - there are zero depth
++    // clears in an entire run. So the second pass depth-tests against the first
++    // pass's depth for unrelated screen pixels and its LARGE, distant geometry
++    // (ice, boards, glass) is wrongly rejected while near objects still pass,
++    // leaving the first pass's clear colour showing through. Proven with
++    // REX_CLEAR_DEBUG_COLOR: without this the second half is drenched in the
++    // clear colour; with it, the half renders almost completely.
++    //
++    // This is NOT a GPU ordering race - a full AwaitAllQueueOperationsCompletion
++    // after every resolve does not help, because the pixels were never written
++    // in the first place.
++    //
++    // Clearing depth on the tile colour resolve is safe: depth was already
++    // copied out by its own earlier resolve, so this cannot clobber a pending
++    // depth copy the way the colour clear can. Scoped to the 640px scene
++    // surface. Opt out with REX_KEEP_TILE_DEPTH=1.
++    static const bool clear_tile_depth = std::getenv("REX_KEEP_TILE_DEPTH") == nullptr;
 +    if (clear_tile_depth && !IsCopyingDepth() &&
-+        rb_copy_control.color_clear_enable != 0 && color_edram_info.pitch_tiles < 16) {
++        rb_copy_control.color_clear_enable != 0 && color_edram_info.pitch_tiles == 8) {
 +      return true;
 +    }
 +    static const bool clear_depth_with_color =
@@ -193,7 +210,7 @@ index 3da182d..bc04a6a 100644
      return !IsCopyingDepth() && rb_copy_control.color_clear_enable != 0;
    }
  
-@@ -551,8 +665,21 @@ struct ResolveInfo {
+@@ -551,8 +682,21 @@ struct ResolveInfo {
      // k_16_16_16_16 blending emulation when using host render targets as it
      // would be inconsistent with the usual way of clearing with a depth quad.
      // TODO(Triang3l): Check which 32-bit portion is in which register.
@@ -748,7 +765,7 @@ index 305380e..d02257f 100644
         xenos::IsColorResolveFormatBitwiseEquivalent(
             xenos::ColorRenderTargetFormat(color_edram_info.format),
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index 001f36b..c1448c6 100644
+index 001f36b..4965615 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -3253,6 +3253,8 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
@@ -836,7 +853,7 @@ index 001f36b..c1448c6 100644
      // Process primitives.
      if (!primitive_processor_->Process(primitive_processing_result)) {
        return draw_fail("primitive_processing");
-@@ -4393,11 +4457,48 @@ bool VulkanCommandProcessor::IssueCopy() {
+@@ -4393,11 +4457,61 @@ bool VulkanCommandProcessor::IssueCopy() {
    ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
    if (readback_mode == ReadbackResolveMode::kDisabled) {
      uint32_t written_address, written_length;
@@ -884,11 +901,24 @@ index 001f36b..c1448c6 100644
 +  if (split_submit_readback) {
 +    EndSubmission(false);
 +  }
++  // REX_CLEAR_HARD_WAIT: end the submission AND block until the GPU has
++  // finished it, before anything else is recorded. The resolve's colour clear
++  // is a compute dispatch into EDRAM that must complete before the next tiling
++  // pass's fragment writes touch the same range; MoltenVK honours neither a
++  // buffer barrier, an encoder split, a blit-based fill, nor a plain submission
++  // split for that compute->fragment hazard. A full wait is the one ordering
++  // guarantee left. Expensive, so this is a diagnostic first: if the second
++  // half comes out clean, the hazard is proven and only the cost is in question.
++  static const bool clear_hard_wait = std::getenv("REX_CLEAR_HARD_WAIT") != nullptr;
++  if (clear_hard_wait) {
++    EndSubmission(false);
++    AwaitAllQueueOperationsCompletion();
++  }
 +  return readback_ok;
  }
  
  bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
-@@ -5703,6 +5804,30 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
+@@ -5703,6 +5817,30 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
    scissor_rect.extent.height = scissor.extent[1];
    SetScissor(scissor_rect);
  
