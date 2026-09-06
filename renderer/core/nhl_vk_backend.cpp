@@ -282,7 +282,7 @@ bool NhlVkCommandProcessor::IssueCopy() {
       REXLOG_INFO(
           "[nhl-seq] {} RESOLVE dest=0x{:08X} src_sel={} sample_sel={} msaa={} "
           "scissor=({},{})-({},{}) win_off={} clr_c={} clr_d={} depth_base={} src_pitch={} "
-          "dest_pitch={} dest_height={} dest_fmt={} depth_fmt={} color_fmt={} rb_depth_clear=0x{:08X}",
+          "dest_pitch={} dest_height={} dest_fmt={} depth_fmt={} color_fmt={} rb_depth_clear=0x{:08X} exp_bias={}",
           ++g_seq, dest_base, uint32_t(cc.copy_src_select),
           uint32_t(cc.copy_sample_select), uint32_t(si_c.msaa_samples), uint32_t(tl.tl_x),
           uint32_t(tl.tl_y), uint32_t(br.br_x), uint32_t(br.br_y),
@@ -293,7 +293,8 @@ bool NhlVkCommandProcessor::IssueCopy() {
           uint32_t(dest_pitch.copy_dest_height), uint32_t(di.copy_dest_format),
           uint32_t(register_file_->Get<rex::graphics::reg::RB_DEPTH_INFO>().depth_format),
           uint32_t(register_file_->Get<rex::graphics::reg::RB_COLOR_INFO>().color_format),
-          uint32_t((*register_file_)[rex::graphics::XE_GPU_REG_RB_DEPTH_CLEAR]));
+          uint32_t((*register_file_)[rex::graphics::XE_GPU_REG_RB_DEPTH_CLEAR]),
+          int32_t(di.copy_dest_exp_bias));
     }
     const uint32_t key = dest_base ^ (uint32_t(tl.tl_x) << 3) ^
                          (uint32_t(br.br_x) << 15) ^

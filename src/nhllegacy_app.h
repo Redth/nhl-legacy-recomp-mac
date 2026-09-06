@@ -111,6 +111,7 @@ REXCVAR_DECLARE(std::string, trace_gpu_prefix);
 // Phase 2 enhancement: internal render-resolution (supersampling) scale.
 // Xenia's draw_resolution_scale_x/y; 2 => 2x2 the native 1280x720 internal
 // buffers for a sharper image. GPU/VRAM cost; auto-clamped to GPU max.
+REXCVAR_DECLARE(int32_t, anisotropic_override);
 REXCVAR_DECLARE(int32_t, draw_resolution_scale_x);
 REXCVAR_DECLARE(int32_t, draw_resolution_scale_y);
 // Host window logical size (Xenia heritage cvars). The SDK's SetupPresentation
@@ -346,6 +347,18 @@ class NhllegacyApp : public rex::ReXApp {
     // cost than the prior 2x2) and target a 1920x1080 window.
     REXCVAR_SET(draw_resolution_scale_x, 1);
     REXCVAR_SET(draw_resolution_scale_y, 1);
+    // Force 16x anisotropic filtering (5) rather than the SDK's 4x default (3).
+    // The rink is viewed at a very oblique angle, so the ice markings and board
+    // textures are exactly the case anisotropy helps, and this device reports
+    // maxSamplerAnisotropy 16. Measured no frame-time cost: still 30 fps at
+    // 63 draws/frame. NHL_ANISO overrides (-1 = no override, 0..5 = off..16x).
+    {
+      int32_t aniso = 5;
+      if (const char* e = std::getenv("NHL_ANISO"); e && *e) {
+        aniso = int32_t(std::strtol(e, nullptr, 10));
+      }
+      REXCVAR_SET(anisotropic_override, aniso);
+    }
     REXCVAR_SET(window_width, 1920);
     REXCVAR_SET(window_height, 1080);
 
