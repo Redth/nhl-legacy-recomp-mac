@@ -1091,13 +1091,21 @@ class NhllegacyApp : public rex::ReXApp {
       REXLOG_ERROR("[nhl-dumpres] no memory system");
       return;
     }
-    constexpr uint32_t kW = 1280, kH = 720;
-    std::vector<uint8_t> rgba(size_t(kW) * kH * 4);
+    // Entries are <hex addr>[:<width>x<height>], comma separated. The
+    // post-process chain renders at 640x360, so the size has to be per-entry.
+    std::vector<uint8_t> rgba;
     for (const char* p = list; *p;) {
       char* end = nullptr;
       const uint32_t addr = uint32_t(std::strtoul(p, &end, 16));
       if (end == p) break;
+      uint32_t kW = 1280, kH = 720;
+      if (*end == ':') {
+        kW = uint32_t(std::strtoul(end + 1, &end, 10));
+        if (*end == 'x') kH = uint32_t(std::strtoul(end + 1, &end, 10));
+      }
       p = (*end == ',') ? end + 1 : end;
+      if (!kW || !kH) continue;
+      rgba.assign(size_t(kW) * kH * 4, 0);
       const uint8_t* base = gs->memory()->TranslatePhysical<const uint8_t*>(addr);
       if (!base) {
         REXLOG_ERROR("[nhl-dumpres] cannot translate 0x{:08X}", addr);
@@ -1110,13 +1118,27 @@ class NhllegacyApp : public rex::ReXApp {
               int32_t(x), int32_t(y), kW, /*bytes_per_block_log2=*/2);
           const uint8_t* src = base + off;
           uint8_t* dst = rgba.data() + (size_t(y) * kW + x) * 4;
-          // Guest surfaces are big-endian 8888; take BGRA->RGBA.
-          dst[0] = src[2];
-          dst[1] = src[1];
-          dst[2] = src[0];
+          // Channel order varies with the destination format and endian swap, so
+          // make it selectable: NHL_DUMP_SWIZZLE=<3 byte indices>, e.g. "123"
+          // for ARGB or "210" for BGRA (the previous hard-coded behaviour).
+          static const char* sw = std::getenv("NHL_DUMP_SWIZZLE");
+          const int i0 = sw && sw[0] ? sw[0] - '0' : 1;
+          const int i1 = sw && sw[1] ? sw[1] - '0' : 2;
+          const int i2 = sw && sw[2] ? sw[2] - '0' : 3;
+          dst[0] = src[i0 & 3];
+          dst[1] = src[i1 & 3];
+          dst[2] = src[i2 & 3];
           dst[3] = 255;
-          sum += (unsigned(src[0]) + src[1] + src[2]) / 3u;
+          sum += (unsigned(dst[0]) + dst[1] + dst[2]) / 3u;
         }
+      }
+      {
+        // Log a mid-frame pixel's raw bytes so the real layout is identifiable.
+        const int32_t off_mid = rex::graphics::texture_util::GetTiledOffset2D(
+            int32_t(kW / 2), int32_t(kH / 2), kW, 2);
+        const uint8_t* m = base + off_mid;
+        REXLOG_INFO("[nhl-dumpres] 0x{:08X} {}x{} centre raw bytes = {:02X} {:02X} {:02X} {:02X}",
+                    addr, kW, kH, m[0], m[1], m[2], m[3]);
       }
       char name[64];
       std::snprintf(name, sizeof(name), "resolve_%08X.png", addr);

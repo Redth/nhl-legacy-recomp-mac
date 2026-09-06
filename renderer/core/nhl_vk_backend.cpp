@@ -277,18 +277,22 @@ bool NhlVkCommandProcessor::IssueCopy() {
     // Log every resolve off the 640-pitch scene surface rather than a hardcoded
     // set of destination addresses, which go stale as soon as the game moves
     // its buffers.
-    if (seqlog_on_ && uint32_t(si_pre.surface_pitch) == 640) {
+    if (seqlog_on_) {
       const auto si_c = si_pre;
       REXLOG_INFO(
           "[nhl-seq] {} RESOLVE dest=0x{:08X} src_sel={} sample_sel={} msaa={} "
-          "scissor=({},{})-({},{}) win_off={} clr_c={} clr_d={} depth_base={} src_pitch={}",
+          "scissor=({},{})-({},{}) win_off={} clr_c={} clr_d={} depth_base={} src_pitch={} "
+          "dest_pitch={} dest_height={} dest_fmt={} depth_fmt={} color_fmt={}",
           ++g_seq, dest_base, uint32_t(cc.copy_src_select),
           uint32_t(cc.copy_sample_select), uint32_t(si_c.msaa_samples), uint32_t(tl.tl_x),
           uint32_t(tl.tl_y), uint32_t(br.br_x), uint32_t(br.br_y),
           int32_t(wo.window_x_offset), uint32_t(cc.color_clear_enable),
           uint32_t(cc.depth_clear_enable),
           uint32_t(register_file_->Get<rex::graphics::reg::RB_DEPTH_INFO>().depth_base),
-          uint32_t(si_c.surface_pitch));
+          uint32_t(si_c.surface_pitch), uint32_t(dest_pitch.copy_dest_pitch),
+          uint32_t(dest_pitch.copy_dest_height), uint32_t(di.copy_dest_format),
+          uint32_t(register_file_->Get<rex::graphics::reg::RB_DEPTH_INFO>().depth_format),
+          uint32_t(register_file_->Get<rex::graphics::reg::RB_COLOR_INFO>().color_format));
     }
     const uint32_t key = dest_base ^ (uint32_t(tl.tl_x) << 3) ^
                          (uint32_t(br.br_x) << 15) ^
