@@ -24,6 +24,23 @@ emulated, so it runs as a real PC application with modern rendering on top.
   bundled `ffmpeg.exe` (the recompiled decoder had an arithmetic bug that garbled
   them); it ships beside the port and needs no setup.
 
+## Screenshots
+
+Captured from the Vulkan renderer at the game's native 1280x720 (macOS / Apple
+Silicon build). No game content is included in this repository — these are
+screenshots of the running port.
+
+| | |
+|---|---|
+| ![Title screen](docs/screenshots/01-title.png) | ![Select teams](docs/screenshots/02-select-teams.png) |
+| Title screen | Team select |
+| ![Select jerseys](docs/screenshots/03-select-jerseys.png) | ![Starting lineups](docs/screenshots/04-starting-lineups.png) |
+| Jersey select | Starting lineups |
+| ![Faceoff](docs/screenshots/05-gameplay-faceoff.png) | ![Gameplay](docs/screenshots/06-gameplay-wide.png) |
+| Centre-ice faceoff | Gameplay |
+| ![Bench](docs/screenshots/07-bench-closeup.png) | |
+| Bench cam | |
+
 ## Requirements
 
 - Windows 10 / 11, 64-bit (native), or **Linux / Steam Deck via Proton** — see
