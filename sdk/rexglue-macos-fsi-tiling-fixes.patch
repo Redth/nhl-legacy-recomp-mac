@@ -275,7 +275,7 @@ index 3da182d..5d71ae1 100644
      constants_out.coordinate_info = coordinate_info;
    }
 diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
-index 696ff48..7663865 100644
+index 696ff48..f01e335 100644
 --- a/include/rex/graphics/vulkan/command_processor.h
 +++ b/include/rex/graphics/vulkan/command_processor.h
 @@ -204,6 +204,11 @@ class VulkanCommandProcessor : public CommandProcessor {
@@ -290,6 +290,40 @@ index 696ff48..7663865 100644
    VkDescriptorSetLayout GetSingleTransientDescriptorLayout(
        SingleTransientDescriptorLayout transient_descriptor_layout) const {
      return descriptor_set_layouts_single_transient_[size_t(transient_descriptor_layout)];
+@@ -416,6 +421,33 @@ class VulkanCommandProcessor : public CommandProcessor {
+   // clearing and stopping capturing. Returns whether the submission was done
+   // successfully, if it has failed, leaves it open.
+   bool EndSubmission(bool is_swap);
++  // Deferred resolve readback (see FlushDeferredReadbacks). Instead of draining
++  // the GPU once per readback resolve, each resolve's bytes are copied into an
++  // arena buffer and every pending copy is completed with a SINGLE drain at end
++  // of frame.
++  struct DeferredReadback {
++    uint32_t guest_address;
++    uint32_t offset;
++    uint32_t length;
++  };
++  std::vector<DeferredReadback> deferred_readbacks_;
++  VkBuffer deferred_readback_buffer_ = VK_NULL_HANDLE;
++  VkDeviceMemory deferred_readback_memory_ = VK_NULL_HANDLE;
++  void* deferred_readback_mapping_ = nullptr;
++  uint32_t deferred_readback_capacity_ = 0;
++  uint32_t deferred_readback_used_ = 0;
++  bool in_deferred_readback_flush_ = false;
++  bool EnsureDeferredReadbackCapacity(uint32_t needed);
++  void FlushDeferredReadbacks();
++  void DestroyDeferredReadbackBuffer();
++
++  // REX_READBACK_STATS counters (see IssueCopy_ReadbackResolvePath).
++  uint32_t readback_drains_this_frame_ = 0;
++  uint32_t readback_drain_gap_draws_ = 0;
++  uint32_t draws_since_last_drain_ = 0;
++  uint64_t readback_bytes_this_frame_ = 0;
++
++  void ReportReadbackStats();
+   bool AwaitAllQueueOperationsCompletion() {
+     CheckSubmissionFenceAndDeviceLoss(GetCurrentSubmission());
+     return !submission_open_ && submissions_in_flight_fences_.empty();
 diff --git a/include/rex/graphics/vulkan/deferred_command_buffer.h b/include/rex/graphics/vulkan/deferred_command_buffer.h
 index 9d2a848..6ad2b5f 100644
 --- a/include/rex/graphics/vulkan/deferred_command_buffer.h
@@ -905,19 +939,141 @@ index 305380e..152ef1f 100644
         xenos::IsColorResolveFormatBitwiseEquivalent(
             xenos::ColorRenderTargetFormat(color_edram_info.format),
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index 001f36b..1c0fbd1 100644
+index 001f36b..fe64b22 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
-@@ -3253,6 +3253,8 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+@@ -1898,6 +1898,8 @@ bool VulkanCommandProcessor::SetupContext() {
+ 
+ void VulkanCommandProcessor::ShutdownContext() {
+   AwaitAllQueueOperationsCompletion();
++  deferred_readbacks_.clear();
++  DestroyDeferredReadbackBuffer();
+   InvalidateAllVertexBufferResidency();
+   ShutdownOcclusionQueryResources();
+ 
+@@ -3253,6 +3255,121 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
    in_render_pass_ = true;
  }
  
++void VulkanCommandProcessor::DestroyDeferredReadbackBuffer() {
++  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
++  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
++  const VkDevice device = vulkan_device->device();
++  if (deferred_readback_mapping_) {
++    dfn.vkUnmapMemory(device, deferred_readback_memory_);
++    deferred_readback_mapping_ = nullptr;
++  }
++  if (deferred_readback_buffer_ != VK_NULL_HANDLE) {
++    dfn.vkDestroyBuffer(device, deferred_readback_buffer_, nullptr);
++    deferred_readback_buffer_ = VK_NULL_HANDLE;
++  }
++  if (deferred_readback_memory_ != VK_NULL_HANDLE) {
++    dfn.vkFreeMemory(device, deferred_readback_memory_, nullptr);
++    deferred_readback_memory_ = VK_NULL_HANDLE;
++  }
++  deferred_readback_capacity_ = 0;
++  deferred_readback_used_ = 0;
++}
++
++bool VulkanCommandProcessor::EnsureDeferredReadbackCapacity(uint32_t needed) {
++  if (needed <= deferred_readback_capacity_) {
++    return true;
++  }
++  // Growing frees the old buffer, which earlier recorded copies may still
++  // reference, so everything pending has to land first.
++  FlushDeferredReadbacks();
++  DestroyDeferredReadbackBuffer();
++  // Menus queue ~21 readbacks of ~2 MB each, so a small arena would overflow
++  // and force several mid-frame flushes - defeating the point. Start big.
++  uint32_t new_capacity = 64 * 1024 * 1024;
++  while (new_capacity < needed) {
++    new_capacity *= 2;
++  }
++  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
++  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
++  const VkDevice device = vulkan_device->device();
++  VkBuffer buffer = VK_NULL_HANDLE;
++  VkDeviceMemory memory = VK_NULL_HANDLE;
++  if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
++          vulkan_device, new_capacity, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++          ui::vulkan::util::MemoryPurpose::kReadback, buffer, memory)) {
++    REXGPU_ERROR("Failed to create a {} MB deferred resolve readback buffer", new_capacity >> 20);
++    return false;
++  }
++  void* mapping = nullptr;
++  if (dfn.vkMapMemory(device, memory, 0, VK_WHOLE_SIZE, 0, &mapping) != VK_SUCCESS) {
++    dfn.vkDestroyBuffer(device, buffer, nullptr);
++    dfn.vkFreeMemory(device, memory, nullptr);
++    return false;
++  }
++  deferred_readback_buffer_ = buffer;
++  deferred_readback_memory_ = memory;
++  deferred_readback_mapping_ = mapping;
++  deferred_readback_capacity_ = new_capacity;
++  deferred_readback_used_ = 0;
++  return true;
++}
++
++// Completes every deferred readback with ONE GPU drain.
++//
++// ReadbackResolveMode::kFull otherwise calls AwaitAllQueueOperationsCompletion()
++// per readback resolve, and that both ends the current submission and blocks on
++// its fence. Menus issue 20-25 such resolves per frame (versus 1-4 in gameplay),
++// so the frame paid 20-25 full pipeline flushes - which is why heavy scenes ran
++// at ~14 fps while gameplay held 30.
++void VulkanCommandProcessor::FlushDeferredReadbacks() {
++  if (deferred_readbacks_.empty() || in_deferred_readback_flush_) {
++    deferred_readback_used_ = 0;
++    return;
++  }
++  in_deferred_readback_flush_ = true;
++  ++readback_drains_this_frame_;
++  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
++  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
++  const VkDevice device = vulkan_device->device();
++  if (AwaitAllQueueOperationsCompletion() && deferred_readback_mapping_) {
++    VkMappedMemoryRange range = {};
++    range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
++    range.memory = deferred_readback_memory_;
++    range.offset = 0;
++    range.size = VK_WHOLE_SIZE;
++    dfn.vkInvalidateMappedMemoryRanges(device, 1, &range);
++    for (const DeferredReadback& pending : deferred_readbacks_) {
++      uint8_t* destination = memory_->TranslatePhysical(pending.guest_address);
++      if (destination) {
++        std::memcpy(destination,
++                    reinterpret_cast<const uint8_t*>(deferred_readback_mapping_) + pending.offset,
++                    pending.length);
++      }
++    }
++  }
++  deferred_readbacks_.clear();
++  deferred_readback_used_ = 0;
++  in_deferred_readback_flush_ = false;
++}
++
++void VulkanCommandProcessor::ReportReadbackStats() {
++  static const bool stats = std::getenv("REX_READBACK_STATS") != nullptr;
++  if (stats && readback_drains_this_frame_) {
++    REXGPU_INFO(
++        "[rex-readback] drains={} bytes={} avg_draws_between_drains={:.1f} "
++        "draws_after_last={}",
++        readback_drains_this_frame_, readback_bytes_this_frame_,
++        double(readback_drain_gap_draws_) / double(readback_drains_this_frame_),
++        draws_since_last_drain_);
++  }
++  readback_drains_this_frame_ = 0;
++  readback_drain_gap_draws_ = 0;
++  draws_since_last_drain_ = 0;
++  readback_bytes_this_frame_ = 0;
++}
++
 +void VulkanCommandProcessor::SplitSubmissionForHazard() { EndSubmission(false); }
 +
  void VulkanCommandProcessor::EndRenderPass() {
    assert_true(submission_open_);
    if (!in_render_pass_) {
-@@ -3661,6 +3663,73 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3661,6 +3778,74 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
          }
        }
      }
@@ -926,6 +1082,7 @@ index 001f36b..1c0fbd1 100644
 +    // post-process passes out of the frame.
 +    // REX_SKIP_PS=<hex>[,<hex>]: drop every draw using those pixel shaders, to
 +    // bisect which pass introduces an artifact.
++    ++draws_since_last_drain_;
 +    if (pixel_shader) {
 +      const uint64_t ps_hash = pixel_shader->ucode_data_hash();
 +      static const bool ps_log = std::getenv("REX_PS_LOG") != nullptr;
@@ -991,7 +1148,7 @@ index 001f36b..1c0fbd1 100644
    } else {
      // Disabling pixel shader for this case is also required by the pipeline
      // cache.
-@@ -3707,6 +3776,11 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3707,6 +3892,11 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
        return draw_fail("begin_submission");
      }
  
@@ -1003,7 +1160,7 @@ index 001f36b..1c0fbd1 100644
      // Process primitives.
      if (!primitive_processor_->Process(primitive_processing_result)) {
        return draw_fail("primitive_processing");
-@@ -4393,11 +4467,61 @@ bool VulkanCommandProcessor::IssueCopy() {
+@@ -4393,11 +4583,61 @@ bool VulkanCommandProcessor::IssueCopy() {
    ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
    if (readback_mode == ReadbackResolveMode::kDisabled) {
      uint32_t written_address, written_length;
@@ -1068,7 +1225,79 @@ index 001f36b..1c0fbd1 100644
  }
  
  bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
-@@ -5703,6 +5827,30 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
+@@ -4473,6 +4713,40 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
+   };
+ 
+   bool is_scaled = texture_cache_->IsDrawResolutionScaled();
++
++  // Batch kFull readbacks into an arena and complete them all with ONE drain at
++  // end of frame instead of draining per resolve (REX_NO_READBACK_DEFER=1 opts
++  // out). Correctness is preserved: every byte still lands in guest memory
++  // before the frame ends, unlike kFast which serves one-frame-stale data. Only
++  // the unscaled path is deferred - the resolution-scaled path reads from a
++  // separate downscale buffer and keeps the original behaviour.
++  static const bool defer_readback = std::getenv("REX_NO_READBACK_DEFER") == nullptr;
++  if (defer_readback && !is_scaled && readback_mode == ReadbackResolveMode::kFull) {
++    constexpr uint32_t kArenaAlignment = 256;
++    const uint32_t aligned_length =
++        (written_length + (kArenaAlignment - 1)) & ~(kArenaAlignment - 1);
++    if (deferred_readback_used_ + aligned_length > deferred_readback_capacity_) {
++      // Land what is already queued, then make room.
++      FlushDeferredReadbacks();
++      if (!EnsureDeferredReadbackCapacity(aligned_length)) {
++        return true;
++      }
++    }
++    const uint32_t offset = deferred_readback_used_;
++    VkBufferCopy region = {};
++    region.srcOffset = written_address;
++    region.dstOffset = offset;
++    region.size = written_length;
++    SubmitBarriers(true);
++    deferred_command_buffer_.CmdVkCopyBuffer(shared_memory_->buffer(), deferred_readback_buffer_, 1,
++                                             &region);
++    PushBufferMemoryBarrier(deferred_readback_buffer_, offset, written_length,
++                            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
++                            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
++    deferred_readbacks_.push_back({written_address, offset, written_length});
++    deferred_readback_used_ = offset + aligned_length;
++    return true;
++  }
+   uint64_t resolve_key = MakeReadbackResolveKey(written_address, written_length);
+   ReadbackBuffer& readback = readback_buffers_[resolve_key];
+   readback.last_used_frame = frame_current_;
+@@ -4654,8 +4928,17 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
+   uint32_t read_index = write_index;
+   if (use_delayed_sync) {
+     read_index = 1 - write_index;
+-  } else if (!AwaitAllQueueOperationsCompletion()) {
+-    return true;
++  } else {
++    // REX_READBACK_STATS: how many full GPU drains happen per frame, and how
++    // many draws land between them - i.e. whether the drains are batched
++    // (coalescible) or interleaved with drawing (not).
++    ++readback_drains_this_frame_;
++    readback_drain_gap_draws_ += draws_since_last_drain_;
++    draws_since_last_drain_ = 0;
++    readback_bytes_this_frame_ += written_length;
++    if (!AwaitAllQueueOperationsCompletion()) {
++      return true;
++    }
+   }
+ 
+   bool is_cache_miss = false;
+@@ -5230,6 +5513,10 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+ }
+ 
+ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
++  if (is_swap) {
++    FlushDeferredReadbacks();
++    ReportReadbackStats();
++  }
+   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+   const VkDevice device = vulkan_device->device();
+@@ -5703,6 +5990,30 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
    scissor_rect.extent.height = scissor.extent[1];
    SetScissor(scissor_rect);
  
