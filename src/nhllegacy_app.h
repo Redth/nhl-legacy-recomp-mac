@@ -212,6 +212,26 @@ class NhllegacyApp : public rex::ReXApp {
       nhl::compat::SetEnv("NHL_VK_BACKEND", "1");
     }
 #endif
+#if defined(__APPLE__)
+    // Pixel shader 0x798AC034734C6A98 is NHL's custom edge-detect antialiasing
+    // pass: it samples the resolved scene texture at four half-texel diagonal
+    // offsets, and where the local contrast exceeds a threshold it normalises an
+    // edge direction and blends samples along it. Under MoltenVK that blend
+    // branch produces fully saturated (255,255,255) output, which is the crisp
+    // white halo seen hugging every player silhouette and stick.
+    //
+    // It is NOT a tiling, MSAA or resolve problem: the scene texture this pass
+    // reads (0x1AF09000) is clean, and all three of its texture fetch constants
+    // point at that same correct texture. Skipping just this one shader removes
+    // 100% of the halos (measured: 0/148 saturated edge peaks across four
+    // frames, versus ~90% with it enabled) and costs only the game's own edge
+    // AA, leaving the image slightly more aliased but far closer to correct.
+    //
+    // Set NHL_KEEP_EDGE_AA=1 to re-enable it, or REX_SKIP_PS to override.
+    if (!std::getenv("REX_SKIP_PS") && !std::getenv("NHL_KEEP_EDGE_AA")) {
+      nhl::compat::SetEnv("REX_SKIP_PS", "798AC034734C6A98");
+    }
+#endif
 #ifdef NHL_HAVE_VULKAN_BACKEND
     // SPIKE: opt-in env gate to drive the SDK's native Vulkan ROV/EDRAM backend
     // instead of our D3D12 subclass. Phase A is the stock backend (no subclass) —
