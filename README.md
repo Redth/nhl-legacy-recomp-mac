@@ -78,6 +78,21 @@ The build is recompiled from one specific vanilla image of the game, so the buil
 verifies your `default.xex` by hash. A different region, a modified dump, or one with
 a title update applied will not pass validation.
 
+### macOS (Apple Silicon)
+
+The macOS port is built from source (see **[DEV-README.md](DEV-README.md)**) and
+uses a helper to unpack your disc image, because Xbox 360 discs are XDVDFS —
+Finder, `hdiutil` and 7-Zip cannot read them:
+
+```
+tools/macos/setup_game.py --iso ~/Downloads/"NHL Legacy Edition.iso"
+```
+
+That verifies the image, checks free space, extracts ~6 GB into `game/`, and
+prints the command to launch. It also accepts a `.7z` straight from a dump, or
+an already-unpacked folder via `--from`. Re-running skips files that are already
+present, so an interrupted run just resumes.
+
 ## Legal
 
 You must own NHL Legacy and dump your own copy. No game assets are included or
