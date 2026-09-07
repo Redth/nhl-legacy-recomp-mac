@@ -11,6 +11,7 @@
 
 #include <rex/graphics/registers.h>
 #include <rex/graphics/xenos.h>
+#include <rex/cvar.h>
 #include <rex/logging.h>
 
 // Win32 keyboard poll for the F9 hotkey capture (declared directly to keep
@@ -19,6 +20,8 @@
 #ifdef _WIN32
 extern "C" __declspec(dllimport) short __stdcall GetAsyncKeyState(int v_key);
 #endif
+
+REXCVAR_DECLARE(bool, shadow_filter_linear);
 
 namespace nhl::graphics {
 
@@ -538,6 +541,38 @@ void NhlVkCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
     if (frames_total_ == at) {
       SetSwapPostEffect(NhlSwapPostEffect::kFxaa);
       REXLOG_INFO("[nhl-fxaa] swap post effect -> fxaa at frame {}", frames_total_);
+    }
+  }
+
+  // NHL_SHADOWFILT_AT_FRAME=<n>: turn shadow_filter_linear on at guest frame n.
+  //
+  // Unlike shadow_softness (blur passes baked in at texture upload), this cvar
+  // is read per draw in the texture cache's GetSamplerParameters, so it is
+  // genuinely hot-switchable - which is the only way to measure it. Comparing
+  // two runs is useless here: they drift ~1.5 minutes of game time apart by
+  // frame 6600, so the frames show different camera positions and the
+  // difference lands on the crowd rather than on any shadow.
+  //
+  // RESULT: INCONCLUSIVE - the effect could not be separated from camera
+  // motion, on three different scenes. The toggle definitely fires (the log
+  // line below is emitted). In gameplay, frames 12 apart give mean|luma diff|
+  // 30.8, which is just 0.7 s of fast play. On the slow arena pan at frame 5300
+  // it gives 9.10 - but FXAA, a known-real whole-frame effect, only reaches 8.18
+  // on those same two frames, so ~8 is the motion floor there and 9.10 sits
+  // inside it. Note this may also mean the setting genuinely does nothing in
+  // that particular frame: it only touches draws sampling a k_24_8 depth
+  // texture, and the distant arena shot may contain none. Either way the visual
+  // magnitude is unproven. What IS proven is the plumbing - librexgpu-xenos
+  // exports the cvar storage, the app imports it undefined rather than
+  // redefining it, and the texture cache consumes it per draw in
+  // GetSamplerParameters. To settle this properly, find a static 3D scene with
+  // a large on-screen shadow; NHL's pause screen does NOT work, it is
+  // full-screen 2D and hides the rink.
+  if (const char* sf_at = std::getenv("NHL_SHADOWFILT_AT_FRAME")) {
+    const uint64_t at = std::strtoull(sf_at, nullptr, 10);
+    if (frames_total_ == at) {
+      REXCVAR_SET(shadow_filter_linear, true);
+      REXLOG_INFO("[nhl-shadowfilt] shadow_filter_linear -> true at frame {}", frames_total_);
     }
   }
 
