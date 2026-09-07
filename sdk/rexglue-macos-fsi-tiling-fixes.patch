@@ -2257,7 +2257,7 @@ index 0298f06..caf232c 100644
                                                   dst_stage_mask, src_access_mask,
                                                   dst_access_mask)) {
 diff --git a/src/graphics/vulkan/texture_cache.cpp b/src/graphics/vulkan/texture_cache.cpp
-index ecbd940..1dd071b 100644
+index ecbd940..5f0239e 100644
 --- a/src/graphics/vulkan/texture_cache.cpp
 +++ b/src/graphics/vulkan/texture_cache.cpp
 @@ -12,8 +12,11 @@
@@ -2326,7 +2326,7 @@ index ecbd940..1dd071b 100644
    if (null_image_view_3d_ != VK_NULL_HANDLE) {
      dfn.vkDestroyImageView(device, null_image_view_3d_, nullptr);
    }
-@@ -755,6 +784,32 @@ VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
+@@ -755,6 +784,54 @@ VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
    }
    parameters.aniso_filter = aniso_filter;
  
@@ -2337,6 +2337,28 @@ index ecbd940..1dd071b 100644
 +  // "striped" shadow edges. When enabled and the host format actually supports
 +  // linear filtering, force bilinear min/mag to soften them. Only touches depth
 +  // formats, so colour textures are unaffected.
++  // REX_SHADOWFILT_LOG: count how often this actually fires. shadow_filter_linear
++  // only affects draws that sample a k_24_8 / k_24_8_FLOAT depth texture, so if
++  // the title never does that, the setting is a no-op no matter what the ini says
++  // - which is the difference between "cannot measure it" and "there is nothing
++  // to measure".
++  static const bool shadowfilt_log = std::getenv("REX_SHADOWFILT_LOG") != nullptr;
++  if (shadowfilt_log) {
++    static uint64_t seen = 0, depth_hits = 0, applied = 0;
++    ++seen;
++    if ((seen % 200000) == 0) {
++      REXGPU_INFO("[rex-shadowfilt] samplers={} depth_k24_8={} bilinear_applied={}", seen,
++                  depth_hits, applied);
++    }
++    TextureKey probe_key;
++    uint8_t probe_signs;
++    BindingInfoFromFetchConstant(fetch, probe_key, &probe_signs);
++    if (probe_key.is_valid && (probe_key.format == xenos::TextureFormat::k_24_8 ||
++                               probe_key.format == xenos::TextureFormat::k_24_8_FLOAT)) {
++      ++depth_hits;
++      if (REXCVAR_GET(shadow_filter_linear) && !parameters.mag_linear) ++applied;
++    }
++  }
 +  if (REXCVAR_GET(shadow_filter_linear) && !parameters.mag_linear) {
 +    TextureKey depth_key;
 +    uint8_t depth_swizzled_signs;
@@ -2359,7 +2381,7 @@ index ecbd940..1dd071b 100644
    return parameters;
  }
  
-@@ -864,7 +919,20 @@ VkSampler VulkanTextureCache::UseSampler(SamplerParameters parameters, bool& has
+@@ -864,7 +941,20 @@ VkSampler VulkanTextureCache::UseSampler(SamplerParameters parameters, bool& has
    sampler_create_info.addressModeU = kAddressModeMap[uint32_t(parameters.clamp_x)];
    sampler_create_info.addressModeV = kAddressModeMap[uint32_t(parameters.clamp_y)];
    sampler_create_info.addressModeW = kAddressModeMap[uint32_t(parameters.clamp_z)];
@@ -2381,7 +2403,7 @@ index ecbd940..1dd071b 100644
    if (parameters.aniso_filter != xenos::AnisoFilter::kDisabled) {
      sampler_create_info.anisotropyEnable = VK_TRUE;
      sampler_create_info.maxAnisotropy =
-@@ -1174,6 +1242,28 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
+@@ -1174,6 +1264,28 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
    image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
    image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
    image_create_info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
@@ -2410,7 +2432,7 @@ index ecbd940..1dd071b 100644
    image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
    image_create_info.queueFamilyIndexCount = 0;
    image_create_info.pQueueFamilyIndices = nullptr;
-@@ -1608,8 +1698,45 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+@@ -1608,8 +1720,45 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
                                            sizeof(load_constants.host_offset),
                                            &load_constants.host_offset);
        }
@@ -2458,7 +2480,7 @@ index ecbd940..1dd071b 100644
        load_constants.guest_offset += level_array_slice_stride_bytes_scaled;
        load_constants.host_offset += uint32_t(level_host_layout.slice_size_bytes);
      }
-@@ -1783,9 +1910,153 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+@@ -1783,9 +1932,153 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
      copy_region.imageExtent.depth = std::max(depth >> level, UINT32_C(1));
    }
  
@@ -2612,7 +2634,7 @@ index ecbd940..1dd071b 100644
  void VulkanTextureCache::UpdateTextureBindingsImpl(uint32_t fetch_constant_mask) {
    uint32_t bindings_remaining = fetch_constant_mask;
    uint32_t binding_index;
-@@ -2501,6 +2772,18 @@ bool VulkanTextureCache::Initialize() {
+@@ -2501,6 +2794,18 @@ bool VulkanTextureCache::Initialize() {
      host_format_dxn.format_unsigned.format = VK_FORMAT_R8G8_UNORM;
      host_format_dxn.format_unsigned.block_compressed = false;
    }
@@ -2631,7 +2653,7 @@ index ecbd940..1dd071b 100644
    HostFormatPair& host_format_dxt5a = host_formats_[uint32_t(xenos::TextureFormat::k_DXT5A)];
    assert_true(host_format_dxt5a.format_unsigned.format == VK_FORMAT_BC4_UNORM_BLOCK);
    ifn.vkGetPhysicalDeviceFormatProperties(physical_device, VK_FORMAT_BC4_UNORM_BLOCK,
-@@ -2512,7 +2795,10 @@ bool VulkanTextureCache::Initialize() {
+@@ -2512,7 +2817,10 @@ bool VulkanTextureCache::Initialize() {
    }
    // Keep signed format support aligned with D3D12 for texture formats where
    // D3D12 doesn't expose signed sampling paths.
@@ -2643,7 +2665,7 @@ index ecbd940..1dd071b 100644
        xenos::TextureFormat::k_1_5_5_5,
        xenos::TextureFormat::k_5_6_5,
        xenos::TextureFormat::k_6_5_5,
-@@ -2523,7 +2809,6 @@ bool VulkanTextureCache::Initialize() {
+@@ -2523,7 +2831,6 @@ bool VulkanTextureCache::Initialize() {
        xenos::TextureFormat::k_DXT1,
        xenos::TextureFormat::k_DXT2_3,
        xenos::TextureFormat::k_DXT4_5,
