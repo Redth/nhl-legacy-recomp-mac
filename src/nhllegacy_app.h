@@ -239,6 +239,11 @@ class NhllegacyApp : public rex::ReXApp {
       nhl::compat::SetEnv("REX_SKIP_PS", "798AC034734C6A98");
     }
 #ifdef NHL_HAVE_VULKAN_BACKEND
+    // Swap-time post effect: apply the persisted overlay choice at launch. The
+    // SDK's own swap_post_effect cvar is sampled once at context setup, so the
+    // backend pushes this value through SetDesiredSwapPostEffect instead.
+    nhl::graphics::SetSwapPostEffect(
+        static_cast<nhl::graphics::NhlSwapPostEffect>(nhl::LoadSwapPostEffect(0)));
     if (std::getenv("NHL_KEEP_EDGE_AA")) {
       nhl::graphics::SetEdgeAaMode(nhl::graphics::NhlEdgeAaMode::kAlways);
     } else {

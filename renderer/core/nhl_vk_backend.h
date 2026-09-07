@@ -112,6 +112,8 @@ class NhlVkCommandProcessor : public rex::graphics::vulkan::VulkanCommandProcess
   uint32_t scene_agree_frames_ = 0;
   bool scene_is_3d_ = false;
   void UpdateSceneKind();
+  // Last value pushed to the SDK, so the change is only submitted once.
+  NhlSwapPostEffect applied_swap_post_effect_ = NhlSwapPostEffect::kNone;
   const bool copy_barrier_on_ = std::getenv("NHL_VK_COPY_BARRIER") != nullptr;
   bool exp_skip_dxt3_ = false, exp_skip_alphatest_ = false, exp_skip_blend_ = false;
   uint32_t exp_skip_addr_ = 0;   // NHL_VK_SKIP_ADDR (hex), 0 = off

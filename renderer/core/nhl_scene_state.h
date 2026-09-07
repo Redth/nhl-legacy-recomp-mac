@@ -30,4 +30,17 @@ enum class NhlEdgeAaMode { kAuto = 0, kAlways = 1, kNever = 2 };
 void SetEdgeAaMode(NhlEdgeAaMode mode);
 NhlEdgeAaMode GetEdgeAaMode();
 
+// The SDK's swap-time post effect, mirrored here so the overlay can drive it
+// without including the SDK's Vulkan headers. The SDK reads its swap_post_effect
+// cvar once at context setup, so changing that string later does nothing; the
+// backend applies this value via SetDesiredSwapPostEffect instead, which is why
+// this is genuinely live where Supersampling is not.
+//
+// FXAA is edge-directed and does smooth geometry edges, but note it does NOT
+// remove the sub-pixel checker on boards/glass/ice - that needs supersampling.
+// It also softens menu and HUD text, since it runs on the whole frame.
+enum class NhlSwapPostEffect { kNone = 0, kFxaa = 1, kFxaaExtreme = 2 };
+void SetSwapPostEffect(NhlSwapPostEffect effect);
+NhlSwapPostEffect GetSwapPostEffect();
+
 }  // namespace nhl::graphics

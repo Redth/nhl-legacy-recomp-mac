@@ -54,6 +54,15 @@ void SetEdgeAaMode(NhlEdgeAaMode mode) {
 }
 NhlEdgeAaMode GetEdgeAaMode() { return g_edge_aa_mode.load(std::memory_order_relaxed); }
 
+std::atomic<NhlSwapPostEffect> g_swap_post_effect{NhlSwapPostEffect::kNone};
+
+void SetSwapPostEffect(NhlSwapPostEffect effect) {
+  g_swap_post_effect.store(effect, std::memory_order_relaxed);
+}
+NhlSwapPostEffect GetSwapPostEffect() {
+  return g_swap_post_effect.load(std::memory_order_relaxed);
+}
+
 NhlVkPerfSnapshot ReadVkPerf() {
   std::lock_guard<std::mutex> lock(g_perf_mutex);
   return g_perf;
@@ -527,9 +536,25 @@ void NhlVkCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
   if (const char* fxaa_at = std::getenv("NHL_FXAA_AT_FRAME")) {
     const uint64_t at = std::strtoull(fxaa_at, nullptr, 10);
     if (frames_total_ == at) {
-      SetDesiredSwapPostEffect(SwapPostEffect::kFxaa);
+      SetSwapPostEffect(NhlSwapPostEffect::kFxaa);
       REXLOG_INFO("[nhl-fxaa] swap post effect -> fxaa at frame {}", frames_total_);
     }
+  }
+
+  // Apply the overlay's swap-post-effect choice. The SDK samples its
+  // swap_post_effect cvar once at context setup, so the cvar cannot drive this
+  // at runtime - SetDesiredSwapPostEffect can, and it only needs calling when
+  // the value actually changes.
+  const NhlSwapPostEffect want = GetSwapPostEffect();
+  if (want != applied_swap_post_effect_) {
+    applied_swap_post_effect_ = want;
+    SwapPostEffect sdk_effect = SwapPostEffect::kNone;
+    switch (want) {
+      case NhlSwapPostEffect::kFxaa: sdk_effect = SwapPostEffect::kFxaa; break;
+      case NhlSwapPostEffect::kFxaaExtreme: sdk_effect = SwapPostEffect::kFxaaExtreme; break;
+      case NhlSwapPostEffect::kNone: default: break;
+    }
+    SetDesiredSwapPostEffect(sdk_effect);
   }
 
   if (!started_) {

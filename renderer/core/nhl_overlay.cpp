@@ -296,6 +296,22 @@ void NhlEnhancementsDialog::OnDraw(ImGuiIO& io) {
                             (edge_aa == 1 || (edge_aa == 0 && !in_3d)) ? "on" : "off");
       }
 
+      // Swap-time FXAA. Unlike Supersampling this is a present-time post-process,
+      // so it applies immediately - no restart. It smooths geometry edges, but
+      // it will NOT remove the fine checker on boards/glass/ice (that is
+      // sub-pixel undersampling, which only supersampling fixes), and being a
+      // whole-frame pass it also softens menu and HUD text.
+      {
+        static const char* kPost[] = {"Off", "FXAA", "FXAA extreme"};
+        int post = int(nhl::graphics::GetSwapPostEffect());
+        if (ImGui::Combo("Post AA", &post, kPost, IM_ARRAYSIZE(kPost))) {
+          nhl::graphics::SetSwapPostEffect(nhl::graphics::NhlSwapPostEffect(post));
+          nhl::SaveSwapPostEffect(post);
+        }
+        ImGui::TextDisabled("smooths edges; also softens text. does not fix the "
+                            "boards/glass shimmer - use Supersampling for that");
+      }
+
       // Soften shadows: restore bilinear filtering on the guest's depth/shadow
       // maps. Read per-draw in the texture cache, so this is live (no restart).
       bool soften_shadows = REXCVAR_GET(shadow_filter_linear);

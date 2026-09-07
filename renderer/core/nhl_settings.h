@@ -132,6 +132,17 @@ inline void SaveEdgeAaMode(int v) {
   SaveSetting("edge_aa_mode", std::to_string(v));
 }
 
+// Swap-time post effect: 0 = off, 1 = FXAA, 2 = FXAA extreme. Applied live by
+// the Vulkan backend (the SDK's own swap_post_effect cvar is only sampled once
+// at context setup, so it cannot drive this at runtime). Persisted so the choice
+// survives a relaunch.
+inline int LoadSwapPostEffect(int fallback) { return LoadInt("swap_post_effect", fallback, 0, 2); }
+inline void SaveSwapPostEffect(int v) {
+  if (v < 0) v = 0;
+  if (v > 2) v = 2;
+  SaveSetting("swap_post_effect", std::to_string(v));
+}
+
 // Borderless-fullscreen vs windowed (the SDK's "fullscreen" cvar is borderless).
 inline bool LoadFullscreen(bool fallback) { return LoadBool("fullscreen", fallback); }
 inline void SaveFullscreen(bool v) { SaveSetting("fullscreen", v ? "1" : "0"); }
