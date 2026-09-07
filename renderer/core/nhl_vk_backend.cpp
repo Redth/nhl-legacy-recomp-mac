@@ -41,6 +41,19 @@ void PublishVkFrameIndex(uint64_t frame_index) {
 
 uint64_t ReadVkFrameIndex() { return g_frame_index.load(std::memory_order_relaxed); }
 
+std::atomic<NhlSceneKind> g_scene_kind{NhlSceneKind::kMenu};
+std::atomic<NhlEdgeAaMode> g_edge_aa_mode{NhlEdgeAaMode::kAuto};
+
+void PublishSceneKind(NhlSceneKind kind) {
+  g_scene_kind.store(kind, std::memory_order_relaxed);
+}
+NhlSceneKind ReadSceneKind() { return g_scene_kind.load(std::memory_order_relaxed); }
+
+void SetEdgeAaMode(NhlEdgeAaMode mode) {
+  g_edge_aa_mode.store(mode, std::memory_order_relaxed);
+}
+NhlEdgeAaMode GetEdgeAaMode() { return g_edge_aa_mode.load(std::memory_order_relaxed); }
+
 NhlVkPerfSnapshot ReadVkPerf() {
   std::lock_guard<std::mutex> lock(g_perf_mutex);
   return g_perf;
@@ -173,6 +186,9 @@ bool NhlVkCommandProcessor::IssueDraw(
   {
     const auto si_d = register_file_->Get<reg::RB_SURFACE_INFO>();
     last_draw_pitch_ = uint32_t(si_d.surface_pitch);
+    // Scene detection (see NhlSceneKind): the 3D scene is the only thing NHL
+    // renders through the folded 640-pitch surface.
+    if (last_draw_pitch_ == 640u) ++folded_draws_this_frame_;
   }
 
   const auto cc = register_file_->Get<reg::RB_COLORCONTROL>();
@@ -418,6 +434,48 @@ void NhlVkCommandProcessor::PollHotkeyCapture() {
   }
 }
 
+void NhlVkCommandProcessor::UpdateSceneKind() {
+  // A 3D frame issues hundreds of folded draws; a menu issues none. The
+  // threshold only has to survive the transition frames where the scene is
+  // being torn down or built up, so it is deliberately low but non-zero.
+  const bool frame_is_3d = folded_draws_this_frame_ >= 8;
+  folded_draws_this_frame_ = 0;
+
+  // Require agreement for several frames before flipping, ASYMMETRICALLY.
+  //
+  // Entering the 3D scene is committed quickly: the halo the edge-AA pass leaves
+  // on player silhouettes is what we are trying to avoid, so a few frames of it
+  // during a wipe is the cost of not being twitchy.
+  //
+  // Leaving it is committed slowly. Gameplay is punctuated by short full-screen
+  // 2D interludes - replay wipes, whistle and scoreboard overlays, timeouts -
+  // that draw nothing against the folded surface. A symmetric 6-frame threshold
+  // was measured flapping through one of these: "now MENU/2D (frame 6311)"
+  // followed by "now GAMEPLAY/3D (frame 6320)", nine frames later. Toggling the
+  // pass twice inside a third of a second is a visible flicker, so a return to
+  // 2D has to persist for about a second and a half before we believe it.
+  const uint32_t flip_frames = frame_is_3d ? 6u : 45u;
+  if (frame_is_3d == scene_is_3d_) {
+    scene_agree_frames_ = 0;
+  } else if (++scene_agree_frames_ >= flip_frames) {
+    scene_is_3d_ = frame_is_3d;
+    scene_agree_frames_ = 0;
+    REXLOG_INFO("[nhl-scene] now {} (frame {})", scene_is_3d_ ? "GAMEPLAY/3D" : "MENU/2D",
+                frames_total_);
+  }
+  PublishSceneKind(scene_is_3d_ ? NhlSceneKind::kScene3D : NhlSceneKind::kMenu);
+
+  // Apply the edge-AA policy. The SDK consults this atomic per draw, so this is
+  // a free switch - no pipeline, shader or render-target rebuild.
+  bool skip_edge_aa;
+  switch (GetEdgeAaMode()) {
+    case NhlEdgeAaMode::kAlways: skip_edge_aa = false; break;  // never skip -> always drawn
+    case NhlEdgeAaMode::kNever: skip_edge_aa = true; break;    // always skip -> never drawn
+    case NhlEdgeAaMode::kAuto: default: skip_edge_aa = scene_is_3d_; break;
+  }
+  rex::graphics::vulkan::g_skip_ps_active.store(skip_edge_aa, std::memory_order_relaxed);
+}
+
 void NhlVkCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
                                       uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
@@ -443,6 +501,7 @@ void NhlVkCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
   ++window_frames_;
   ++frames_total_;
   PublishVkFrameIndex(frames_total_);
+  UpdateSceneKind();
 
   if (!started_) {
     started_ = true;

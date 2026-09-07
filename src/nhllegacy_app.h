@@ -229,10 +229,23 @@ class NhllegacyApp : public rex::ReXApp {
     // frames, versus ~90% with it enabled) and costs only the game's own edge
     // AA, leaving the image slightly more aliased but far closer to correct.
     //
-    // Set NHL_KEEP_EDGE_AA=1 to re-enable it, or REX_SKIP_PS to override.
+    // The halo only appears over the 3D scene; over the flat 2D menus the same
+    // pass is harmless and does sharpen the art. So the shader hash is always
+    // registered here, and whether the skip actually fires is decided per frame
+    // by the scene detector in nhl_vk_backend.cpp (edge_aa mode Auto). Setting
+    // NHL_KEEP_EDGE_AA=1 pins it on everywhere; the overlay exposes the same
+    // three-way choice persistently.
     if (!std::getenv("REX_SKIP_PS") && !std::getenv("NHL_KEEP_EDGE_AA")) {
       nhl::compat::SetEnv("REX_SKIP_PS", "798AC034734C6A98");
     }
+#ifdef NHL_HAVE_VULKAN_BACKEND
+    if (std::getenv("NHL_KEEP_EDGE_AA")) {
+      nhl::graphics::SetEdgeAaMode(nhl::graphics::NhlEdgeAaMode::kAlways);
+    } else {
+      nhl::graphics::SetEdgeAaMode(
+          static_cast<nhl::graphics::NhlEdgeAaMode>(nhl::LoadEdgeAaMode(0)));
+    }
+#endif
 #endif
 #ifdef NHL_HAVE_VULKAN_BACKEND
     // SPIKE: opt-in env gate to drive the SDK's native Vulkan ROV/EDRAM backend

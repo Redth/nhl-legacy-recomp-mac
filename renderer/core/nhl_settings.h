@@ -120,6 +120,18 @@ inline void SaveShadowSoftness(int v) {
   SaveSetting("shadow_softness", std::to_string(v));
 }
 
+// Edge-AA pass gating: 0 = Auto (on in menus, off in gameplay), 1 = Always on,
+// 2 = Always off. The game's own edge-AA/bloom shader sharpens the flat 2D menu
+// art but blows player and stick silhouettes out to white over the 3D scene, so
+// Auto follows the scene detector. Hot-switchable (it is a per-draw test, not a
+// pipeline rebuild), and persisted so the choice survives a relaunch.
+inline int LoadEdgeAaMode(int fallback) { return LoadInt("edge_aa_mode", fallback, 0, 2); }
+inline void SaveEdgeAaMode(int v) {
+  if (v < 0) v = 0;
+  if (v > 2) v = 2;
+  SaveSetting("edge_aa_mode", std::to_string(v));
+}
+
 // Borderless-fullscreen vs windowed (the SDK's "fullscreen" cvar is borderless).
 inline bool LoadFullscreen(bool fallback) { return LoadBool("fullscreen", fallback); }
 inline void SaveFullscreen(bool v) { SaveSetting("fullscreen", v ? "1" : "0"); }

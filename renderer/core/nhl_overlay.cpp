@@ -23,6 +23,7 @@
 
 #include "renderer/core/nhl_input_gate.h"
 #include "renderer/core/nhl_settings.h"
+#include "renderer/core/nhl_scene_state.h"
 
 // SDK GPU cvars driven by the cheap-win knobs. draw_resolution_scale_* are
 // defined in the SDK texture cache and read at backend init (VulkanTextureCache::
@@ -277,6 +278,23 @@ void NhlEnhancementsDialog::OnDraw(ImGuiIO& io) {
       }
       ImGui::SameLine();
       ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "[restart]");
+
+      // Edge AA. The game's own edge-AA/bloom pass sharpens the flat 2D menu art
+      // but blows player and stick silhouettes out to white over the 3D scene.
+      // It is skipped by pixel-shader hash, which is a per-draw test, so unlike
+      // Supersampling above this switches live - no restart, no rebuild.
+      {
+        static const char* kEdgeAaModes[] = {"Auto (menus only)", "Always on", "Always off"};
+        int edge_aa = int(nhl::graphics::GetEdgeAaMode());
+        if (ImGui::Combo("Edge AA", &edge_aa, kEdgeAaModes, IM_ARRAYSIZE(kEdgeAaModes))) {
+          nhl::graphics::SetEdgeAaMode(nhl::graphics::NhlEdgeAaMode(edge_aa));
+          nhl::SaveEdgeAaMode(edge_aa);
+        }
+        const bool in_3d = nhl::graphics::ReadSceneKind() == nhl::graphics::NhlSceneKind::kScene3D;
+        ImGui::TextDisabled("scene: %s \xE2\x80\x94 pass currently %s",
+                            in_3d ? "gameplay/3D" : "menu/2D",
+                            (edge_aa == 1 || (edge_aa == 0 && !in_3d)) ? "on" : "off");
+      }
 
       // Soften shadows: restore bilinear filtering on the guest's depth/shadow
       // maps. Read per-draw in the texture cache, so this is live (no restart).

@@ -13,6 +13,7 @@
 
 #pragma once
 
+#include "renderer/core/nhl_scene_state.h"
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -44,6 +45,7 @@ NhlVkPerfSnapshot ReadVkPerf();
 // driven by a fixed scripted input timeline, so frame N is the same moment.
 void PublishVkFrameIndex(uint64_t frame_index);
 uint64_t ReadVkFrameIndex();
+
 
 class NhlVkCommandProcessor : public rex::graphics::vulkan::VulkanCommandProcessor {
  public:
@@ -103,6 +105,13 @@ class NhlVkCommandProcessor : public rex::graphics::vulkan::VulkanCommandProcess
   uint32_t last_seq_tile_ = 0xFFFFFFFFu;
   const bool skip_unfold_ = std::getenv("NHL_VK_SKIP_UNFOLD") != nullptr;
   uint32_t last_draw_pitch_ = 0;
+  // Scene detection: draws this frame against the 640-pitch (folded) 3D surface.
+  uint32_t folded_draws_this_frame_ = 0;
+  // Hysteresis so a single odd frame (a loading screen that briefly touches the
+  // scene surface, or a menu drawn over a paused rink) cannot flip the mode.
+  uint32_t scene_agree_frames_ = 0;
+  bool scene_is_3d_ = false;
+  void UpdateSceneKind();
   const bool copy_barrier_on_ = std::getenv("NHL_VK_COPY_BARRIER") != nullptr;
   bool exp_skip_dxt3_ = false, exp_skip_alphatest_ = false, exp_skip_blend_ = false;
   uint32_t exp_skip_addr_ = 0;   // NHL_VK_SKIP_ADDR (hex), 0 = off

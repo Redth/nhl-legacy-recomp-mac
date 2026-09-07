@@ -20,6 +20,13 @@
 #  - Suppress the FIRST tiling pass's colour clear only. MoltenVK will not order
 #    that compute clear before the next pass's fragment writes by any available
 #    means, so it lands on top of pass B's geometry.
+#  - g_skip_ps_active: make the REX_SKIP_PS draw filter a live atomic instead of
+#    a value latched from the environment at startup, so the port can gate NHL's
+#    edge-AA/bloom pass per frame (wanted over the 2D menus, blows silhouettes
+#    out to white over the 3D scene).
+#  - REX_GFX_REINIT_AT_SWAP: probe that tears down and rebuilds the graphics
+#    context mid-run, to measure whether a supersampling change could be applied
+#    live. See the comment on MaybeReinitContextForProbe for the result.
 #  - Diagnostics behind env vars (REX_VP_LOG, REX_VP_INPUT_LOG,
 #    REX_CLEAR_DEBUG_COLOR, REX_RESOLVE_SAMPLE, ...) - all no-ops when unset.
 
@@ -316,10 +323,33 @@ index 3da182d..5d71ae1 100644
      constants_out.coordinate_info = coordinate_info;
    }
 diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
-index 696ff48..f01e335 100644
+index 696ff48..4eb323f 100644
 --- a/include/rex/graphics/vulkan/command_processor.h
 +++ b/include/rex/graphics/vulkan/command_processor.h
-@@ -204,6 +204,11 @@ class VulkanCommandProcessor : public CommandProcessor {
+@@ -10,6 +10,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <atomic>
+ #include <array>
+ #include <climits>
+ #include <cstdint>
+@@ -45,6 +46,14 @@
+ 
+ namespace rex::graphics::vulkan {
+ 
++// Live gate for the REX_SKIP_PS draw filter (see IssueDraw). NHL Legacy's
++// edge-AA/bloom pass is wanted over the 2D menus but saturates to white over
++// the 3D scene, so the port flips this per frame from its scene detector rather
++// than deciding once from the environment at startup. Default true = the
++// REX_SKIP_PS list applies, which is the behaviour before this hook existed.
++extern std::atomic<bool> g_skip_ps_active;
++
++
+ class VulkanCommandProcessor : public CommandProcessor {
+  public:
+   // Single-descriptor layouts for use within a single frame.
+@@ -204,6 +213,11 @@ class VulkanCommandProcessor : public CommandProcessor {
    // scope. Submission must be open.
    void EndRenderPass();
  
@@ -331,7 +361,7 @@ index 696ff48..f01e335 100644
    VkDescriptorSetLayout GetSingleTransientDescriptorLayout(
        SingleTransientDescriptorLayout transient_descriptor_layout) const {
      return descriptor_set_layouts_single_transient_[size_t(transient_descriptor_layout)];
-@@ -416,6 +421,33 @@ class VulkanCommandProcessor : public CommandProcessor {
+@@ -416,6 +430,34 @@ class VulkanCommandProcessor : public CommandProcessor {
    // clearing and stopping capturing. Returns whether the submission was done
    // successfully, if it has failed, leaves it open.
    bool EndSubmission(bool is_swap);
@@ -362,6 +392,7 @@ index 696ff48..f01e335 100644
 +  uint64_t readback_bytes_this_frame_ = 0;
 +
 +  void ReportReadbackStats();
++  void MaybeReinitContextForProbe();
    bool AwaitAllQueueOperationsCompletion() {
      CheckSubmissionFenceAndDeviceLoss(GetCurrentSubmission());
      return !submission_open_ && submissions_in_flight_fences_.empty();
@@ -998,10 +1029,19 @@ index 305380e..152ef1f 100644
         xenos::IsColorResolveFormatBitwiseEquivalent(
             xenos::ColorRenderTargetFormat(color_edram_info.format),
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index 001f36b..bddd658 100644
+index 001f36b..3ffde36 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
-@@ -1898,6 +1898,8 @@ bool VulkanCommandProcessor::SetupContext() {
+@@ -71,6 +71,8 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
+ 
+ namespace rex::graphics::vulkan {
+ 
++std::atomic<bool> g_skip_ps_active{true};
++
+ namespace {
+ 
+ // glslang default built-in resource limits.
+@@ -1898,6 +1900,8 @@ bool VulkanCommandProcessor::SetupContext() {
  
  void VulkanCommandProcessor::ShutdownContext() {
    AwaitAllQueueOperationsCompletion();
@@ -1010,7 +1050,7 @@ index 001f36b..bddd658 100644
    InvalidateAllVertexBufferResidency();
    ShutdownOcclusionQueryResources();
  
-@@ -3253,6 +3255,121 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+@@ -3253,6 +3257,121 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
    in_render_pass_ = true;
  }
  
@@ -1132,7 +1172,7 @@ index 001f36b..bddd658 100644
  void VulkanCommandProcessor::EndRenderPass() {
    assert_true(submission_open_);
    if (!in_render_pass_) {
-@@ -3661,6 +3778,100 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3661,6 +3780,102 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
          }
        }
      }
@@ -1220,7 +1260,9 @@ index 001f36b..bddd658 100644
 +        }
 +      }
 +      static const char* skip_env = std::getenv("REX_SKIP_PS");
-+      if (skip_env) {
++      // g_skip_ps_active lets the port turn the filter on and off per frame
++      // (NHL wants its edge-AA pass in menus but not over the 3D scene).
++      if (skip_env && g_skip_ps_active.load(std::memory_order_relaxed)) {
 +        for (const char* q = skip_env; *q;) {
 +          char* qe = nullptr;
 +          const uint64_t want = std::strtoull(q, &qe, 16);
@@ -1233,7 +1275,7 @@ index 001f36b..bddd658 100644
    } else {
      // Disabling pixel shader for this case is also required by the pipeline
      // cache.
-@@ -3707,6 +3918,11 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3707,6 +3922,11 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
        return draw_fail("begin_submission");
      }
  
@@ -1245,7 +1287,7 @@ index 001f36b..bddd658 100644
      // Process primitives.
      if (!primitive_processor_->Process(primitive_processing_result)) {
        return draw_fail("primitive_processing");
-@@ -4393,11 +4609,61 @@ bool VulkanCommandProcessor::IssueCopy() {
+@@ -4393,11 +4613,61 @@ bool VulkanCommandProcessor::IssueCopy() {
    ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
    if (readback_mode == ReadbackResolveMode::kDisabled) {
      uint32_t written_address, written_length;
@@ -1310,7 +1352,7 @@ index 001f36b..bddd658 100644
  }
  
  bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
-@@ -4473,6 +4739,40 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
+@@ -4473,6 +4743,40 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
    };
  
    bool is_scaled = texture_cache_->IsDrawResolutionScaled();
@@ -1351,7 +1393,7 @@ index 001f36b..bddd658 100644
    uint64_t resolve_key = MakeReadbackResolveKey(written_address, written_length);
    ReadbackBuffer& readback = readback_buffers_[resolve_key];
    readback.last_used_frame = frame_current_;
-@@ -4654,8 +4954,17 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
+@@ -4654,8 +4958,17 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
    uint32_t read_index = write_index;
    if (use_delayed_sync) {
      read_index = 1 - write_index;
@@ -1371,18 +1413,51 @@ index 001f36b..bddd658 100644
    }
  
    bool is_cache_miss = false;
-@@ -5230,6 +5539,10 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+@@ -5229,7 +5542,43 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+   return true;
  }
  
++// REX_GFX_REINIT_AT_SWAP=<n>: at the nth swap, tear the graphics context down
++// and build it back up. Feasibility probe for switching the resolution scale at
++// runtime: the scale is baked into every translated shader and sizes the EDRAM
++// and scaled-resolve buffers, so a live change means exactly this rebuild.
++// REX_GFX_REINIT_AT_SWAP=<n>: tear the graphics context down and rebuild it at
++// swap n. This exists to answer whether a resolution/supersampling change could
++// be applied live instead of at restart - the draw-resolution scale is baked
++// into translated shaders, EDRAM sizing and the scaled-resolve buffer, so
++// changing it means rebuilding all of that.
++//
++// RESULT (M4, MoltenVK, swap 5000): the rebuild works. It reports SUCCEEDED and
++// takes 77 ms, which is an acceptable hitch. But the teardown destroys EDRAM,
++// and NHL accumulates its menu backdrop in EDRAM across frames rather than
++// redrawing it, so the image is ~62% green garbage 100 frames later and only
++// comes back at the next full scene change (clean again by frame 600). That is
++// a multi-second visible glitch, so supersampling stays restart-scoped. Kept as
++// a probe: it is the measurement, and it is off unless the env var is set.
++void VulkanCommandProcessor::MaybeReinitContextForProbe() {
++  static const char* at_env = std::getenv("REX_GFX_REINIT_AT_SWAP");
++  if (!at_env) return;
++  static const uint64_t at = std::strtoull(at_env, nullptr, 10);
++  static uint64_t swaps = 0;
++  if (++swaps != at) return;
++  REXGPU_INFO("[rex-reinit] tearing down the graphics context at swap {}", swaps);
++  ShutdownContext();
++  const bool ok = SetupContext();
++  REXGPU_INFO("[rex-reinit] rebuild {}", ok ? "SUCCEEDED" : "FAILED");
++}
++
  bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
 +  if (is_swap) {
 +    FlushDeferredReadbacks();
 +    ReportReadbackStats();
 +  }
++  if (is_swap) {
++    MaybeReinitContextForProbe();
++  }
    const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
    const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
    const VkDevice device = vulkan_device->device();
-@@ -5703,6 +6016,30 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
+@@ -5703,6 +6052,30 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
    scissor_rect.extent.height = scissor.extent[1];
    SetScissor(scissor_rect);
  
@@ -1413,7 +1488,7 @@ index 001f36b..bddd658 100644
    if (render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
      // Depth bias.
      float depth_bias_constant_factor, depth_bias_slope_factor;
-@@ -6206,8 +6543,20 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
+@@ -6206,8 +6579,20 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
    // Alpha test.
    dirty |= system_constants_.alpha_test_reference != rb_alpha_ref;
    system_constants_.alpha_test_reference = rb_alpha_ref;
@@ -1753,6 +1828,32 @@ index 0298f06..caf232c 100644
    if (command_processor_.PushBufferMemoryBarrier(edram_buffer_, 0, VK_WHOLE_SIZE, src_stage_mask,
                                                   dst_stage_mask, src_access_mask,
                                                   dst_access_mask)) {
+diff --git a/src/graphics/vulkan/texture_cache.cpp b/src/graphics/vulkan/texture_cache.cpp
+index ecbd940..bcb87c5 100644
+--- a/src/graphics/vulkan/texture_cache.cpp
++++ b/src/graphics/vulkan/texture_cache.cpp
+@@ -864,7 +864,20 @@ VkSampler VulkanTextureCache::UseSampler(SamplerParameters parameters, bool& has
+   sampler_create_info.addressModeU = kAddressModeMap[uint32_t(parameters.clamp_x)];
+   sampler_create_info.addressModeV = kAddressModeMap[uint32_t(parameters.clamp_y)];
+   sampler_create_info.addressModeW = kAddressModeMap[uint32_t(parameters.clamp_z)];
+-  // LOD biasing is performed in shaders.
++  // LOD biasing is otherwise performed in shaders; this is an additional global
++  // bias on top.
++  //
++  // REX_TEX_LOD_BIAS: the residual shimmer on this port - the jersey lattice,
++  // the crowd criss-cross, the 4x4 pattern over the boards and glass - is
++  // undersampled high-frequency texture content (2x SSAA removes it, and it
++  // survives every shader-semantics fix). Nudging minified sampling towards
++  // blurrier mips attacks that directly, costs nothing, and unlike
++  // supersampling it applies in menus too and needs no restart.
++  {
++    static const char* bias_env = std::getenv("REX_TEX_LOD_BIAS");
++    static const float bias = bias_env ? float(std::atof(bias_env)) : 0.0f;
++    sampler_create_info.mipLodBias = bias;
++  }
+   if (parameters.aniso_filter != xenos::AnisoFilter::kDisabled) {
+     sampler_create_info.anisotropyEnable = VK_TRUE;
+     sampler_create_info.maxAnisotropy =
 diff --git a/src/input/input_system.cpp b/src/input/input_system.cpp
 index 813bb1c..55bf85a 100644
 --- a/src/input/input_system.cpp
