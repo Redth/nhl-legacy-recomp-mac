@@ -42,10 +42,25 @@ index 9b3cdf5..abfeb3d 100644
  # SDK install support
  include(GNUInstallDirs)
 diff --git a/include/rex/graphics/pipeline/shader/spirv_translator.h b/include/rex/graphics/pipeline/shader/spirv_translator.h
-index dce3dbf..55bdbc4 100644
+index dce3dbf..07d6f22 100644
 --- a/include/rex/graphics/pipeline/shader/spirv_translator.h
 +++ b/include/rex/graphics/pipeline/shader/spirv_translator.h
-@@ -649,6 +649,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
+@@ -78,8 +78,12 @@ class SpirvShaderTranslator : public ShaderTranslator {
+       uint32_t interpolator_mask : xenos::kMaxInterpolators;
+       uint32_t interpolators_centroid : xenos::kMaxInterpolators;
+       // uint32_t 1.
+-      // Dynamically indexable register count from SQ_PROGRAM_CNTL.
+-      uint32_t dynamic_addressable_register_count : 8;
++      // Dynamically indexable register count from SQ_PROGRAM_CNTL. 7 bits is
++      // enough: the Xenos has 64 GPRs, and the assignment clamps.
++      uint32_t dynamic_addressable_register_count : 7;
++      // Interpolators to declare Flat (constant across the primitive) rather
++      // than smoothly interpolated - see SQ_INTERPOLATOR_CNTL::param_shade.
++      uint32_t interpolators_flat : xenos::kMaxInterpolators;
+       uint32_t param_gen_enable : 1;
+       uint32_t param_gen_interpolator : 4;
+       // If param_gen_enable is set, this must be set for point primitives, and
+@@ -649,6 +653,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
    // destination. If the return value is ps itself (in the retain_prev case),
    // returns spv::NoResult (handled as a special case, so if it's retain_prev,
    // but don't need to write to anywhere, no OpLoad(ps) will be done).
@@ -474,7 +489,7 @@ index 0d8f8af..6dc19af 100644
  
  target_include_directories(rexgpu-xenos PRIVATE
 diff --git a/src/graphics/pipeline/shader/spirv_translator.cpp b/src/graphics/pipeline/shader/spirv_translator.cpp
-index 1774f97..bf047c1 100644
+index 1774f97..d5f3eff 100644
 --- a/src/graphics/pipeline/shader/spirv_translator.cpp
 +++ b/src/graphics/pipeline/shader/spirv_translator.cpp
 @@ -9,6 +9,7 @@
@@ -504,6 +519,21 @@ index 1774f97..bf047c1 100644
        demote_to_helper_invocation(vulkan_device->properties().shaderDemoteToHelperInvocation),
        sample_rate_shading(vulkan_device->properties().sampleRateShading) {
    const uint32_t vulkan_api_version = vulkan_device->properties().apiVersion;
+@@ -2865,8 +2876,13 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
+             fmt::format("xe_in_interpolator_{}", interpolator_index).c_str());
+         input_output_interpolators_[interpolator_index] = interpolator;
+         builder_->addDecoration(interpolator, spv::DecorationLocation, int(input_location));
+-        if (shader_modification.pixel.interpolators_centroid &
++        if (shader_modification.pixel.interpolators_flat &
+             (UINT32_C(1) << interpolator_index)) {
++          // Flat overrides sampling: the value is taken from the provoking
++          // vertex, so Centroid would be meaningless alongside it.
++          builder_->addDecoration(interpolator, spv::DecorationFlat);
++        } else if (shader_modification.pixel.interpolators_centroid &
++                   (UINT32_C(1) << interpolator_index)) {
+           builder_->addDecoration(interpolator, spv::DecorationCentroid);
+         }
+         main_interface_.push_back(interpolator);
 diff --git a/src/graphics/pipeline/shader/spirv_translator_alu.cpp b/src/graphics/pipeline/shader/spirv_translator_alu.cpp
 index 706ac7e..b83ee36 100644
 --- a/src/graphics/pipeline/shader/spirv_translator_alu.cpp
@@ -1367,10 +1397,51 @@ index b49e033..60d4e72 100644
          auto& args = *reinterpret_cast<const ArgsVkCopyBufferToImage*>(stream);
          dfn.vkCmdCopyBufferToImage(
 diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
-index 91ac08f..0b0a72a 100644
+index 91ac08f..953f7bd 100644
 --- a/src/graphics/vulkan/pipeline_cache.cpp
 +++ b/src/graphics/vulkan/pipeline_cache.cpp
-@@ -1246,6 +1246,13 @@ bool VulkanPipelineCache::TranslateAnalyzedShader(SpirvShaderTranslator& transla
+@@ -966,10 +966,38 @@ SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentPixelShaderMo
+   const auto& regs = register_file_;
+ 
+   SpirvShaderTranslator::Modification modification(
+-      shader_translator_->GetDefaultPixelShaderModification(
+-          shader.GetDynamicAddressableRegisterCount(regs.Get<reg::SQ_PROGRAM_CNTL>().ps_num_reg)));
++      shader_translator_->GetDefaultPixelShaderModification(std::min(
++          shader.GetDynamicAddressableRegisterCount(regs.Get<reg::SQ_PROGRAM_CNTL>().ps_num_reg),
++          uint32_t(127))));
+ 
+   modification.pixel.interpolator_mask = interpolator_mask;
++  // REX_FLAT_INTERP: honour SQ_INTERPOLATOR_CNTL::param_shade, which selects the
++  // interpolation mode per parameter and which nothing in this codebase reads.
++  // Smoothly interpolating a parameter the guest wants constant across the
++  // primitive makes adjacent triangles disagree at their shared edge, which
++  // shows as a visible line along every polygon edge.
++  //
++  // Polarity established empirically: a SET bit means the parameter is
++  // interpolated, so the interpolators the pixel shader reads that param_shade
++  // does NOT mark are flat. The inverse (mode 2) renders an almost entirely
++  // black screen, which settles it.
++  //   1 = default: interpolators NOT in param_shade are flat
++  //   2 = inverted, kept only so the negative result stays reproducible
++  //   0 = off (REX_NO_FLAT_INTERP=1)
++  {
++    static const char* flat_env = std::getenv("REX_FLAT_INTERP");
++    const int flat_mode = std::getenv("REX_NO_FLAT_INTERP")
++                              ? 0
++                              : (flat_env ? std::atoi(flat_env) : 1);
++    const uint32_t param_shade = regs.Get<reg::SQ_INTERPOLATOR_CNTL>().param_shade;
++    uint32_t flat = 0;
++    if (flat_mode == 1) {
++      flat = interpolator_mask & ~param_shade;
++    } else if (flat_mode == 2) {
++      flat = interpolator_mask & param_shade;
++    }
++    modification.pixel.interpolators_flat = flat;
++  }
+   modification.pixel.interpolators_centroid =
+       interpolator_mask & ~xenos::GetInterpolatorSamplingPattern(
+                               regs.Get<reg::RB_SURFACE_INFO>().msaa_samples,
+@@ -1246,6 +1274,13 @@ bool VulkanPipelineCache::TranslateAnalyzedShader(SpirvShaderTranslator& transla
      return false;
    }
  
