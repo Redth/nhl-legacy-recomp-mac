@@ -503,6 +503,35 @@ void NhlVkCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
   PublishVkFrameIndex(frames_total_);
   UpdateSceneKind();
 
+  // NHL_FXAA_AT_FRAME=<n>: flip the SDK's swap post effect on at guest frame n.
+  //
+  // Measuring a post-process across two runs does not work here - the runs
+  // diverge (mean|luma diff| 53 by frame 6600, against a same-config floor of
+  // 2.6), so region metrics compare different game states and are noise.
+  // Switching mid-run lets frames a few apart in the SAME run be compared,
+  // where the state is effectively identical.
+  //
+  // RESULT: FXAA does NOT fix the residual boards/glass/ice artifacts, so it is
+  // not wired into the overlay. It runs correctly on this MoltenVK path and is
+  // properly edge-directed (53.7% of edge pixels changed vs 2.3% of flat ones)
+  // and it does cut global high-frequency energy 13-17%, but the artifact is a
+  // regular sub-pixel checker over flat surfaces, not a luminance edge - FXAA's
+  // detector does not fire on it and there is no detail to reconstruct anyway.
+  // A 3x zoom of the boards/ice with it off and on is indistinguishable in the
+  // pattern. 2x supersampling remains the only thing that removes it
+  // (boards checker +7.30 -> -0.20), because it actually samples more.
+  //
+  // Note when using this: pausing to freeze the scene does NOT work - NHL's
+  // pause screen is full-screen 2D and hides the rink entirely, so the frame
+  // measures menu text, not the artifact.
+  if (const char* fxaa_at = std::getenv("NHL_FXAA_AT_FRAME")) {
+    const uint64_t at = std::strtoull(fxaa_at, nullptr, 10);
+    if (frames_total_ == at) {
+      SetDesiredSwapPostEffect(SwapPostEffect::kFxaa);
+      REXLOG_INFO("[nhl-fxaa] swap post effect -> fxaa at frame {}", frames_total_);
+    }
+  }
+
   if (!started_) {
     started_ = true;
     window_start_ = now;
