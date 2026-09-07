@@ -42,10 +42,17 @@ index 9b3cdf5..abfeb3d 100644
  # SDK install support
  include(GNUInstallDirs)
 diff --git a/include/rex/graphics/pipeline/shader/spirv_translator.h b/include/rex/graphics/pipeline/shader/spirv_translator.h
-index dce3dbf..07d6f22 100644
+index dce3dbf..45dd761 100644
 --- a/include/rex/graphics/pipeline/shader/spirv_translator.h
 +++ b/include/rex/graphics/pipeline/shader/spirv_translator.h
-@@ -78,8 +78,12 @@ class SpirvShaderTranslator : public ShaderTranslator {
+@@ -1,4 +1,6 @@
+ #pragma once
++
++#include <cstdlib>
+ /**
+  ******************************************************************************
+  * Xenia : Xbox 360 Emulator Research Project                                 *
+@@ -78,8 +80,12 @@ class SpirvShaderTranslator : public ShaderTranslator {
        uint32_t interpolator_mask : xenos::kMaxInterpolators;
        uint32_t interpolators_centroid : xenos::kMaxInterpolators;
        // uint32_t 1.
@@ -60,7 +67,26 @@ index dce3dbf..07d6f22 100644
        uint32_t param_gen_enable : 1;
        uint32_t param_gen_interpolator : 4;
        // If param_gen_enable is set, this must be set for point primitives, and
-@@ -649,6 +653,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
+@@ -550,8 +556,18 @@ class SpirvShaderTranslator : public ShaderTranslator {
+     return depth_stencil_mode == Modification::DepthStencilMode::kFloat24Truncating ||
+            depth_stencil_mode == Modification::DepthStencilMode::kFloat24Rounding;
+   }
++  // REX_FSI_SAMPLE_RATE: run the FSI pixel shader at SAMPLE rate even when the
++  // guest's depth format does not already force it (kD24S8 does not). Per-sample
++  // invocations are what make gl_SampleMaskIn carry a single sample's coverage,
++  // which is the only way to write the guest's two MSAA samples independently -
++  // and hence the only way alpha-to-coverage can produce real partial coverage
++  // instead of a hard screen-space stipple.
+   bool IsSampleRate() const {
+     assert_true(is_pixel_shader());
++    static const bool force = std::getenv("REX_FSI_SAMPLE_RATE") != nullptr;
++    if (force && edram_fragment_shader_interlock_ && !current_shader().writes_depth()) {
++      return true;
++    }
+     return IsWritingFloat24Depth() && !current_shader().writes_depth();
+   }
+ 
+@@ -649,6 +665,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
    // destination. If the return value is ps itself (in the retain_prev case),
    // returns spv::NoResult (handled as a special case, so if it's retain_prev,
    // but don't need to write to anywhere, no OpLoad(ps) will be done).
@@ -605,10 +631,10 @@ index 706ac7e..b83ee36 100644
      case ucode::AluScalarOpcode::kRsqc: {
        spv::Id result = builder_->createUnaryBuiltinCall(
 diff --git a/src/graphics/pipeline/shader/spirv_translator_rb.cpp b/src/graphics/pipeline/shader/spirv_translator_rb.cpp
-index 765c141..16c1497 100644
+index 765c141..56c0bad 100644
 --- a/src/graphics/pipeline/shader/spirv_translator_rb.cpp
 +++ b/src/graphics/pipeline/shader/spirv_translator_rb.cpp
-@@ -1488,13 +1488,66 @@ void SpirvShaderTranslator::FSI_LoadSampleMask(spv::Id msaa_samples) {
+@@ -1488,13 +1488,69 @@ void SpirvShaderTranslator::FSI_LoadSampleMask(spv::Id msaa_samples) {
          builder_->createUnaryOp(spv::OpBitReverse, type_uint_, input_sample_mask_value),
          builder_->makeUintConstant(32 - 2));
    } else {
@@ -647,8 +673,11 @@ index 765c141..16c1497 100644
 +  // exactly the un-antialiased image, and no stale EDRAM can leak in.
 +  // ON by default. Set REX_FSI_2X_HOST_COVERAGE=1 to trust the host coverage
 +  // bits again (correct on desktop Vulkan, broken under MoltenVK).
-+  static const bool both_samples =
-+      std::getenv("REX_FSI_2X_HOST_COVERAGE") == nullptr;
++  // Also disabled when running at sample rate: there each invocation carries a
++  // single sample's coverage, so the host mask is usable directly and forcing
++  // both samples would defeat alpha-to-coverage.
++  static const bool both_samples = std::getenv("REX_FSI_2X_HOST_COVERAGE") == nullptr &&
++                                   std::getenv("REX_FSI_SAMPLE_RATE") == nullptr;
 +  if (both_samples) {
 +    spv::Id write_this_invocation =
 +        builder_->createBinOp(spv::OpINotEqual, type_bool_,
@@ -969,7 +998,7 @@ index 305380e..152ef1f 100644
         xenos::IsColorResolveFormatBitwiseEquivalent(
             xenos::ColorRenderTargetFormat(color_edram_info.format),
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index 001f36b..1374eef 100644
+index 001f36b..877cc4a 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -1898,6 +1898,8 @@ bool VulkanCommandProcessor::SetupContext() {
@@ -1103,7 +1132,7 @@ index 001f36b..1374eef 100644
  void VulkanCommandProcessor::EndRenderPass() {
    assert_true(submission_open_);
    if (!in_render_pass_) {
-@@ -3661,6 +3778,96 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3661,6 +3778,100 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
          }
        }
      }
@@ -1147,9 +1176,13 @@ index 001f36b..1374eef 100644
 +          const uint32_t used = pixel_shader->GetInterpolatorInputMask(
 +              regs.Get<reg::SQ_PROGRAM_CNTL>(), regs.Get<reg::SQ_CONTEXT_MISC>(),
 +              param_gen_pos_unused);
++          const auto sc = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
 +          REXGPU_INFO(
-+              "[rex-shade] param_shade=0x{:04X} interp_used=0x{:04X} equal={} union=0x{:04X}",
-+              shade, used, (shade == used) ? "YES" : "no", seen_mask);
++              "[rex-shade] param_shade=0x{:04X} interp_used=0x{:04X} equal={} union=0x{:04X} "
++              "| persp_corr_dis={} provoking_vtx_last={} msaa_enable={} quad_order={}",
++              shade, used, (shade == used) ? "YES" : "no", seen_mask,
++              uint32_t(sc.persp_corr_dis), uint32_t(sc.provoking_vtx_last),
++              uint32_t(sc.msaa_enable), uint32_t(sc.quad_order_enable));
 +        }
 +      }
 +      static const char* trace_env = std::getenv("REX_PS_TRACE");
@@ -1200,7 +1233,7 @@ index 001f36b..1374eef 100644
    } else {
      // Disabling pixel shader for this case is also required by the pipeline
      // cache.
-@@ -3707,6 +3914,11 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3707,6 +3918,11 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
        return draw_fail("begin_submission");
      }
  
@@ -1212,7 +1245,7 @@ index 001f36b..1374eef 100644
      // Process primitives.
      if (!primitive_processor_->Process(primitive_processing_result)) {
        return draw_fail("primitive_processing");
-@@ -4393,11 +4605,61 @@ bool VulkanCommandProcessor::IssueCopy() {
+@@ -4393,11 +4609,61 @@ bool VulkanCommandProcessor::IssueCopy() {
    ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
    if (readback_mode == ReadbackResolveMode::kDisabled) {
      uint32_t written_address, written_length;
@@ -1277,7 +1310,7 @@ index 001f36b..1374eef 100644
  }
  
  bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
-@@ -4473,6 +4735,40 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
+@@ -4473,6 +4739,40 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
    };
  
    bool is_scaled = texture_cache_->IsDrawResolutionScaled();
@@ -1318,7 +1351,7 @@ index 001f36b..1374eef 100644
    uint64_t resolve_key = MakeReadbackResolveKey(written_address, written_length);
    ReadbackBuffer& readback = readback_buffers_[resolve_key];
    readback.last_used_frame = frame_current_;
-@@ -4654,8 +4950,17 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
+@@ -4654,8 +4954,17 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
    uint32_t read_index = write_index;
    if (use_delayed_sync) {
      read_index = 1 - write_index;
@@ -1338,7 +1371,7 @@ index 001f36b..1374eef 100644
    }
  
    bool is_cache_miss = false;
-@@ -5230,6 +5535,10 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+@@ -5230,6 +5539,10 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
  }
  
  bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
@@ -1349,7 +1382,7 @@ index 001f36b..1374eef 100644
    const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
    const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
    const VkDevice device = vulkan_device->device();
-@@ -5703,6 +6012,30 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
+@@ -5703,6 +6016,30 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
    scissor_rect.extent.height = scissor.extent[1];
    SetScissor(scissor_rect);
  
@@ -1397,7 +1430,7 @@ index b49e033..60d4e72 100644
          auto& args = *reinterpret_cast<const ArgsVkCopyBufferToImage*>(stream);
          dfn.vkCmdCopyBufferToImage(
 diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
-index 91ac08f..953f7bd 100644
+index 91ac08f..9bdf49f 100644
 --- a/src/graphics/vulkan/pipeline_cache.cpp
 +++ b/src/graphics/vulkan/pipeline_cache.cpp
 @@ -966,10 +966,38 @@ SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentPixelShaderMo
@@ -1455,6 +1488,22 @@ index 91ac08f..953f7bd 100644
    // TODO(Triang3l): Log that the shader has been successfully translated in
    // common code.
  
+@@ -1386,9 +1421,14 @@ bool VulkanPipelineCache::GetCurrentStateDescription(
+     SpirvShaderTranslator::Modification pixel_shader_modification(
+         description_out.pixel_shader_modification);
+     using DepthStencilMode = SpirvShaderTranslator::Modification::DepthStencilMode;
++    // Must agree with SpirvShaderTranslator::IsSampleRate(), including the
++    // REX_FSI_SAMPLE_RATE override.
++    static const bool force_sample_rate = std::getenv("REX_FSI_SAMPLE_RATE") != nullptr;
++    const bool fsi = render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
+     description_out.sample_rate_shading =
+         !pixel_shader->shader().writes_depth() &&
+-        (pixel_shader_modification.pixel.depth_stencil_mode ==
++        ((force_sample_rate && fsi) ||
++         pixel_shader_modification.pixel.depth_stencil_mode ==
+              DepthStencilMode::kFloat24Truncating ||
+          pixel_shader_modification.pixel.depth_stencil_mode == DepthStencilMode::kFloat24Rounding);
+   }
 diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
 index 0298f06..caf232c 100644
 --- a/src/graphics/vulkan/render_target_cache.cpp

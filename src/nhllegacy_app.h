@@ -785,6 +785,32 @@ class NhllegacyApp : public rex::ReXApp {
     // guest frame to shot_<n>s.png at each listed time. Headless-friendly proof
     // that the renderer is producing real output (macOS screencapture needs
     // Screen Recording permission, which a terminal usually lacks).
+    // NHL_SHOT_AFTER_FRAME=<n>[,<n>...]: capture at an exact GUEST FRAME index
+    // instead of a wall-clock time. The guest runs a fixed scripted input
+    // timeline, so frame N is the same moment in every run - which makes A/B
+    // captures between two builds/settings genuinely comparable. Wall-clock
+    // captures drift by seconds and land on different scenes.
+    if (const char* s = std::getenv("NHL_SHOT_AFTER_FRAME"); s && *s) {
+      std::vector<uint64_t> at;
+      for (const char* p = s; *p;) {
+        char* end = nullptr;
+        const uint64_t v = std::strtoull(p, &end, 10);
+        if (end == p) break;
+        at.push_back(v);
+        p = (*end == ',') ? end + 1 : end;
+      }
+      std::thread([this, at]() {
+        for (uint64_t want : at) {
+          while (nhl::graphics::ReadVkFrameIndex() < want) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+          }
+          char name[64];
+          std::snprintf(name, sizeof(name), "frame_%llu.png",
+                        static_cast<unsigned long long>(want));
+          CaptureFrameToPng(name);
+        }
+      }).detach();
+    }
     if (const char* s = std::getenv("NHL_SHOT_AFTER_SEC"); s && *s) {
       std::vector<unsigned> at;
       for (const char* p = s; *p;) {

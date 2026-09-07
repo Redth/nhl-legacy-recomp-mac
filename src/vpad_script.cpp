@@ -14,6 +14,8 @@
 
 #include <rex/logging.h>
 
+#include "renderer/core/nhl_vk_backend.h"
+
 namespace nhllegacy {
 
 namespace {
@@ -44,7 +46,7 @@ SDL_GamepadButton ButtonByName(const std::string& n) {
   return SDL_GAMEPAD_BUTTON_INVALID;
 }
 
-std::vector<Press> ParseScript(const char* spec) {
+std::vector<Press> ParseScript(const char* spec, bool frame_based) {
   std::vector<Press> out;
   std::string s(spec);
   size_t pos = 0;
@@ -55,7 +57,11 @@ std::vector<Press> ParseScript(const char* spec) {
       const size_t c1 = item.find(':');
       if (c1 != std::string::npos) {
         Press p;
-        p.at_ms = static_cast<unsigned>(std::strtod(item.substr(0, c1).c_str(), nullptr) * 1000.0);
+        // In frame mode at_ms holds a frame index, not milliseconds.
+        p.at_ms = frame_based
+                      ? static_cast<unsigned>(std::strtoul(item.substr(0, c1).c_str(), nullptr, 10))
+                      : static_cast<unsigned>(
+                            std::strtod(item.substr(0, c1).c_str(), nullptr) * 1000.0);
         const size_t c2 = item.find(':', c1 + 1);
         const std::string name = item.substr(c1 + 1, c2 == std::string::npos ? std::string::npos
                                                                              : c2 - c1 - 1);
@@ -77,15 +83,22 @@ std::vector<Press> ParseScript(const char* spec) {
 }  // namespace
 
 void StartVpadScript() {
-  const char* spec = std::getenv("NHL_VPAD_SCRIPT");
+  // NHL_VPAD_SCRIPT_FRAMES uses GUEST FRAME indices instead of seconds. The
+  // wall-clock form makes runs diverge: if two runs render at different speeds
+  // the presses land on different guest frames, so the simulation goes a
+  // different way and A/B captures are not comparable. Driving input off the
+  // frame counter makes the whole run reproducible.
+  const bool frame_based = std::getenv("NHL_VPAD_SCRIPT_FRAMES") != nullptr;
+  const char* spec =
+      frame_based ? std::getenv("NHL_VPAD_SCRIPT_FRAMES") : std::getenv("NHL_VPAD_SCRIPT");
   if (!spec || !*spec) return;
-  std::vector<Press> script = ParseScript(spec);
+  std::vector<Press> script = ParseScript(spec, frame_based);
   if (script.empty()) {
     REXLOG_WARN("[nhl-vpad] NHL_VPAD_SCRIPT parsed to nothing: '{}'", spec);
     return;
   }
 
-  std::thread([script = std::move(script)]() {
+  std::thread([script = std::move(script), frame_based]() {
     // The SDK's SDL input driver owns SDL_INIT_GAMEPAD; wait for it rather than
     // racing it, otherwise the attach lands before the driver can observe it.
     for (int i = 0; i < 400 && !SDL_WasInit(SDL_INIT_GAMEPAD); ++i) {
@@ -124,7 +137,11 @@ void StartVpadScript() {
 
     unsigned now_ms = 0;
     for (const Press& p : script) {
-      if (p.at_ms > now_ms) {
+      if (frame_based) {
+        while (nhl::graphics::ReadVkFrameIndex() < p.at_ms) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+      } else if (p.at_ms > now_ms) {
         std::this_thread::sleep_for(std::chrono::milliseconds(p.at_ms - now_ms));
         now_ms = p.at_ms;
       }
@@ -132,8 +149,9 @@ void StartVpadScript() {
       std::this_thread::sleep_for(std::chrono::milliseconds(p.hold_ms));
       SDL_SetJoystickVirtualButton(js, p.button, false);
       now_ms += p.hold_ms;
-      REXLOG_INFO("[nhl-vpad] t={}ms pressed {} for {}ms", p.at_ms,
-                  SDL_GetGamepadStringForButton(p.button), p.hold_ms);
+      REXLOG_INFO("[nhl-vpad] at={} pressed {} for {}ms (guest frame {})", p.at_ms,
+                  SDL_GetGamepadStringForButton(p.button), p.hold_ms,
+                  nhl::graphics::ReadVkFrameIndex());
     }
     REXLOG_INFO("[nhl-vpad] script complete; pad stays attached");
   }).detach();

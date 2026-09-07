@@ -33,6 +33,14 @@ void PublishVkPerf(const NhlVkPerfSnapshot& snapshot) {
   g_perf = snapshot;
 }
 
+std::atomic<uint64_t> g_frame_index{0};
+
+void PublishVkFrameIndex(uint64_t frame_index) {
+  g_frame_index.store(frame_index, std::memory_order_relaxed);
+}
+
+uint64_t ReadVkFrameIndex() { return g_frame_index.load(std::memory_order_relaxed); }
+
 NhlVkPerfSnapshot ReadVkPerf() {
   std::lock_guard<std::mutex> lock(g_perf_mutex);
   return g_perf;
@@ -434,6 +442,7 @@ void NhlVkCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
   draws_this_frame_ = 0;
   ++window_frames_;
   ++frames_total_;
+  PublishVkFrameIndex(frames_total_);
 
   if (!started_) {
     started_ = true;

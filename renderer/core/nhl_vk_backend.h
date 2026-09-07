@@ -38,6 +38,13 @@ struct NhlVkPerfSnapshot {
 void PublishVkPerf(const NhlVkPerfSnapshot& snapshot);
 NhlVkPerfSnapshot ReadVkPerf();
 
+// Guest frames presented so far, published every frame (the perf snapshot above
+// only updates at 1 Hz). Capturing at an exact frame index rather than a
+// wall-clock time makes A/B captures between runs comparable: the guest is
+// driven by a fixed scripted input timeline, so frame N is the same moment.
+void PublishVkFrameIndex(uint64_t frame_index);
+uint64_t ReadVkFrameIndex();
+
 class NhlVkCommandProcessor : public rex::graphics::vulkan::VulkanCommandProcessor {
  public:
   // Inherit the (VulkanGraphicsSystem*, KernelState*) constructor.
