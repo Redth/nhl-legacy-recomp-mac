@@ -998,7 +998,7 @@ index 305380e..152ef1f 100644
         xenos::IsColorResolveFormatBitwiseEquivalent(
             xenos::ColorRenderTargetFormat(color_edram_info.format),
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index 001f36b..877cc4a 100644
+index 001f36b..bddd658 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -1898,6 +1898,8 @@ bool VulkanCommandProcessor::SetupContext() {
@@ -1413,6 +1413,29 @@ index 001f36b..877cc4a 100644
    if (render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
      // Depth bias.
      float depth_bias_constant_factor, depth_bias_slope_factor;
+@@ -6206,8 +6543,20 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
+   // Alpha test.
+   dirty |= system_constants_.alpha_test_reference != rb_alpha_ref;
+   system_constants_.alpha_test_reference = rb_alpha_ref;
+-  uint32_t alpha_to_mask =
+-      rb_colorcontrol.alpha_to_mask_enable ? (rb_colorcontrol.value >> 24) | (UINT32_C(1) << 8) : 0;
++  // REX_NO_ALPHA_TO_COVERAGE: report alpha-to-coverage as disabled so the shader
++  // writes full coverage and the ordinary alpha blend produces the translucency.
++  //
++  // With only two guest MSAA samples, alpha-to-coverage can express 0%, 50% or
++  // 100% per pixel and spreads intermediate values with a 4x4 ordered dither.
++  // On this port that dither survives into the final image as a visible
++  // checkerboard, measured at +7.97 checker strength over the boards/glass
++  // versus ~0 everywhere else. The draws that use it here also have blending
++  // enabled, so the coverage step is redundant - the alpha blend alone gives
++  // smooth translucency.
++  static const bool no_a2c = std::getenv("REX_NO_ALPHA_TO_COVERAGE") != nullptr;
++  uint32_t alpha_to_mask = (rb_colorcontrol.alpha_to_mask_enable && !no_a2c)
++                               ? (rb_colorcontrol.value >> 24) | (UINT32_C(1) << 8)
++                               : 0;
+   dirty |= system_constants_.alpha_to_mask != alpha_to_mask;
+   system_constants_.alpha_to_mask = alpha_to_mask;
+ 
 diff --git a/src/graphics/vulkan/deferred_command_buffer.cpp b/src/graphics/vulkan/deferred_command_buffer.cpp
 index b49e033..60d4e72 100644
 --- a/src/graphics/vulkan/deferred_command_buffer.cpp
