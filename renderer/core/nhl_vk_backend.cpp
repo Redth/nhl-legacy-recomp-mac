@@ -4,6 +4,7 @@
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <mutex>
 #include <system_error>
@@ -408,6 +409,37 @@ bool NhlVkCommandProcessor::IssueCopy() {
 }
 
 void NhlVkCommandProcessor::PollHotkeyCapture() {
+  // NHL_CAPTURE_AT_FRAME=<start>:<length> captures a PM4 trace over a fixed
+  // guest-frame window, without the F9 keypress. The deterministic replay bench
+  // (NHL_REPLAY_BENCH) is the only way to A/B command-processor changes here:
+  // comparing fps between two live runs does not work, because the runs diverge
+  // and never render the same content - measured 11 vs 30 samples over the same
+  // nominal frame range. A trace replays identical PM4 every time.
+  if (const char* cap = std::getenv("NHL_CAPTURE_AT_FRAME")) {
+    static uint64_t cap_start = std::strtoull(cap, nullptr, 10);
+    static uint64_t cap_len = [&]() -> uint64_t {
+      const char* colon = std::strchr(cap, ':');
+      return colon ? std::strtoull(colon + 1, nullptr, 10) : 120;
+    }();
+    if (!auto_capturing_ && frames_total_ == cap_start) {
+      std::error_code ec;
+      const std::filesystem::path path = std::filesystem::path("gpu_trace") / "scene_bench";
+      std::filesystem::create_directories(path, ec);
+#ifdef NHL_HAVE_SDK_TRACING
+      BeginTracing(path);
+#endif
+      auto_capturing_ = true;
+      REXLOG_INFO("[nhl-cap] auto capture BEGIN -> {}/ (frame {}, {} frames)", path.string(),
+                  frames_total_, cap_len);
+    } else if (auto_capturing_ && frames_total_ >= cap_start + cap_len) {
+#ifdef NHL_HAVE_SDK_TRACING
+      EndTracing();
+#endif
+      auto_capturing_ = false;
+      REXLOG_INFO("[nhl-cap] auto capture END (frame {}) -> gpu_trace/scene_bench/",
+                  frames_total_);
+    }
+  }
   if (!hotkey_checked_) {
     hotkey_checked_ = true;
     hotkey_enabled_ = std::getenv("NHL_HOTKEY_CAPTURE") != nullptr;

@@ -112,6 +112,7 @@ class NhlVkCommandProcessor : public rex::graphics::vulkan::VulkanCommandProcess
   uint32_t scene_agree_frames_ = 0;
   bool scene_is_3d_ = false;
   void UpdateSceneKind();
+  bool auto_capturing_ = false;  // NHL_CAPTURE_AT_FRAME window in progress
   // Last value pushed to the SDK, so the change is only submitted once.
   NhlSwapPostEffect applied_swap_post_effect_ = NhlSwapPostEffect::kNone;
   const bool copy_barrier_on_ = std::getenv("NHL_VK_COPY_BARRIER") != nullptr;
