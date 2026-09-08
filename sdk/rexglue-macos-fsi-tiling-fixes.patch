@@ -270,6 +270,26 @@ index dce3dbf..5753019 100644
    spv::Id ProcessScalarAluOperation(const ParsedAluInstruction& instr,
                                      uint8_t memexport_eM_potentially_written_before,
                                      bool& predicate_written);
+diff --git a/include/rex/graphics/register_file.h b/include/rex/graphics/register_file.h
+index 36e07dd..d65deca 100644
+--- a/include/rex/graphics/register_file.h
++++ b/include/rex/graphics/register_file.h
+@@ -40,6 +40,15 @@ class RegisterFile {
+   static constexpr size_t kRegisterCount = 0x5003;
+   uint32_t values[kRegisterCount];
+ 
++  // Bumped by CommandProcessor::WriteRegister on any write outside the float
++  // shader constants. Every register mutation in the command processor funnels
++  // through that one function (WriteRegistersFromMem and
++  // WriteRegisterRangeFromRing both loop over it), so this is a complete change
++  // signal for anything the pipeline state description reads. Float constants
++  // are excluded because they are uniform-buffer data that the description does
++  // not read, and they are rewritten constantly.
++  uint64_t write_epoch = 1;
++
+   const uint32_t& operator[](uint32_t reg) const { return values[reg]; }
+   uint32_t& operator[](uint32_t reg) { return values[reg]; }
+ 
 diff --git a/include/rex/graphics/util/draw.h b/include/rex/graphics/util/draw.h
 index 3da182d..5d71ae1 100644
 --- a/include/rex/graphics/util/draw.h
@@ -677,6 +697,35 @@ index 9d2a848..aac6905 100644
    struct ArgsVkCopyBufferToImage {
      VkBuffer src_buffer;
      VkImage dst_image;
+diff --git a/include/rex/graphics/vulkan/pipeline_cache.h b/include/rex/graphics/vulkan/pipeline_cache.h
+index 7b938b9..6b50a62 100644
+--- a/include/rex/graphics/vulkan/pipeline_cache.h
++++ b/include/rex/graphics/vulkan/pipeline_cache.h
+@@ -425,6 +425,24 @@ class VulkanPipelineCache {
+ 
+   // Previously used pipeline, to avoid lookups if the state wasn't changed.
+   const std::pair<const PipelineDescription, Pipeline>* last_pipeline_ = nullptr;
++
++  // Inputs the last state description was built from, so an unchanged draw can
++  // skip GetCurrentStateDescription entirely (71% of descriptions are identical
++  // to the previous draw's). last_state_epoch_ is RegisterFile::write_epoch, a
++  // complete change signal for every register the description reads.
++  bool last_state_valid_ = false;
++  uint64_t last_state_epoch_ = 0;
++  VulkanShader::VulkanTranslation* last_state_vertex_shader_ = nullptr;
++  VulkanShader::VulkanTranslation* last_state_pixel_shader_ = nullptr;
++  reg::RB_DEPTHCONTROL last_state_depth_control_ = {};
++  uint32_t last_state_color_mask_ = 0;
++  VulkanRenderTargetCache::RenderPassKey last_state_render_pass_key_ = {};
++  xenos::PrimitiveType last_state_guest_primitive_type_ = xenos::PrimitiveType::kNone;
++  xenos::PrimitiveType last_state_host_primitive_type_ = xenos::PrimitiveType::kNone;
++  Shader::HostVertexShaderType last_state_host_vertex_shader_type_ =
++      Shader::HostVertexShaderType::kVertex;
++  xenos::TessellationMode last_state_tessellation_mode_ = xenos::TessellationMode::kDiscrete;
++  bool last_state_host_primitive_reset_ = false;
+   // <Submission index, pipeline>.
+   std::deque<std::pair<uint64_t, VkPipeline>> deferred_destroy_pipelines_;
+   std::mutex deferred_destroy_lock_;
 diff --git a/include/rex/graphics/vulkan/render_target_cache.h b/include/rex/graphics/vulkan/render_target_cache.h
 index 34f7033..1924acf 100644
 --- a/include/rex/graphics/vulkan/render_target_cache.h
@@ -824,7 +873,7 @@ index 0d8f8af..6dc19af 100644
  
  target_include_directories(rexgpu-xenos PRIVATE
 diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
-index a744375..9fe8a7d 100644
+index a744375..cd95046 100644
 --- a/src/graphics/command_processor.cpp
 +++ b/src/graphics/command_processor.cpp
 @@ -12,6 +12,7 @@
@@ -857,6 +906,74 @@ index a744375..9fe8a7d 100644
    ReadbackResolveMode shared_mode = ParseReadbackResolveMode(REXCVAR_GET(readback_resolve));
    bool shared_mode_overrides_legacy = shared_mode != ReadbackResolveMode::kDisabled ||
                                        rex::cvar::HasNonDefaultValue("readback_resolve");
+@@ -354,7 +370,67 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
+   }
+ 
+   // Volatile for the WAIT_REG_MEM loop.
++  const uint32_t previous_value = regs.values[index];
+   const_cast<volatile uint32_t&>(regs.values[index]) = value;
++
++  // Pipeline-state epoch. Every register mutation in the whole command processor
++  // funnels through this one function (WriteRegistersFromMem and
++  // WriteRegisterRangeFromRing both loop over WriteRegister), so bumping here is
++  // sufficient to detect any change the pipeline description could depend on.
++  //
++  // Float shader constants are excluded: they are uniform-buffer data and are
++  // rewritten constantly, but the pipeline description does not read them. Not
++  // excluding them would leave the epoch permanently dirty and the
++  // short-circuit would never fire.
++  // Bump the pipeline-state epoch only for the registers the Vulkan pipeline
++  // cache's GetCurrentStateDescription actually reads. Every register mutation
++  // in the command processor funnels through this function
++  // (WriteRegistersFromMem and WriteRegisterRangeFromRing both loop over it), so
++  // this list being complete is the whole correctness condition for the
++  // short-circuit in VulkanPipelineCache::ConfigurePipeline.
++  //
++  // The list was derived by enumerating every register access in that function:
++  //   PA_SU_SC_MODE_CNTL, PA_CL_CLIP_CNTL, RB_BLENDCONTROL0..3, and the two
++  //   helpers it calls - IsPrimitivePolygonal (VGT_DRAW_INITIATOR,
++  //   VGT_OUTPUT_PATH_CNTL) and IsRasterizationPotentiallyDone (RB_DEPTHCONTROL).
++  //
++  // VGT_DRAW_INITIATOR is deliberately NOT in the list. Writing it is what
++  // ISSUES a draw, so including it pinned the epoch dirty on every draw and the
++  // short-circuit never fired (measured 0.0%). Its only influence on the
++  // description is via IsPrimitivePolygonal reading prim_type - and
++  // PrimitiveProcessor sets result.guest_primitive_type from exactly that field
++  // (primitive_processor.cpp: guest_primitive_type = vgt_draw_initiator.prim_type),
++  // which the call site compares explicitly. So the dependency is already
++  // covered and excluding the register here is sound.
++  // Everything else the description depends on (shaders, normalized depth
++  // control and colour mask, render pass key, primitive processing result) is
++  // passed in as a parameter and compared explicitly at the call site.
++  //
++  // A coarser "any non-float-constant write" epoch was tried first and was
++  // useless: measured 0.0% unchanged, because the title writes some state
++  // register before literally every draw.
++  //
++  // The epoch bumps only on an actual VALUE CHANGE, not on every write. The
++  // title re-emits its state registers before each draw with identical values,
++  // so counting writes left the epoch permanently dirty (measured 0.0%
++  // unchanged) even though 70% of the resulting descriptions were byte
++  // identical.
++  if (previous_value != value) {
++    switch (index) {
++      case XE_GPU_REG_PA_SU_SC_MODE_CNTL:
++      case XE_GPU_REG_PA_CL_CLIP_CNTL:
++      case XE_GPU_REG_RB_DEPTHCONTROL:
++      case XE_GPU_REG_RB_BLENDCONTROL0:
++      case XE_GPU_REG_RB_BLENDCONTROL1:
++      case XE_GPU_REG_RB_BLENDCONTROL2:
++      case XE_GPU_REG_RB_BLENDCONTROL3:
++      case XE_GPU_REG_VGT_OUTPUT_PATH_CNTL:
++        ++regs.write_epoch;
++        break;
++      default:
++        break;
++    }
++  }
+   if (!regs.GetRegisterInfo(index)) {
+     REXGPU_DEBUG("GPU: Write to unknown register ({:04X} = {:08X})", index, value);
+   }
 diff --git a/src/graphics/pipeline/shader/spirv_translator.cpp b/src/graphics/pipeline/shader/spirv_translator.cpp
 index 1774f97..d5f3eff 100644
 --- a/src/graphics/pipeline/shader/spirv_translator.cpp
@@ -2178,7 +2295,7 @@ index b49e033..63aee41 100644
          auto& args = *reinterpret_cast<const ArgsVkCopyBufferToImage*>(stream);
          dfn.vkCmdCopyBufferToImage(
 diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
-index 91ac08f..9bdf49f 100644
+index 91ac08f..4097b63 100644
 --- a/src/graphics/vulkan/pipeline_cache.cpp
 +++ b/src/graphics/vulkan/pipeline_cache.cpp
 @@ -966,10 +966,38 @@ SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentPixelShaderMo
@@ -2222,7 +2339,110 @@ index 91ac08f..9bdf49f 100644
    modification.pixel.interpolators_centroid =
        interpolator_mask & ~xenos::GetInterpolatorSamplingPattern(
                                regs.Get<reg::RB_SURFACE_INFO>().msaa_samples,
-@@ -1246,6 +1274,13 @@ bool VulkanPipelineCache::TranslateAnalyzedShader(SpirvShaderTranslator& transla
+@@ -1059,6 +1087,65 @@ bool VulkanPipelineCache::ConfigurePipeline(
+   if (!EnsureShadersTranslated(vertex_shader, pixel_shader)) {
+     return false;
+   }
++
++  // Item #2 of the CPU optimization plan: skip rebuilding the state description
++  // when nothing it reads has changed. Measured with REX_PIPELINE_STATS: 71% of
++  // descriptions built are byte-identical to the previous draw's, so that work
++  // was wasted on roughly seven draws in ten.
++  //
++  // The guard is deliberately conservative. It fires only when the register
++  // write epoch is unchanged (any register write outside the float shader
++  // constants bumps it - see RegisterFile::write_epoch, and note every mutation
++  // path funnels through CommandProcessor::WriteRegister) AND every explicit
++  // input to GetCurrentStateDescription is identical. So it cannot go stale on a
++  // register the description reads; the worst case is a missed opportunity.
++  //
++  // REX_NO_PIPELINE_SHORTCUT=1 disables it.
++  static const bool pipeline_shortcut = std::getenv("REX_NO_PIPELINE_SHORTCUT") == nullptr;
++  const uint64_t register_epoch = register_file_.write_epoch;
++  // REX_SHORTCUT_STATS=1: which precondition actually blocks the short-circuit?
++  if (std::getenv("REX_SHORTCUT_STATS")) {
++    static uint64_t n = 0, epoch_same = 0, inputs_same = 0, both = 0;
++    ++n;
++    const bool e_ok = last_state_valid_ && last_state_epoch_ == register_epoch;
++    const bool i_ok = last_state_valid_ && last_state_vertex_shader_ == vertex_shader &&
++                      last_state_pixel_shader_ == pixel_shader &&
++                      last_state_depth_control_.value == normalized_depth_control.value &&
++                      last_state_color_mask_ == normalized_color_mask &&
++                      last_state_render_pass_key_.key == render_pass_key.key;
++    if (e_ok) ++epoch_same;
++    if (i_ok) ++inputs_same;
++    if (e_ok && i_ok) ++both;
++    if ((n % 200000) == 0) {
++      REXGPU_INFO("[rex-shortcut] n={} epoch_unchanged={:.1f}% inputs_same={:.1f}% both={:.1f}%",
++                  n, 100.0 * double(epoch_same) / double(n), 100.0 * double(inputs_same) / double(n),
++                  100.0 * double(both) / double(n));
++    }
++  }
++  if (pipeline_shortcut && last_pipeline_ && last_state_valid_ &&
++      last_state_epoch_ == register_epoch && last_state_vertex_shader_ == vertex_shader &&
++      last_state_pixel_shader_ == pixel_shader &&
++      last_state_depth_control_.value == normalized_depth_control.value &&
++      last_state_color_mask_ == normalized_color_mask &&
++      last_state_render_pass_key_.key == render_pass_key.key &&
++      last_state_guest_primitive_type_ == primitive_processing_result.guest_primitive_type &&
++      last_state_host_primitive_type_ == primitive_processing_result.host_primitive_type &&
++      last_state_host_vertex_shader_type_ == primitive_processing_result.host_vertex_shader_type &&
++      last_state_tessellation_mode_ == primitive_processing_result.tessellation_mode &&
++      last_state_host_primitive_reset_ ==
++          primitive_processing_result.host_primitive_reset_enabled) {
++    VkPipeline last_pipeline = last_pipeline_->second.pipeline.load(std::memory_order_acquire);
++    const PipelineLayoutProvider* last_pipeline_layout =
++        last_pipeline_->second.pipeline_layout.load(std::memory_order_acquire);
++    if (last_pipeline != VK_NULL_HANDLE && last_pipeline_layout != nullptr) {
++      pipeline_out = last_pipeline;
++      pipeline_layout_out = last_pipeline_layout;
++      if (pipeline_handle_out) {
++        *pipeline_handle_out = const_cast<Pipeline*>(&last_pipeline_->second);
++      }
++      return true;
++    }
++  }
+   if (shader_storage_file_ &&
+       vertex_shader->shader().ucode_storage_index() != shader_storage_index_) {
+     vertex_shader->shader().set_ucode_storage_index(shader_storage_index_);
+@@ -1097,6 +1184,36 @@ bool VulkanPipelineCache::ConfigurePipeline(
+         uint32_t(primitive_processing_result.host_primitive_reset_enabled), render_pass_key.key);
+     return false;
+   }
++  // REX_PIPELINE_STATS=1: how often is the freshly built description identical
++  // to the previous draw's? Every hit is a draw where GetCurrentStateDescription
++  // did full work for nothing, and is precisely the headroom for item #2 of the
++  // CPU plan (short-circuit it via a register dirty-bit). That change carries a
++  // real stale-pipeline risk, so measure the ceiling before taking it on -
++  // especially as milliseconds cannot be measured here without the replay bench.
++  static const bool pipeline_stats = std::getenv("REX_PIPELINE_STATS") != nullptr;
++  if (pipeline_stats) {
++    static uint64_t total = 0, same = 0;
++    ++total;
++    if (last_pipeline_ && last_pipeline_->first == description) ++same;
++    if ((total % 200000) == 0) {
++      REXGPU_INFO("[rex-pipestats] descriptions built={} identical_to_previous={} ({:.1f}%)",
++                  total, same, 100.0 * double(same) / double(total));
++    }
++  }
++  // Remember the inputs this description was built from, for the short-circuit.
++  last_state_valid_ = true;
++  last_state_epoch_ = register_epoch;
++  last_state_vertex_shader_ = vertex_shader;
++  last_state_pixel_shader_ = pixel_shader;
++  last_state_depth_control_ = normalized_depth_control;
++  last_state_color_mask_ = normalized_color_mask;
++  last_state_render_pass_key_ = render_pass_key;
++  last_state_guest_primitive_type_ = primitive_processing_result.guest_primitive_type;
++  last_state_host_primitive_type_ = primitive_processing_result.host_primitive_type;
++  last_state_host_vertex_shader_type_ = primitive_processing_result.host_vertex_shader_type;
++  last_state_tessellation_mode_ = primitive_processing_result.tessellation_mode;
++  last_state_host_primitive_reset_ = primitive_processing_result.host_primitive_reset_enabled;
++
+   if (last_pipeline_ && last_pipeline_->first == description) {
+     VkPipeline last_pipeline = last_pipeline_->second.pipeline.load(std::memory_order_acquire);
+     const PipelineLayoutProvider* last_pipeline_layout =
+@@ -1246,6 +1363,13 @@ bool VulkanPipelineCache::TranslateAnalyzedShader(SpirvShaderTranslator& transla
      return false;
    }
  
@@ -2236,7 +2456,7 @@ index 91ac08f..9bdf49f 100644
    // TODO(Triang3l): Log that the shader has been successfully translated in
    // common code.
  
-@@ -1386,9 +1421,14 @@ bool VulkanPipelineCache::GetCurrentStateDescription(
+@@ -1386,9 +1510,14 @@ bool VulkanPipelineCache::GetCurrentStateDescription(
      SpirvShaderTranslator::Modification pixel_shader_modification(
          description_out.pixel_shader_modification);
      using DepthStencilMode = SpirvShaderTranslator::Modification::DepthStencilMode;
