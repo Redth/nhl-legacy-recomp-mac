@@ -1200,6 +1200,31 @@ class NhllegacyApp : public rex::ReXApp {
     }
     // Entries are <hex addr>[:<width>x<height>], comma separated. The
     // post-process chain renders at 640x360, so the size has to be per-entry.
+    //
+    // NHL_DUMP_RESOLVE=auto targets whatever full-width colour buffer the game
+    // is using right now, reported by the backend. Use it: hardcoded addresses
+    // copied from a previous run's log go stale as soon as the game moves its
+    // buffers, and the dump then silently writes an all-black PNG.
+    std::string auto_spec;
+    if (std::strncmp(list, "auto", 4) == 0) {
+#ifdef NHL_HAVE_VULKAN_BACKEND
+      const auto t = nhl::graphics::ReadLastColorResolve();
+      if (!t.address) {
+        REXLOG_ERROR("[nhl-dumpres] auto: no colour resolve seen yet");
+        return;
+      }
+      char buf[64];
+      std::snprintf(buf, sizeof(buf), "%X:%ux%u", t.address, t.pitch,
+                    t.height ? t.height : 720u);
+      auto_spec = buf;
+      list = auto_spec.c_str();
+      REXLOG_INFO("[nhl-dumpres] auto -> 0x{:08X} {}x{}", t.address, t.pitch,
+                  t.height ? t.height : 720u);
+#else
+      REXLOG_ERROR("[nhl-dumpres] auto requires the Vulkan backend");
+      return;
+#endif
+    }
     std::vector<uint8_t> rgba;
     for (const char* p = list; *p;) {
       char* end = nullptr;

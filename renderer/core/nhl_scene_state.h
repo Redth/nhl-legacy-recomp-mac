@@ -7,6 +7,8 @@
 
 #pragma once
 
+#include <cstdint>
+
 namespace nhl::graphics {
 
 // What the guest is currently drawing, decided per frame in IssueSwap.
@@ -42,5 +44,17 @@ NhlEdgeAaMode GetEdgeAaMode();
 enum class NhlSwapPostEffect { kNone = 0, kFxaa = 1, kFxaaExtreme = 2 };
 void SetSwapPostEffect(NhlSwapPostEffect effect);
 NhlSwapPostEffect GetSwapPostEffect();
+
+// Destination of the most recent full-size (>=1280 pitch) colour resolve, so a
+// dump can target whatever buffer the game is actually using right now. Fixed
+// addresses read out of an earlier run's log go stale the moment the game moves
+// its buffers - three dumps came back all-zero that way.
+struct NhlResolveTarget {
+  uint32_t address = 0;
+  uint32_t pitch = 0;
+  uint32_t height = 0;
+};
+void PublishLastColorResolve(const NhlResolveTarget& t);
+NhlResolveTarget ReadLastColorResolve();
 
 }  // namespace nhl::graphics

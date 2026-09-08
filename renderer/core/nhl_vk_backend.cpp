@@ -66,6 +66,18 @@ NhlSwapPostEffect GetSwapPostEffect() {
   return g_swap_post_effect.load(std::memory_order_relaxed);
 }
 
+std::mutex g_resolve_mutex;
+NhlResolveTarget g_last_color_resolve;
+
+void PublishLastColorResolve(const NhlResolveTarget& t) {
+  std::lock_guard<std::mutex> lock(g_resolve_mutex);
+  g_last_color_resolve = t;
+}
+NhlResolveTarget ReadLastColorResolve() {
+  std::lock_guard<std::mutex> lock(g_resolve_mutex);
+  return g_last_color_resolve;
+}
+
 NhlVkPerfSnapshot ReadVkPerf() {
   std::lock_guard<std::mutex> lock(g_perf_mutex);
   return g_perf;
@@ -300,6 +312,18 @@ bool NhlVkCommandProcessor::IssueDraw(
 // offset), so any left/right asymmetry in the final image has to come from the
 // resolve destination, not the rendering. Log the copy rect + dest to see it.
 bool NhlVkCommandProcessor::IssueCopy() {
+  // Remember the newest full-width colour resolve so NHL_DUMP_RESOLVE=auto can
+  // target it without a hardcoded address (see NhlResolveTarget).
+  if (register_file_) {
+    const auto cc_t = register_file_->Get<rex::graphics::reg::RB_COPY_CONTROL>();
+    const auto dp_t = register_file_->Get<rex::graphics::reg::RB_COPY_DEST_PITCH>();
+    const uint32_t pitch = uint32_t(dp_t.copy_dest_pitch);
+    if (uint32_t(cc_t.copy_src_select) == 0 && pitch >= 1280) {
+      PublishLastColorResolve(NhlResolveTarget{
+          (*register_file_)[rex::graphics::XE_GPU_REG_RB_COPY_DEST_BASE], pitch,
+          uint32_t(dp_t.copy_dest_height)});
+    }
+  }
   if (rtlog_on_ && register_file_) {
     const auto cc = register_file_->Get<rex::graphics::reg::RB_COPY_CONTROL>();
     const uint32_t dest_base =
