@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -101,6 +102,30 @@ bool NhlVkCommandProcessor::IssueDraw(
     rex::graphics::CommandProcessor::IndexBufferInfo* index_buffer_info,
     bool major_mode_explicit) {
   ++draws_this_frame_;
+  // NHL_DRAW_TIMING=1: total wall time inside the SDK's IssueDraw, per draw.
+  // This is the denominator the CPU plan is really about - it puts the
+  // individually optimized paths in proportion. The descriptor path measures
+  // ~200-255 ns/draw, so if the total is ~15 us/draw then descriptors are under
+  // 2% of the cost and optimizing them further is not where the time is.
+  static const bool draw_timing = std::getenv("NHL_DRAW_TIMING") != nullptr;
+  const std::chrono::steady_clock::time_point draw_t0 =
+      draw_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+  struct DrawTimingScope {
+    bool on;
+    std::chrono::steady_clock::time_point t0;
+    ~DrawTimingScope() {
+      if (!on) return;
+      static uint64_t n = 0, total_ns = 0;
+      ++n;
+      total_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now() - t0)
+                               .count());
+      if ((n % 200000) == 0) {
+        REXLOG_INFO("[nhl-drawtime] draws={} mean={:.2f} us/draw", n,
+                    double(total_ns) / double(n) / 1000.0);
+      }
+    }
+  } draw_timing_scope{draw_timing, draw_t0};
   namespace reg = rex::graphics::reg;
   namespace xe = rex::graphics::xenos;
   if (!register_file_) {
@@ -313,6 +338,30 @@ bool NhlVkCommandProcessor::IssueDraw(
 // offset), so any left/right asymmetry in the final image has to come from the
 // resolve destination, not the rendering. Log the copy rect + dest to see it.
 bool NhlVkCommandProcessor::IssueCopy() {
+  // NHL_DRAW_TIMING also reports resolve cost. IssueDraw measured 2.34 us/draw
+  // = ~6.8 ms of a ~52 ms frame, so 87% of frame time is NOT draw submission -
+  // contrary to the CPU plan's premise, which was written for the Windows
+  // build. The readback resolve path is the prime suspect: it is documented as
+  // "the dominant cost in high-draw scenes" and does a GPU drain per resolve.
+  static const bool copy_timing = std::getenv("NHL_DRAW_TIMING") != nullptr;
+  const std::chrono::steady_clock::time_point copy_t0 =
+      copy_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+  struct CopyTimingScope {
+    bool on;
+    std::chrono::steady_clock::time_point t0;
+    ~CopyTimingScope() {
+      if (!on) return;
+      static uint64_t n = 0, total_ns = 0;
+      ++n;
+      total_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now() - t0)
+                               .count());
+      if ((n % 2000) == 0) {
+        REXLOG_INFO("[nhl-copytime] resolves={} mean={:.1f} us/resolve total={:.1f} ms", n,
+                    double(total_ns) / double(n) / 1000.0, double(total_ns) / 1e6);
+      }
+    }
+  } copy_timing_scope{copy_timing, copy_t0};
   // Remember the newest full-width colour resolve so NHL_DUMP_RESOLVE=auto can
   // target it without a hardcoded address (see NhlResolveTarget).
   if (register_file_) {
@@ -547,9 +596,29 @@ void NhlVkCommandProcessor::UpdateSceneKind() {
 void NhlVkCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
                                       uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
+  // NHL_DRAW_TIMING also reports swap cost. Draws measured 2.34 us x ~2900 =
+  // ~6.5 ms and resolves ~0.04 ms, together only ~13% of a ~52 ms gameplay
+  // frame. IssueSwap is where EndSubmission, the deferred readback flush and
+  // the present all happen, i.e. where the CP thread would block on the GPU.
+  static const bool swap_timing = std::getenv("NHL_DRAW_TIMING") != nullptr;
+  const std::chrono::steady_clock::time_point swap_t0 =
+      swap_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+
   // Present the frame via the SDK's own Vulkan presenter, then sample timing.
   rex::graphics::vulkan::VulkanCommandProcessor::IssueSwap(
       frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+
+  if (swap_timing) {
+    static uint64_t n = 0, total_ns = 0;
+    ++n;
+    total_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now() - swap_t0)
+                             .count());
+    if ((n % 500) == 0) {
+      REXLOG_INFO("[nhl-swaptime] swaps={} mean={:.2f} ms/swap", n,
+                  double(total_ns) / double(n) / 1e6);
+    }
+  }
 
   // F9 streaming capture toggle (gameplay-trace benchmark source).
   PollHotkeyCapture();
